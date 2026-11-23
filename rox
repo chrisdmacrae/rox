@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """Launch Rex guests and the project workspaces inside them."""
 import argparse
+import base64
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
 import fcntl
 import getpass
 import hashlib
+import io
 import ipaddress
 import json
 import os
@@ -20,10 +22,16 @@ import shutil
 import socket
 import subprocess
 import sys
+import tarfile
 import tempfile
 import time
 from urllib.parse import urlsplit
 import urllib.request
+
+try:
+    import tomllib
+except ImportError:  # Python before 3.11 can't read Codex's config.toml, so rox skips it.
+    tomllib = None
 
 
 HERE = Path(__file__).resolve().parent
@@ -1537,6 +1545,20 @@ AGENT_ENV_SCRIPT = ('umask 077; mkdir -p "$HOME/.rox" && cat > "$HOME/.rox/agent
 CODEX_AUTH_SCRIPT = ('umask 077; mkdir -p "$HOME/.codex" && cat > "$HOME/.codex/auth.json.tmp" '
                      '&& mv "$HOME/.codex/auth.json.tmp" "$HOME/.codex/auth.json"')
 CODEX_LOGIN_SCRIPT = 'export PATH="$HOME/.local/bin:$PATH"; codex login --with-api-key >/dev/null'
+# What rox copies from the launcher's agent setup unless the config says otherwise.
+SYNC_DEFAULTS = {"skills": True, "instructions": True, "mcp": False, "settings": False}
+# Settings that name programs or paths on the launcher, or hold its secrets, so guests don't get them.
+CLAUDE_HOST_SETTINGS = {"hooks", "statusLine", "apiKeyHelper", "awsAuthRefresh", "awsCredentialExport",
+                        "otelHeadersHelper", "env", "enabledPlugins", "extraKnownMarketplaces"}
+CODEX_HOST_SETTINGS = {"notify", "projects", "mcp_servers", "hooks", "plugins", "marketplaces", "desktop"}
+# Rox isn't installed in guests, so its own skill would only mislead an agent there.
+UNSYNCED_SKILLS = {"rox"}
+SKILL_NAME_PATTERN = r"[A-Za-z0-9_][A-Za-z0-9_.-]*"
+SYNC_RECORD = ".rox/synced.json"
+# Prints each file that exists as its path and its contents in base64, one per line.
+SYNC_READ_SCRIPT = ('cd "$HOME" || exit; for file; do if [ -f "$file" ]; then '
+                    'printf "%s " "$file"; base64 < "$file" | tr -d "\\n"; echo; fi; done')
+SYNC_WRITE_SCRIPT = 'cd "$HOME" && if [ "$#" -gt 0 ]; then rm -rf -- "$@"; fi && tar -xf -'
 
 
 def agent_settings(config, config_path):
@@ -1552,7 +1574,7 @@ def agent_settings(config, config_path):
             raise Error(f"Unknown agent {agent} in {config_path}. Use {' or '.join(AGENT_CREDENTIALS)}")
         if not isinstance(value, dict):
             raise Error(f"Expected an object for agents.{agent} in {config_path}")
-        allowed = ["version", *AGENT_CREDENTIALS[agent]]
+        allowed = ["version", "sync", *AGENT_CREDENTIALS[agent]]
         if unknown := sorted(set(value) - set(allowed)):
             raise Error(f"Unknown setting agents.{agent}.{unknown[0]} in {config_path}. Use {', '.join(allowed)}")
         version = value.get("version", "latest")
@@ -1571,8 +1593,34 @@ def agent_settings(config, config_path):
             credentials[setting] = path
         if len(credentials) > 1:
             raise Error(f"Choose one of {' or '.join(credentials)} for agents.{agent} in {config_path}")
-        agents[agent] = {"version": version, **credentials}
+        agents[agent] = {"version": version, "sync": sync_settings(agent, value.get("sync"), config_path),
+                         **credentials}
     return agents
+
+
+def sync_settings(agent, value, config_path):
+    """What of the launcher's own agent setup to copy into guests. Skills and instructions by default."""
+    sync = dict(SYNC_DEFAULTS)
+    if value is None:
+        return sync
+    if not isinstance(value, dict):
+        raise Error(f"Expected an object for agents.{agent}.sync in {config_path}")
+    if unknown := sorted(set(value) - set(SYNC_DEFAULTS)):
+        raise Error(f"Unknown setting agents.{agent}.sync.{unknown[0]} in {config_path}. "
+                    f"Use {', '.join(SYNC_DEFAULTS)}")
+    for key in ("skills", "instructions", "settings"):
+        if key in value:
+            if not isinstance(value[key], bool):
+                raise Error(f"Expected true or false for agents.{agent}.sync.{key} in {config_path}")
+            sync[key] = value[key]
+    if "mcp" in value:
+        mcp = value["mcp"]
+        if not (isinstance(mcp, bool) or isinstance(mcp, list) and all(isinstance(name, str) and name
+                                                                       for name in mcp)):
+            raise Error(f"Expected true, false or a list of server names for agents.{agent}.sync.mcp "
+                        f"in {config_path}")
+        sync["mcp"] = mcp
+    return sync
 
 
 def latest_agent_version(agent):
@@ -1711,10 +1759,278 @@ def push_agent_credentials(guest, agents):
                input=codex["api_key_file"].read_text().strip() + "\n", timeout=60)
 
 
+def skill_folders(agent):
+    """The launcher's skills folders for agent, each with the guest folder it's copied to."""
+    folders = [(agent_home(agent) / "skills", f".{agent}/skills")]
+    if agent == "codex":
+        folders.append((Path.home() / ".agents" / "skills", ".agents/skills"))
+    return folders
+
+
+def launcher_skills(agent):
+    """{guest path: launcher folder} for each skill to copy. Links are followed."""
+    skills = {}
+    for folder, target in skill_folders(agent):
+        if not folder.is_dir():
+            continue
+        for entry in sorted(folder.iterdir()):
+            if (re.fullmatch(SKILL_NAME_PATTERN, entry.name) and entry.name not in UNSYNCED_SKILLS
+                    and (entry / "SKILL.md").is_file()):
+                skills[f"{target}/{entry.name}"] = entry.resolve()
+    return skills
+
+
+def claude_state_file():
+    configured = os.environ.get("CLAUDE_CONFIG_DIR")
+    return Path(configured).expanduser() / ".claude.json" if configured else Path.home() / ".claude.json"
+
+
+def read_json_object(path, description):
+    try:
+        value = json.loads(path.read_text())
+    except FileNotFoundError:
+        return {}
+    except (OSError, ValueError) as error:
+        print(f"rox: Could not read {description} in {path}, so guests don't get it. ({error})",
+              file=sys.stderr, flush=True)
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def read_codex_config():
+    path = agent_home("codex") / "config.toml"
+    if not path.is_file():
+        return {}
+    if tomllib is None:
+        print(f"rox: Reading {path} needs Python 3.11 or newer, so guests don't get your Codex MCP servers "
+              "or settings.", file=sys.stderr, flush=True)
+        return {}
+    try:
+        return tomllib.loads(path.read_text())
+    except (OSError, ValueError) as error:
+        print(f"rox: Could not read {path}, so guests don't get your Codex MCP servers or settings. ({error})",
+              file=sys.stderr, flush=True)
+        return {}
+
+
+def remote_mcp_server(agent, server):
+    """Whether an MCP server runs over the network, so a guest can reach it too."""
+    if not isinstance(server, dict):
+        return False
+    if agent == "claude":
+        return server.get("type") in ("http", "sse") and isinstance(server.get("url"), str)
+    return isinstance(server.get("url"), str) and "command" not in server
+
+
+def launcher_mcp_servers(agent, wanted):
+    """The MCP servers to copy: every remote one for true, or the named ones."""
+    if wanted is False:
+        return {}
+    if agent == "claude":
+        servers = read_json_object(claude_state_file(), "your Claude Code MCP servers").get("mcpServers")
+    else:
+        servers = read_codex_config().get("mcp_servers")
+    servers = servers if isinstance(servers, dict) else {}
+    names = [name for name in servers if remote_mcp_server(agent, servers[name])] if wanted is True else wanted
+    chosen = {}
+    for name in names:
+        if name not in servers:
+            print(f"rox: {AGENT_NAMES[agent]} has no MCP server named {name}, so guests don't get it.",
+                  file=sys.stderr, flush=True)
+        elif not remote_mcp_server(agent, servers[name]):
+            print(f"rox: The {name} MCP server runs a program on this machine, so guests don't get it. "
+                  "Install it in the guest image to use it there.", file=sys.stderr, flush=True)
+        else:
+            chosen[name] = servers[name]
+    return chosen
+
+
+def launcher_settings(agent):
+    if agent == "claude":
+        settings = read_json_object(agent_home("claude") / "settings.json", "your Claude Code settings")
+        return {key: value for key, value in settings.items() if key not in CLAUDE_HOST_SETTINGS}
+    return {key: value for key, value in read_codex_config().items() if key not in CODEX_HOST_SETTINGS}
+
+
+def toml_key(key):
+    return key if re.fullmatch(r"[A-Za-z0-9_-]+", key) else json.dumps(key)
+
+
+def toml_value(value):
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (int, float)):
+        return repr(value)
+    if isinstance(value, str):
+        return json.dumps(value)
+    if isinstance(value, list):
+        return "[" + ", ".join(toml_value(item) for item in value) + "]"
+    if isinstance(value, dict):
+        return "{" + ", ".join(f"{toml_key(key)} = {toml_value(item)}" for key, item in value.items()) + "}"
+    raise ValueError(f"can't write {type(value).__name__} values to TOML")
+
+
+def dump_toml(data, prefix=()):
+    """Write the plain TOML that Codex's config uses: tables, strings, numbers, booleans and arrays."""
+    values = [f"{toml_key(key)} = {toml_value(value)}" for key, value in data.items() if not isinstance(value, dict)]
+    tables = [(key, value) for key, value in data.items() if isinstance(value, dict)]
+    if prefix and (values or not tables):
+        values.insert(0, f"[{'.'.join(toml_key(part) for part in prefix)}]")
+    text = "\n".join(values)
+    for key, value in tables:
+        text += ("\n\n" if text else "") + dump_toml(value, (*prefix, key)).rstrip("\n")
+    return text + "\n" if not prefix else text
+
+
+def agent_sync_plan(agents):
+    """What to copy into guests for agents, read from the launcher's own setup."""
+    plan = {"files": {}, "dirs": {}, "settings": {}, "mcp": {}}
+    for agent, settings in sorted(agents.items()):
+        sync = settings.get("sync", SYNC_DEFAULTS)
+        if sync["skills"]:
+            plan["dirs"].update(launcher_skills(agent))
+        if sync["instructions"]:
+            name = "CLAUDE.md" if agent == "claude" else "AGENTS.md"
+            if (agent_home(agent) / name).is_file():
+                plan["files"][f".{agent}/{name}"] = (agent_home(agent) / name).read_bytes()
+        if sync["settings"]:
+            plan["settings"][agent] = launcher_settings(agent)
+        plan["mcp"][agent] = launcher_mcp_servers(agent, sync["mcp"])
+    return plan
+
+
+def describe_sync(plan):
+    parts = []
+    if plan["dirs"]:
+        names = sorted({path.rsplit("/", 1)[1] for path in plan["dirs"]})
+        parts.append(f"skills {', '.join(names)}")
+    parts += [path.rsplit("/", 1)[1] for path in sorted(plan["files"])]
+    for agent, servers in sorted(plan["mcp"].items()):
+        if servers:
+            parts.append(f"{AGENT_NAMES[agent]} MCP servers {', '.join(sorted(servers))}")
+    parts += [f"{AGENT_NAMES[agent]} settings" for agent in sorted(plan["settings"])]
+    return "; ".join(parts)
+
+
+def safe_synced_path(path):
+    parts = PurePosixPath(path).parts if isinstance(path, str) else ()
+    return (len(parts) >= 2 and parts[0] in (".claude", ".codex", ".agents") and ".." not in parts
+            and not PurePosixPath(path).is_absolute())
+
+
+def read_guest_files(guest, paths):
+    text = output(remote_command(guest, ["sh", "-c", SYNC_READ_SCRIPT, "rox", *paths]), timeout=30)
+    files = {}
+    for line in text.splitlines():
+        path, _, data = line.partition(" ")
+        if path in paths:
+            files[path] = base64.b64decode(data)
+    return files
+
+
+def merge_synced(current, previous, keys, servers, mcp_key):
+    """Replace what rox synced into a guest's agent config last time with what it syncs now."""
+    for key in previous.get("keys", []):
+        current.pop(key, None)
+    mcp = current.get(mcp_key) if isinstance(current.get(mcp_key), dict) else {}
+    for name in previous.get("mcp", []):
+        mcp.pop(name, None)
+    current.update(keys)
+    mcp.update(servers)
+    if mcp:
+        current[mcp_key] = mcp
+    else:
+        current.pop(mcp_key, None)
+    return {"keys": sorted(keys), "mcp": sorted(servers)}
+
+
+def sync_agent_setup(guest, agents):
+    """Copy the launcher's skills, instructions, and chosen MCP servers and settings into the guest.
+
+    Rox records what it copied in the guest, so the next sync removes what the launcher no longer has.
+    """
+    plan = agent_sync_plan(agents)
+    merged_files = [".claude.json", ".codex/config.toml"]
+    existing = read_guest_files(guest, [SYNC_RECORD, *merged_files])
+    try:
+        record = json.loads(existing.get(SYNC_RECORD, b"{}"))
+    except ValueError:
+        record = {}
+    record = record if isinstance(record, dict) else {}
+    stale = [path for path in record.get("paths", []) if safe_synced_path(path)]
+    owned = dict(plan["files"])
+    if "claude" in plan["settings"]:
+        owned[".claude/settings.json"] = (json.dumps(plan["settings"]["claude"], indent=2) + "\n").encode()
+    new_record = {"paths": sorted([*owned, *plan["dirs"]])}
+    private = {}
+
+    claude_previous = record.get("claude") if isinstance(record.get("claude"), dict) else {}
+    if "claude" in agents and (plan["mcp"].get("claude") or claude_previous.get("mcp")):
+        try:
+            state = json.loads(existing.get(".claude.json", b"{}") or b"{}")
+        except ValueError:
+            state = None
+        if isinstance(state, dict):
+            new_record["claude"] = merge_synced(state, claude_previous, {}, plan["mcp"].get("claude", {}),
+                                                "mcpServers")
+            state.setdefault("hasCompletedOnboarding", True)
+            private[".claude.json"] = (json.dumps(state, indent=2) + "\n").encode()
+        else:
+            print(f"rox: {guest.name} has a ~/.claude.json rox can't read, so it doesn't get your MCP servers.",
+                  file=sys.stderr, flush=True)
+
+    codex_previous = record.get("codex") if isinstance(record.get("codex"), dict) else {}
+    codex_keys = plan["settings"].get("codex", {})
+    if "codex" in agents and (codex_keys or plan["mcp"].get("codex") or codex_previous.get("keys")
+                              or codex_previous.get("mcp")):
+        config = None
+        if tomllib is not None:
+            try:
+                config = tomllib.loads(existing.get(".codex/config.toml", b"").decode())
+            except ValueError:
+                pass
+        if config is not None:
+            new_record["codex"] = merge_synced(config, codex_previous, codex_keys, plan["mcp"].get("codex", {}),
+                                               "mcp_servers")
+            try:
+                private[".codex/config.toml"] = dump_toml(config).encode()
+            except ValueError as error:
+                print(f"rox: Could not write {guest.name}'s Codex config. ({error})", file=sys.stderr, flush=True)
+        else:
+            print(f"rox: Could not read {guest.name}'s ~/.codex/config.toml, so it doesn't get your Codex MCP "
+                  "servers or settings.", file=sys.stderr, flush=True)
+    private[SYNC_RECORD] = (json.dumps(new_record, indent=2) + "\n").encode()
+
+    archive = io.BytesIO()
+    with tarfile.open(fileobj=archive, mode="w", dereference=True) as tar:
+        def add_bytes(path, data, mode):
+            info = tarfile.TarInfo(path)
+            info.size, info.mode, info.mtime = len(data), mode, int(time.time())
+            tar.addfile(info, io.BytesIO(data))
+
+        for path, folder in sorted(plan["dirs"].items()):
+            tar.add(folder, arcname=path, filter=lambda info: None if ".git" in info.name.split("/") else info)
+        for path, data in sorted(owned.items()):
+            add_bytes(path, data, 0o600 if path.endswith("settings.json") else 0o644)
+        for path, data in sorted(private.items()):
+            add_bytes(path, data, 0o600)
+    remove = sorted(set(stale) | set(plan["dirs"]))
+    result = subprocess.run(remote_command(guest, ["sh", "-c", SYNC_WRITE_SCRIPT, "rox", *remove]),
+                            input=archive.getvalue(), capture_output=True, timeout=120)
+    if result.returncode:
+        raise Error(result.stderr.decode(errors="replace").strip() or "Copying the agent setup failed")
+    return describe_sync(plan)
+
+
 def install_agents(guest, agents, versions):
-    """Install any agent whose version the guest lacks, and give the agents their credentials."""
+    """Install any agent whose version the guest lacks, and give the agents their credentials and setup."""
     guest_stage(guest, "agents", *agent_specs(versions))
     push_agent_credentials(guest, agents)
+    try:
+        if synced := sync_agent_setup(guest, agents):
+            print(f"Copied {synced} into {guest.name}", flush=True)
+    except (Error, OSError, ValueError, subprocess.SubprocessError) as error:
+        print(f"rox: Could not copy your agent setup into {guest.name}. ({error})", file=sys.stderr, flush=True)
     guest.agents = dict(versions)
     guest.save()
 
@@ -1753,6 +2069,30 @@ def update_all_agents(config_value=None):
         raise Error(f"Could not update {', '.join(failed)}")
 
 
+def parse_sync_options(items, servers):
+    """The sync settings that --sync and --mcp ask for, or None when neither is given."""
+    if items is None and not servers:
+        return None
+    sync = {}
+    if items is not None:
+        chosen = {item.strip() for item in items.split(",") if item.strip()} - {"none"}
+        if unknown := sorted(chosen - set(SYNC_DEFAULTS)):
+            raise Error(f"Unknown --sync item {unknown[0]}. Use {', '.join(SYNC_DEFAULTS)} or none")
+        sync = {item: item in chosen for item in SYNC_DEFAULTS}
+    if servers:
+        sync["mcp"] = list(dict.fromkeys(servers))
+    return sync
+
+
+def describe_agent_sync(agent, sync):
+    """Say what new guests get from this machine's setup for agent."""
+    plan = agent_sync_plan({agent: {"sync": sync}})
+    copied = describe_sync(plan)
+    print(f"New guests get {copied} from this machine" if copied else
+          f"New guests get none of this machine's {AGENT_NAMES[agent]} skills, instructions or settings",
+          flush=True)
+
+
 def read_secret(prompt, help_text):
     """Read a token without echoing it, or a line from stdin when it's piped. Return "" when blank."""
     if sys.stdin.isatty():
@@ -1780,8 +2120,9 @@ def configure_agents(args):
     config_path = config_location(args.config)
     if args.version and not (args.version == "latest" or re.fullmatch(VERSION_PATTERN, args.version)):
         raise Error("Expected latest or a version such as 1.2.3 for --version")
+    sync = parse_sync_options(args.sync, args.mcp)
     if args.agent is None:
-        if args.off or args.version or args.api_key or args.auth_file:
+        if args.off or args.version or args.api_key or args.auth_file or sync is not None:
             raise Error("Name the agent these options are for: rox config agents claude or rox config agents codex")
         if not sys.stdin.isatty():
             raise Error("Name the agent to set up: rox config agents claude or rox config agents codex")
@@ -1795,9 +2136,16 @@ def configure_agents(args):
         raise Error("--auth-file is for codex")
 
     updates = {}
+    configured = config_for(config_path).get("agents")
+    configured = configured if isinstance(configured, dict) else {}
     for agent in chosen:
         if args.off:
             updates[agent] = None
+            continue
+        if (sync is not None and not (args.version or args.api_key or args.auth_file)
+                and isinstance(configured.get(agent), dict)):
+            # Changing only what's copied keeps the credentials, so there's nothing to ask for.
+            updates[agent] = "keep"
             continue
         if agent == "claude":
             value = read_secret("Claude Code token or Anthropic API key: ",
@@ -1830,13 +2178,21 @@ def configure_agents(args):
             previous = current.get(agent) if isinstance(current.get(agent), dict) else {}
             # Delete the secrets rox saved for this agent that the new settings no longer use.
             for (owner, setting), filename in AGENT_SECRET_FILES.items():
-                if owner == agent and (update is None or setting not in update):
+                if owner == agent and update != "keep" and (update is None or setting not in update):
                     config_path.with_name(filename).unlink(missing_ok=True)
             if update is None:
                 current.pop(agent, None)
                 print(f"New guests won't get {AGENT_NAMES[agent]}", flush=True)
                 continue
-            settings = {}
+            kept = previous.get("sync") if isinstance(previous.get("sync"), dict) else {}
+            if update == "keep":
+                settings = dict(previous, sync=sync_settings(agent, {**kept, **sync}, config_path))
+                current[agent] = settings
+                describe_agent_sync(agent, settings["sync"])
+                continue
+            # What the agent copies carries over unless --sync or --mcp changes it.
+            settings = {"sync": sync_settings(agent, {**kept, **sync}, config_path)} if sync is not None else (
+                {"sync": kept} if kept else {})
             version = args.version or previous.get("version")
             if version and version != "latest":
                 settings["version"] = version
@@ -1851,6 +2207,7 @@ def configure_agents(args):
             pinned = f" {settings['version']}" if "version" in settings else ", kept at the latest version"
             login = "with no credentials" if not update else "signed in"
             print(f"New guests get {AGENT_NAMES[agent]}{pinned}, {login}", flush=True)
+            describe_agent_sync(agent, sync_settings(agent, settings.get("sync"), config_path))
             if "auth_file" in update:
                 print("Each guest refreshes this login on its own. If guests sign each other out, "
                       "use rox config agents codex --api-key instead.", flush=True)
@@ -3466,6 +3823,11 @@ def main(argv):
     agent_config.add_argument("--api-key", action="store_true", help="codex: sign in with an OpenAI API key")
     agent_config.add_argument("--auth-file", help="codex: login file to copy into guests (default ~/.codex/auth.json)")
     agent_config.add_argument("--off", action="store_true", help="stop installing the agent in new guests")
+    agent_config.add_argument("--sync", metavar="ITEMS",
+                              help="what to copy from this machine: a comma list of skills, instructions, mcp "
+                                   "and settings, or none (default skills,instructions)")
+    agent_config.add_argument("--mcp", action="append", metavar="NAME",
+                              help="copy this remote MCP server into guests. Repeat for more")
     skill = commands.add_parser("skill", help="install the rox agent skill")
     skill_commands = skill.add_subparsers(dest="skill_command", required=True)
     install = skill_commands.add_parser("install", help="copy the bundled skill into Claude Code or Codex")

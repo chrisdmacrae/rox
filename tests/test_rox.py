@@ -27,6 +27,7 @@ REAL_REACHABLE = rox.reachable
 REAL_SUGGEST_APP_HOST = rox.suggest_app_host
 REAL_LOCAL_APP = rox.local_app
 REAL_RESTORE_GIT_AGENT = rox.restore_git_agent
+REAL_SYNC_AGENT_SETUP = rox.sync_agent_setup
 
 
 def base_image(version=None, image_id="sha256:base"):
@@ -58,7 +59,8 @@ class WorkspaceTests(unittest.TestCase):
         # Treat guests as running and reachable, so commands don't ask a real engine or tunnel.
         # Tests of those checks call the REAL_ copies.
         for name, value in (("guest_state", "running"), ("reachable", True), ("suggest_app_host", None),
-                            ("local_app", None), ("restore_git_agent", False)):
+                            ("local_app", None), ("restore_git_agent", False),
+                            ("sync_agent_setup", "")):
             runtime = patch.object(rox, name, return_value=value)
             runtime.start()
             self.addCleanup(runtime.stop)
@@ -2249,10 +2251,15 @@ class WorkspaceTests(unittest.TestCase):
     def test_agent_settings_are_validated(self):
         token = self.secret("token", "sk-ant-oat01-x")
         self.assertEqual(rox.agent_settings({}, "c"), {})
+        sync = rox.SYNC_DEFAULTS
         self.assertEqual(rox.agent_settings({"agents": {"claude": {"token_file": str(token)}, "codex": {}}}, "c"),
-                         {"claude": {"version": "latest", "token_file": token}, "codex": {"version": "latest"}})
+                         {"claude": {"version": "latest", "sync": sync, "token_file": token},
+                          "codex": {"version": "latest", "sync": sync}})
         self.assertEqual(rox.agent_settings({"agents": {"codex": {"version": "0.171.0"}}}, "c"),
-                         {"codex": {"version": "0.171.0"}})
+                         {"codex": {"version": "0.171.0", "sync": sync}})
+        self.assertEqual(rox.agent_settings({"agents": {"codex": {"sync": {"skills": False, "mcp": ["docs"]}}}},
+                                            "c")["codex"]["sync"],
+                         {"skills": False, "instructions": True, "mcp": ["docs"], "settings": False})
         loose = self.secret("loose", "x", 0o644)
         for agents, message in (
             ([], "Expected an object for agents"),
@@ -2263,6 +2270,10 @@ class WorkspaceTests(unittest.TestCase):
             ({"claude": {"token_file": str(loose)}}, "chmod 600"),
             ({"claude": {"token_file": str(self.root / "missing")}}, "File does not exist"),
             ({"claude": {"token_file": str(token), "api_key_file": str(token)}}, "Choose one of"),
+            ({"claude": {"sync": ["skills"]}}, "Expected an object for agents.claude.sync"),
+            ({"claude": {"sync": {"plugins": True}}}, "Unknown setting agents.claude.sync.plugins"),
+            ({"claude": {"sync": {"skills": "yes"}}}, "true or false for agents.claude.sync.skills"),
+            ({"claude": {"sync": {"mcp": "docs"}}}, "list of server names"),
         ):
             with self.subTest(agents=agents), self.assertRaisesRegex(rox.Error, message):
                 rox.agent_settings({"agents": agents}, "c")
@@ -2442,7 +2453,7 @@ class WorkspaceTests(unittest.TestCase):
         self.assertEqual(launched, ["rox:linux-agents", "rox:linux"])
         self.assertEqual(stages, ["prepare", ("agents", "claude=2.0.0"), "server", "session",
                                   "prepare", "server", "session"])
-        self.assertEqual(pushed, [{"claude": {"version": "latest", "token_file": token}}])
+        self.assertEqual(pushed, [{"claude": {"version": "latest", "sync": rox.SYNC_DEFAULTS, "token_file": token}}])
         self.assertIn("Agents     Claude Code 2.0.0", printed.getvalue())
         agents = sorted(rox.local_guests(), key=lambda guest: bool(guest.agents))
         self.assertEqual([guest.agents for guest in agents], [{}, {"claude": "2.0.0"}])
@@ -2460,7 +2471,7 @@ class WorkspaceTests(unittest.TestCase):
         ):
             rox.main(["update-agents", "--all", "--config", str(config)])
             rox.main(["update-agents", "rv-fixture-000011112222", "--config", str(config)])
-        versions.assert_called_with({"codex": {"version": "latest"}}, refresh=True)
+        versions.assert_called_with({"codex": {"version": "latest", "sync": rox.SYNC_DEFAULTS}}, refresh=True)
         self.assertEqual(installed, [("rv-fixture-000011112222", "agents", "codex=0.2.0")] * 2)
         self.assertEqual(rox.Guest.load("rv-fixture-000011112222").agents, {"codex": "0.2.0"})
         self.assertIn("has Codex 0.2.0 already", printed.getvalue())
@@ -2468,6 +2479,78 @@ class WorkspaceTests(unittest.TestCase):
             rox.main(["update-agents", "rv-fixture-000011112222", "--config", str(self.root / "none.json")])
         with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
             rox.main(["update-agents"])
+
+    def test_agent_setup_is_copied_into_the_guest_and_cleaned_up_next_time(self):
+        home, guest_home = self.root / "home", self.root / "guest-home"
+        claude, codex = home / ".claude", home / ".codex"
+        for skill in ("alpha", "rox", "notes"):
+            (claude / "skills" / skill).mkdir(parents=True)
+        (claude / "skills" / "alpha" / "SKILL.md").write_text("alpha")
+        (claude / "skills" / "rox" / "SKILL.md").write_text("rox")
+        outside = self.root / "linked-skill"
+        (outside / ".git").mkdir(parents=True)
+        (outside / "SKILL.md").write_text("linked")
+        (outside / ".git" / "HEAD").write_text("ref")
+        (claude / "skills" / "linked").symlink_to(outside)
+        (home / ".agents" / "skills" / "beta").mkdir(parents=True)
+        (home / ".agents" / "skills" / "beta" / "SKILL.md").write_text("beta")
+        (claude / "CLAUDE.md").write_text("Be brief.")
+        (claude / "settings.json").write_text(json.dumps({"model": "opus", "hooks": {"Stop": []}}))
+        (home / ".claude.json").write_text(json.dumps({"mcpServers": {
+            "docs": {"type": "http", "url": "https://docs.example/mcp"}, "local": {"command": "/opt/tool"}}}))
+        codex.mkdir()
+        (codex / "config.toml").write_text(
+            'model = "gpt"\nnotify = ["/bin/say"]\n\n[mcp_servers.docs]\nurl = "https://docs.example/mcp"\n\n'
+            '[mcp_servers.local]\ncommand = "/opt/tool"\n')
+        (guest_home / ".codex").mkdir(parents=True)
+        (guest_home / ".claude.json").write_text(json.dumps({"hasCompletedOnboarding": True,
+                                                             "mcpServers": {"mine": {"type": "sse", "url": "u"}}}))
+        (guest_home / ".codex" / "config.toml").write_text('[mcp_servers.mine]\nurl = "u"\n')
+        guest = self.saved_guest()
+        agents = {"claude": {"sync": {**rox.SYNC_DEFAULTS, "mcp": True, "settings": True}},
+                  "codex": {"sync": {**rox.SYNC_DEFAULTS, "mcp": ["docs", "local", "missing"], "settings": True}}}
+
+        def sync(agents):
+            with patch.object(rox, "remote_command", side_effect=lambda guest, argv: ["env", f"HOME={guest_home}",
+                                                                                       *argv]), \
+                    contextlib.redirect_stderr(io.StringIO()) as warned:
+                return REAL_SYNC_AGENT_SETUP(guest, agents), warned.getvalue()
+
+        copied, warned = sync(agents)
+        self.assertIn("skills alpha, beta, linked; CLAUDE.md; Claude Code MCP servers docs; "
+                      "Codex MCP servers docs; Claude Code settings; Codex settings", copied)
+        self.assertIn("The local MCP server runs a program on this machine", warned)
+        self.assertIn("no MCP server named missing", warned)
+        skills = guest_home / ".claude" / "skills"
+        self.assertEqual(sorted(path.name for path in skills.iterdir()), ["alpha", "linked"])
+        self.assertFalse((skills / "linked").is_symlink())
+        self.assertFalse((skills / "linked" / ".git").exists())
+        self.assertEqual((guest_home / ".agents" / "skills" / "beta" / "SKILL.md").read_text(), "beta")
+        self.assertEqual((guest_home / ".claude" / "CLAUDE.md").read_text(), "Be brief.")
+        self.assertEqual(json.loads((guest_home / ".claude" / "settings.json").read_text()), {"model": "opus"})
+        state = json.loads((guest_home / ".claude.json").read_text())
+        self.assertEqual(sorted(state["mcpServers"]), ["docs", "mine"])
+        self.assertEqual((guest_home / ".claude.json").stat().st_mode & 0o777, 0o600)
+        config = rox.tomllib.loads((guest_home / ".codex" / "config.toml").read_text())
+        self.assertEqual(config, {"model": "gpt", "mcp_servers": {"mine": {"url": "u"},
+                                                                  "docs": {"url": "https://docs.example/mcp"}}})
+
+        shutil.rmtree(claude / "skills" / "alpha")
+        copied, _ = sync({"claude": {"sync": rox.SYNC_DEFAULTS}, "codex": {"sync": rox.SYNC_DEFAULTS}})
+        self.assertEqual(copied, "skills beta, linked; CLAUDE.md")
+        self.assertEqual(sorted(path.name for path in skills.iterdir()), ["linked"])
+        self.assertFalse((guest_home / ".claude" / "settings.json").exists())
+        self.assertEqual(sorted(json.loads((guest_home / ".claude.json").read_text())["mcpServers"]), ["mine"])
+        self.assertEqual(rox.tomllib.loads((guest_home / ".codex" / "config.toml").read_text()),
+                         {"mcp_servers": {"mine": {"url": "u"}}})
+
+    def test_codex_config_is_written_back_as_the_same_toml(self):
+        config = {"model": "gpt", "features": {"x": True}, "profiles": {"fast": {"model": "mini", "n": 2}},
+                  "mcp_servers": {"a.b": {"url": "u", "http_headers": {"K": "v"}, "args": ["1", "2"]}},
+                  "empty": {}}
+        self.assertEqual(rox.tomllib.loads(rox.dump_toml(config)), config)
+        with self.assertRaisesRegex(ValueError, "can't write"):
+            rox.dump_toml({"when": object()})
 
     def test_ssh_clones_fall_back_to_the_default_ssh_keys(self):
         args = rox.argparse.Namespace(git_key=None, git_known_hosts="known")
@@ -2518,7 +2601,17 @@ class WorkspaceTests(unittest.TestCase):
         _, saved = configure("claude", "--off")
         self.assertEqual(list(saved["agents"]), ["codex"])
         self.assertFalse(config.with_name("anthropic-api-key").exists())
+        _, saved = configure("codex", "--sync", "skills,mcp", "--mcp", "docs")
+        self.assertEqual(saved["agents"]["codex"], {
+            "api_key_file": str(config.with_name("openai-api-key")),
+            "sync": {"skills": True, "instructions": False, "mcp": ["docs"], "settings": False}})
+        self.assertTrue(config.with_name("openai-api-key").exists())
+        _, saved = configure("codex", "--sync", "none")
+        self.assertEqual(saved["agents"]["codex"]["sync"],
+                         {"skills": False, "instructions": False, "mcp": False, "settings": False})
         for argv, message in ((["claude", "--version", "new"], "Expected latest or a version"),
+                              (["codex", "--sync", "plugins"], "Unknown --sync item plugins"),
+                              (["--sync", "skills"], "Name the agent"),
                               (["claude", "--auth-file", "x"], "--auth-file is for codex"),
                               ([], "Name the agent to set up")):
             with self.subTest(argv=argv), self.assertRaisesRegex(rox.Error, message):

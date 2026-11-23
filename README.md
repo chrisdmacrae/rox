@@ -224,7 +224,7 @@ claude setup-token && rox config agents claude   # paste the token, or an Anthro
 codex login && rox config agents codex           # copies ~/.codex/auth.json, or pass --api-key
 ```
 
-The credentials go to each guest over SSH on stdin and are never written into an image. The guest's Rex server and shells read them, so `rex run -- claude ...` works with no sign-in. Each agent follows its latest release: Rox checks at `rox up`, at most every six hours, and rebuilds only a last `-agents` layer of the container image when a new one comes out. Pin a version with `rox config agents codex --version 0.171.0`. Update guests that are already running with `rox update-agents NAME` or `rox update-agents --all`. The [agent CLIs guide](docs/src/content/docs/guides/agent-clis.mdx) has the details.
+The credentials go to each guest over SSH on stdin and are never written into an image. The guest's Rex server and shells read them, so `rex run -- claude ...` works with no sign-in. Each agent follows its latest release: Rox checks at `rox up`, at most every six hours, and rebuilds only a last `-agents` layer of the container image when a new one comes out. Pin a version with `rox config agents codex --version 0.171.0`. Update guests that are already running with `rox update-agents NAME` or `rox update-agents --all`. Guests also get a copy of your skills and your `CLAUDE.md` or `AGENTS.md` from the launcher. Add network MCP servers and settings with `rox config agents claude --sync skills,instructions,mcp,settings`. The [agent CLIs guide](docs/src/content/docs/guides/agent-clis.mdx) has the details.
 
 ## Keeping guests running
 

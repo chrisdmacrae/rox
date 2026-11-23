@@ -60,6 +60,7 @@ Each key is an agent, `claude` or `codex`, and each value is an object. An empty
 | `api_key_file` | `claude` | An Anthropic API key. Guests get it as `ANTHROPIC_API_KEY`. |
 | `auth_file` | `codex` | A Codex login file, usually `~/.codex/auth.json`, copied to `~/.codex/auth.json` in each guest. |
 | `api_key_file` | `codex` | An OpenAI API key, which each guest signs in with through `codex login --with-api-key`. |
+| `sync` | both | What to copy from this machine's agent setup: an object with `skills` and `instructions` (`true` by default), `settings` (`false` by default), and `mcp`, which is `false` (the default), `true` for every MCP server that runs over the network, or a list of server names. See [Your skills, instructions and MCP servers](../../guides/agent-clis/#your-skills-instructions-and-mcp-servers). |
 
 ## Backend settings
 

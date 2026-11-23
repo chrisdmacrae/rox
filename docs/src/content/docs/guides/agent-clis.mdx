@@ -1,6 +1,6 @@
 ---
 title: Agent CLIs in guests
-description: Install Claude Code and Codex in every guest, signed in with your credentials and kept on the latest release.
+description: Install Claude Code and Codex in every guest, signed in, with your skills, and kept on the latest release.
 ---
 
 import { Aside, Steps } from '@astrojs/starlight/components';
@@ -61,6 +61,45 @@ A guest with these credentials can spend on your account, the same way the agent
 
 Each guest refreshes a copied Codex ChatGPT login on its own. If guests start signing each other out, switch Codex to an API key with `rox config agents codex --api-key`.
 </Aside>
+
+## Your skills, instructions and MCP servers
+
+Guests get the skills, instructions and MCP servers that the project's repository holds, such as `.claude/skills/`, `.mcp.json`, `CLAUDE.md` and `AGENTS.md`, because they come with the clone. Rox also copies some of the launcher's own agent setup into each guest when it starts:
+
+| What | Copied | From the launcher |
+|---|---|---|
+| `skills` | By default | `~/.claude/skills`, `~/.codex/skills` and `~/.agents/skills`. Links are followed. The rox skill is left out, because rox isn't installed in guests |
+| `instructions` | By default | `~/.claude/CLAUDE.md` and `~/.codex/AGENTS.md` |
+| `mcp` | When you turn it on | MCP servers that run over the network: Claude Code's user-scope `http` and `sse` servers in `~/.claude.json`, and Codex's `url` servers in `~/.codex/config.toml` |
+| `settings` | When you turn it on | `~/.claude/settings.json` and the rest of `~/.codex/config.toml`, without hooks, the status line, `env`, `notify`, plugins and per-project entries, which name programs and paths on the launcher |
+
+Choose what to copy for each agent with `--sync`, and name MCP servers with `--mcp`:
+
+```sh
+rox config agents claude --sync skills,instructions,mcp
+rox config agents codex --mcp docs --mcp linear
+rox config agents claude --sync none
+```
+
+Changing only what's copied keeps the agent's credentials, so Rox doesn't ask for them again. Rox prints what new guests will get. In the config, it's the agent's `sync` object:
+
+```json
+{
+  "agents": {
+    "claude": { "token_file": "~/.config/rox/claude-token",
+                "sync": { "skills": true, "instructions": true, "mcp": ["docs"], "settings": false } }
+  }
+}
+```
+
+`mcp` is `false`, `true` for every MCP server that runs over the network, or a list of server names.
+
+Rox records what it copied in the guest's `~/.rox/synced.json`. The next copy replaces it, so a skill you delete on the launcher leaves the guest too, and MCP servers the guest set up itself stay. `rox update-agents NAME` copies the current setup into a running guest.
+
+- **MCP servers that run a program**, such as `npx` or a binary on your Mac, aren't copied, because the guest doesn't have the program. Install them in a [project image](../project-images/) or the project's `.mcp.json` instead.
+- **MCP servers that sign in with OAuth** need signing in again inside the guest. The launcher keeps those tokens in its keychain. Headers and API keys written in a server's settings are copied, into files only the guest user can read.
+- **Plugins** aren't copied. Neither are skills that come from plugins.
+- **For guests on a [Rex remote host](../remote-hosts/)**, the copy comes from that host's setup, not yours.
 
 ## Staying on the latest release
 

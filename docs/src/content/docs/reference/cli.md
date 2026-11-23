@@ -109,7 +109,7 @@ Restore Rex access to a guest. This also works for a guest kept after a failed c
 
 ## `rox update-agents NAME` / `rox update-agents --all`
 
-Bring a running guest's [agent CLIs](../../guides/agent-clis/) up to date. Rox checks for the latest releases, installs any version the guest lacks, and writes the current credentials from the config again. New shells get changed credentials right away, and workers that `rex run` starts get them after `rox stop` and `rox start`. `--all` updates every running guest on this machine. If this machine has no record of `NAME`, Rox finds the Rex host that runs it and works there.
+Bring a running guest's [agent CLIs](../../guides/agent-clis/) up to date. Rox checks for the latest releases, installs any version the guest lacks, writes the current credentials from the config again, and copies the launcher's current skills, instructions, and chosen MCP servers and settings. New shells get changed credentials right away, and workers that `rex run` starts get them after `rox stop` and `rox start`. `--all` updates every running guest on this machine. If this machine has no record of `NAME`, Rox finds the Rex host that runs it and works there.
 
 | Option | Description |
 | --- | --- |
@@ -176,7 +176,7 @@ Ask for a Tailscale auth key, save it to `tailscale-authkey` next to the config 
 
 ## `rox config agents [claude|codex]`
 
-Install [Claude Code or Codex](../../guides/agent-clis/) in new guests, signed in with your credentials. For `claude`, Rox asks for a token from `claude setup-token`, or an Anthropic API key, and saves it to `claude-token` or `anthropic-api-key` next to the config, readable only by you. For `codex`, Rox uses your Codex login in `~/.codex/auth.json` (or `$CODEX_HOME/auth.json`), or, with `--api-key`, asks for an OpenAI API key and saves it to `openai-api-key`. Leave a token blank to install the agent without credentials. Without an agent, Rox asks which ones to set up. When stdin isn't a terminal, Rox reads the token from stdin. Guests that are already running get the change with `rox update-agents`.
+Install [Claude Code or Codex](../../guides/agent-clis/) in new guests, signed in with your credentials. For `claude`, Rox asks for a token from `claude setup-token`, or an Anthropic API key, and saves it to `claude-token` or `anthropic-api-key` next to the config, readable only by you. For `codex`, Rox uses your Codex login in `~/.codex/auth.json` (or `$CODEX_HOME/auth.json`), or, with `--api-key`, asks for an OpenAI API key and saves it to `openai-api-key`. Leave a token blank to install the agent without credentials. Without an agent, Rox asks which ones to set up. When stdin isn't a terminal, Rox reads the token from stdin. Each guest also gets a copy of this machine's skills and instructions for the agent, and, if you choose, its MCP servers and settings. Guests that are already running get the change with `rox update-agents`.
 
 | Option | Description |
 | --- | --- |
@@ -184,6 +184,8 @@ Install [Claude Code or Codex](../../guides/agent-clis/) in new guests, signed i
 | `--api-key` | `codex`: sign in with an OpenAI API key instead of the Codex login file. |
 | `--auth-file PATH` | `codex`: the login file to copy into guests. Defaults to `~/.codex/auth.json`. |
 | `--off` | Stop installing the agent in new guests, and delete the token Rox saved for it. |
+| `--sync ITEMS` | What to [copy from this machine](../../guides/agent-clis/#your-skills-instructions-and-mcp-servers): a comma list of `skills`, `instructions`, `mcp` and `settings`, or `none`. The default is `skills,instructions`. Changing only this keeps the agent's credentials. |
+| `--mcp NAME` | Copy this MCP server into guests. It must run over the network. Repeat it for more. |
 | `--config PATH` | A different rox config file. |
 
 ## `rox skill install`
