@@ -3,7 +3,7 @@ title: Configuration
 description: The rox config file and its settings.
 ---
 
-Rox reads `${XDG_CONFIG_HOME:-$HOME/.config}/rox/config.json` on the machine that runs the guest. Pass `--config PATH` to use a different file. Command-line options take precedence over the config.
+Rox reads `${XDG_CONFIG_HOME:-$HOME/.config}/rox/config.json` on the machine that runs the guest. Pass `--config PATH` to use a different file. Run `rox config` to open it in your editor. Command-line options take precedence over the config.
 
 ```json title="config.json"
 {

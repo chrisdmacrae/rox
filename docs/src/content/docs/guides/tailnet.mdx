@@ -39,14 +39,13 @@ A guest on your tailnet is a device on your network. An agent in the guest can r
 
 2. **Create an auth key.** In **Settings → Keys**, generate an auth key that is **reusable**, **ephemeral**, and tagged `tag:rox-guest`. Pre-approve it if your tailnet requires device approval. Reusable lets one key enroll many guests. Ephemeral makes Tailscale remove a guest's device soon after the guest stops.
 
-3. **Save the key on the launcher**, readable only by you:
+3. **Save the key on the launcher.** Run this on the machine that runs the guests, which for local guests is the machine you're on, and paste the key when asked:
 
    ```sh
-   umask 077
-   printf '%s\n' 'tskey-auth-…' > ~/.config/rox/tailscale-authkey
+   rox config tailscale
    ```
 
-4. **Point the rox config at it**, in `~/.config/rox/config.json` on the launcher:
+   It saves the key to `~/.config/rox/tailscale-authkey`, readable only by you, and adds this to `~/.config/rox/config.json`:
 
    ```json
    {
@@ -57,9 +56,11 @@ A guest on your tailnet is a device on your network. An agent in the guest can r
    }
    ```
 
+   Pass `--tag TAG` to use other tags, and `--control-url URL` for a self-hosted control server. You can also pipe the key in, for example `op read op://… | rox config tailscale`. If `auth_key_file` is already set, Rox writes the new key to that file.
+
 </Steps>
 
-Auth keys expire, after 90 days at most. When one does, launches stop with a message that the key was rejected. Generate a new key and replace the file.
+Auth keys expire, after 90 days at most. When one does, launches stop with a message that the key was rejected. Generate a new key and run `rox config tailscale` again.
 
 ## What changes
 

@@ -368,6 +368,65 @@ class WorkspaceTests(unittest.TestCase):
             rox.main(["key", "remove", str(old_key), "--config", str(config)])
         self.assertEqual(json.loads(config.read_text()), {**settings, "git_keys": [str(new_key)]})
 
+    def test_config_command_creates_the_config_and_opens_it_in_the_editor(self):
+        config = self.root / "config-home" / "rox" / "config.json"
+        editor = self.root / "fake editor"
+        editor.write_text("#!/bin/sh\nprintf '%s\\n' \"$1\" > \"$(dirname \"$0\")/edited\"\n")
+        editor.chmod(0o755)
+        with patch.dict(os.environ, {"VISUAL": "", "EDITOR": f"{shlex.quote(str(editor))} --wait"}):
+            rox.main(["config"])
+        self.assertEqual(config.read_text(), "{}\n")
+        self.assertEqual((self.root / "edited").read_text(), "--wait\n")
+
+    def test_config_command_reports_invalid_json_and_a_missing_editor(self):
+        config = self.root / "custom config.json"
+        with patch.dict(os.environ, {"VISUAL": "sh -c 'echo \"{nope\" > \"$0\"'"}):
+            with self.assertRaisesRegex(rox.Error, "isn't valid JSON"):
+                rox.main(["config", "--config", str(config)])
+        with patch.dict(os.environ, {"VISUAL": "no-such-editor-for-rox"}):
+            with self.assertRaisesRegex(rox.Error, "Could not find the editor no-such-editor-for-rox"):
+                rox.main(["config", "--config", str(config)])
+
+    def test_config_tailscale_saves_a_private_key_and_a_valid_tailscale_section(self):
+        config = self.root / "config-home" / "rox" / "config.json"
+        config.parent.mkdir(parents=True)
+        config.write_text(json.dumps({"git_keys": ["~/.ssh/id"]}))
+        with patch.object(rox.sys, "stdin", io.StringIO("tskey-auth-first\n")), \
+                contextlib.redirect_stdout(io.StringIO()):
+            rox.main(["config", "tailscale"])
+        key = config.with_name("tailscale-authkey")
+        self.assertEqual(key.read_text(), "tskey-auth-first\n")
+        self.assertEqual(key.stat().st_mode & 0o777, 0o600)
+        saved = json.loads(config.read_text())
+        self.assertEqual(saved, {"git_keys": ["~/.ssh/id"],
+                                 "tailscale": {"auth_key_file": str(key), "tags": ["tag:rox-guest"]}})
+        self.assertEqual(rox.tailscale_settings(saved, config, False),
+                         {"key": key, "tags": ["tag:rox-guest"], "control_url": ""})
+
+        # Running it again replaces the key in the configured file and keeps the control server.
+        custom = self.root / "custom key"
+        saved["tailscale"].update(auth_key_file=str(custom), control_url="https://hs.test")
+        config.write_text(json.dumps(saved))
+        with patch.object(rox.sys, "stdin", io.StringIO("tskey-auth-second\n")), \
+                contextlib.redirect_stdout(io.StringIO()):
+            rox.main(["config", "tailscale", "--tag", "tag:a", "--tag", "tag:b"])
+        self.assertEqual(custom.read_text(), "tskey-auth-second\n")
+        self.assertEqual(json.loads(config.read_text())["tailscale"],
+                         {"auth_key_file": str(custom), "tags": ["tag:a", "tag:b"], "control_url": "https://hs.test"})
+
+    def test_config_tailscale_rejects_bad_input_without_writing(self):
+        config = self.root / "alt config.json"
+        for argv, stdin, message in (
+            (["--tag", "rox-guest"], "tskey-auth-x\n", "tag such as tag:rox-guest"),
+            (["--control-url", "http://hs.test"], "tskey-auth-x\n", "https:// URL"),
+            ([], "\n", "Expected a Tailscale auth key"),
+        ):
+            with self.subTest(argv=argv), patch.object(rox.sys, "stdin", io.StringIO(stdin)), \
+                    self.assertRaisesRegex(rox.Error, message):
+                rox.main(["config", "tailscale", "--config", str(config), *argv])
+        self.assertFalse(config.exists())
+        self.assertFalse(config.with_name("tailscale-authkey").exists())
+
     def test_reconnect_registers_a_retained_guest_that_never_created_a_session(self):
         name = "rv-retained-000011112222"
         guest = rox.Guest(name, "container", "image", "workspace",

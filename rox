@@ -5,6 +5,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
 import fcntl
+import getpass
 import hashlib
 import ipaddress
 import json
@@ -315,21 +316,85 @@ def write_config(path, config):
         pending.unlink(missing_ok=True)
 
 
+@contextmanager
+def locked_config(config_path):
+    """Hold the config's lock and yield its settings, so a read, change and write can't interleave."""
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    with config_path.with_name(f"{config_path.name}.lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        yield config_for(config_path)
+
+
+def write_private(path, text):
+    """Replace path with text that only this user may read."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    pending = Path(name)
+    try:
+        with os.fdopen(fd, "w") as file:
+            file.write(text)
+        pending.replace(path)
+    finally:
+        pending.unlink(missing_ok=True)
+
+
+def read_auth_key():
+    """Read a Tailscale auth key without echoing it, or from stdin when it's piped."""
+    if sys.stdin.isatty():
+        print("Create a reusable, ephemeral auth key tagged for guests in the Tailscale admin console, "
+              "under Settings → Keys.", flush=True)
+        key = getpass.getpass("Tailscale auth key: ")
+    else:
+        key = sys.stdin.readline()
+    key = key.strip()
+    if not key or any(character.isspace() for character in key):
+        raise Error("Expected a Tailscale auth key such as tskey-auth-…")
+    return key
+
+
+def configure_tailscale(args):
+    """Save a Tailscale auth key next to the config and point the config's tailscale section at it."""
+    config_path = config_location(args.config)
+    tags = args.tag or ["tag:rox-guest"]
+    for tag in tags:
+        if not re.fullmatch(r"tag:[a-z0-9-]+", tag):
+            raise Error(f"Expected a tag such as tag:rox-guest, not {tag}")
+    if args.control_url and not args.control_url.startswith("https://"):
+        raise Error("Expected an https:// URL for --control-url")
+    key = read_auth_key()
+    with locked_config(config_path) as config:
+        current = config.get("tailscale")
+        if current is not None and not isinstance(current, dict):
+            raise Error(f"Expected an object for tailscale in {config_path}")
+        current = current or {}
+        key_path = configured_location(current.get("auth_key_file")) or config_path.with_name("tailscale-authkey")
+        write_private(key_path, key + "\n")
+        settings = {"auth_key_file": str(key_path), "tags": tags}
+        control_url = args.control_url if args.control_url is not None else current.get("control_url")
+        if control_url:
+            settings["control_url"] = control_url
+        config["tailscale"] = settings
+        write_config(config_path, config)
+    print(f"Saved the auth key to {key_path}", flush=True)
+    print(f"Guests started from now on join the tailnet with {', '.join(tags)}. Guests that are "
+          "already running stay off it until you recreate them.", flush=True)
+
+
+def configured_location(value):
+    return Path(value).expanduser().resolve() if value else None
+
+
 def edit_git_keys(args):
     config_path = config_location(args.config)
     path = Path(args.path).expanduser().resolve()
     adding = args.key_command == "add"
     if adding:
         configured_file(path)
-        config_path.parent.mkdir(parents=True, exist_ok=True)
     elif not config_path.exists():
         print(f"Git SSH key is not configured at {path}")
         return
 
-    lock_path = config_path.with_name(f"{config_path.name}.lock")
-    with lock_path.open("a") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
-        config = config_for(config_path)
+    with locked_config(config_path) as config:
         keys = validate_git_keys(config.get("git_keys", []), config_path)
         remaining = [key for key in keys if Path(key).expanduser().resolve() != path]
         present = len(remaining) != len(keys)
@@ -342,6 +407,24 @@ def edit_git_keys(args):
             write_config(config_path, config)
             action = "Added" if adding else "Removed"
             print(f"{action} Git SSH key path {path}")
+
+
+def edit_config(value):
+    """Open the rox config in the user's editor, creating it if needed, and check it parses."""
+    path = config_location(value)
+    editor = shlex.split(os.environ.get("VISUAL") or os.environ.get("EDITOR") or "vi")
+    if not shutil.which(editor[0]):
+        raise Error(f"Could not find the editor {editor[0]}. Set VISUAL or EDITOR to an editor on PATH")
+    if not path.exists():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("{}\n")
+    status = subprocess.run([*editor, str(path)]).returncode
+    if status:
+        raise Error(f"{editor[0]} exited with status {status}")
+    try:
+        config_for(path)
+    except json.JSONDecodeError as error:
+        raise Error(f"{path} isn't valid JSON: {error}. Run rox config to fix it") from None
 
 
 def configured_file(value):
@@ -1867,6 +1950,15 @@ def main(argv):
         edit = key_commands.add_parser(action, help=help_text)
         edit.add_argument("path", help="path to the SSH private key")
         edit.add_argument("--config", help="alternate Rox configuration file")
+    config_parser = commands.add_parser("config", help="open the rox config in VISUAL or EDITOR")
+    config_parser.add_argument("--config", help="alternate Rox configuration file")
+    config_commands = config_parser.add_subparsers(dest="config_command")
+    tailnet_parser = config_commands.add_parser(
+        "tailscale", help="save a Tailscale auth key and put new guests on the tailnet")
+    tailnet_parser.add_argument("--config", default=argparse.SUPPRESS, help="alternate Rox configuration file")
+    tailnet_parser.add_argument("--tag", action="append",
+                                help="tag for guest devices (repeatable); defaults to tag:rox-guest")
+    tailnet_parser.add_argument("--control-url", help="https:// URL of a self-hosted control server such as Headscale")
     skill = commands.add_parser("skill", help="install the rox agent skill")
     skill_commands = skill.add_subparsers(dest="skill_command", required=True)
     install = skill_commands.add_parser("install", help="copy the bundled skill into Claude Code or Codex")
@@ -1897,6 +1989,10 @@ def main(argv):
         reconnect(args.name, app_host=not args.no_app_host)
     elif args.command == "key":
         edit_git_keys(args)
+    elif args.command == "config" and args.config_command == "tailscale":
+        configure_tailscale(args)
+    elif args.command == "config":
+        edit_config(args.config)
     elif args.command == "skill":
         if args.agent and args.dir:
             parser.error("choose --agent or --dir, not both")

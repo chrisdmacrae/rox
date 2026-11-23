@@ -96,6 +96,24 @@ Add or remove a Git SSH private key path in `git_keys`. Removing a path doesn't 
 | --- | --- |
 | `--config PATH` | A different rox config file. |
 
+## `rox config`
+
+Open the rox config in `$VISUAL`, or `$EDITOR`, or `vi`, creating it as `{}` if it doesn't exist. When the editor exits, Rox checks that the file is still valid JSON.
+
+| Option | Description |
+| --- | --- |
+| `--config PATH` | A different rox config file. |
+
+## `rox config tailscale`
+
+Ask for a Tailscale auth key, save it to `tailscale-authkey` next to the config with only you able to read it, and set the config's `tailscale` section so new guests join your [tailnet](../../guides/tailnet/). When stdin isn't a terminal, Rox reads the key from stdin. If `auth_key_file` is already set, Rox writes the key to that file. Guests that are already running stay off the tailnet until you recreate them.
+
+| Option | Description |
+| --- | --- |
+| `--tag TAG` | Tag for guest devices. Repeat it for several. Defaults to `tag:rox-guest`. |
+| `--control-url URL` | `https://` URL of a self-hosted control server such as Headscale. Without it, Rox keeps any `control_url` already set. |
+| `--config PATH` | A different rox config file. |
+
 ## `rox skill install`
 
 Copy the [rox skill](../../guides/agents/) bundled with this rox version into an agent's skills folder. Without options, it installs for each agent set up on this machine: Claude Code (`${CLAUDE_CONFIG_DIR:-~/.claude}/skills/rox`) and Codex (`${CODEX_HOME:-~/.codex}/skills/rox`). Run it again after upgrading rox to update the skill.

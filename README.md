@@ -99,7 +99,7 @@ rox key add ~/.ssh/project_readonly
 rox key remove ~/.ssh/project_readonly
 ```
 
-The commands update `git_keys` in `${XDG_CONFIG_HOME:-$HOME/.config}/rox/config.json`. Removing a path leaves the key file on disk. Use `--config PATH` with the key command and with `rox up` to use an alternate file. See [config.example.json](config.example.json) for other settings.
+The commands update `git_keys` in `${XDG_CONFIG_HOME:-$HOME/.config}/rox/config.json`. Removing a path leaves the key file on disk. Use `--config PATH` with the key command and with `rox up` to use an alternate file. Run `rox config` to open the file in `$VISUAL` or `$EDITOR`. See [config.example.json](config.example.json) for other settings.
 
 - `git_keys` is a list of host-side SSH private key paths. Prefer read-only deploy keys. Repeat `--git-key PATH` to supply a different list for one launch. Encrypted keys can prompt for a passphrase on the host.
 - `git_known_hosts` or `--git-known-hosts PATH` supplies verified host keys for your Git servers. When omitted, Rox looks up the matching host and port in the launch machine's `~/.ssh/known_hosts`. Guest SSH still verifies the server's key.
@@ -207,7 +207,7 @@ rox up container --image ghcr.io/acme/agent-base:3 --memory 8G
 
 ## Reaching guests from other devices
 
-By default a guest's Rex server is reachable only on its launcher, through a Unix socket. To reach guests from any device, including the Rex app, add a `tailscale` section to the launcher's config. Rox then puts each guest's Rex server on your tailnet as its own device, named after the workspace, and registers that name as the host's second address. After `rox up --host`, the machine you launched from registers the guest by that name too. Other devices can reach it at the tailnet name.
+By default a guest's Rex server is reachable only on its launcher, through a Unix socket. To reach guests from any device, including the Rex app, run `rox config tailscale` on the launcher and paste a Tailscale auth key. It saves the key where only you can read it and adds a `tailscale` section to the launcher's config. Rox then puts each guest's Rex server on your tailnet as its own device, named after the workspace, and registers that name as the host's second address. After `rox up --host`, the machine you launched from registers the guest by that name too. Other devices can reach it at the tailnet name.
 
 ```json
 { "tailscale": { "auth_key_file": "~/.config/rox/tailscale-authkey", "tags": ["tag:rox-guest"] } }
