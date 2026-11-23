@@ -1309,7 +1309,8 @@ class WorkspaceTests(unittest.TestCase):
     def test_tailnet_enrollment_sends_the_key_on_stdin_and_registers_both_endpoints(self):
         guest = self.tailnet_guest()
         settings = {"key": self.auth_key(), "tags": ["tag:rox-guest"], "control_url": ""}
-        calls, states = [], iter(["starting", "running"])
+        # Tailscale reports needs_login briefly while it processes the key.
+        calls, states = [], iter(["starting", "needs_login", "running"])
 
         def fake_output(argv, **kwargs):
             calls.append((argv, kwargs.get("input")))
@@ -1349,9 +1350,15 @@ class WorkspaceTests(unittest.TestCase):
                 return json.dumps({"tailscale": {"state": "needs_login", "auth_url": "https://login.test/a"}})
             return "{}"
 
-        with patch.object(rox, "output", side_effect=fake_output), contextlib.redirect_stdout(io.StringIO()):
+        clock = iter(range(0, 1000, 10))
+        with (
+            patch.object(rox, "output", side_effect=fake_output),
+            patch.object(rox.time, "monotonic", side_effect=lambda: next(clock)),
+            patch.object(rox.time, "sleep"),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
             with self.assertRaisesRegex(rox.Error, "auth key was rejected"):
-                rox.enable_tailnet(guest, settings, 5)
+                rox.enable_tailnet(guest, settings, 30)
         self.assertNotIn("--allow-tailnet-members", shlex.split(calls[0][-1]))
 
     def test_down_signs_the_guest_out_of_the_tailnet(self):

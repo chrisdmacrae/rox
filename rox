@@ -999,15 +999,22 @@ def enable_tailnet(guest, settings, timeout):
     print(f"Adding {guest.name} to the tailnet", flush=True)
     tailscale_on(guest, settings["tags"], settings["control_url"], settings["key"].read_text().strip())
 
-    def settled():
-        state = tailnet_status(guest)
-        return state if state.get("state") in ("running", "needs_login") else None
+    # The node reports needs_login for a moment while Tailscale processes the key, so only a node
+    # still waiting for a sign-in when time runs out means the key was rejected.
+    last = {}
 
-    state = wait_for(settled, timeout, "the guest to join the tailnet")
-    if state["state"] == "needs_login" or not state.get("dns_name"):
-        raise Error("Tailscale asked for a browser sign-in, so the auth key was rejected. "
-                    "Check that it's valid, reusable, and allowed to use the configured tags")
-    guest.tailnet_name = state["dns_name"].rstrip(".")
+    def running():
+        last.update(state=tailnet_status(guest))
+        state = last["state"]
+        return state["dns_name"].rstrip(".") if state.get("state") == "running" and state.get("dns_name") else None
+
+    try:
+        guest.tailnet_name = wait_for(running, min(timeout, 60), "the guest to join the tailnet")
+    except Error:
+        if last.get("state", {}).get("state") == "needs_login":
+            raise Error("Tailscale still wants a browser sign-in, so the auth key was rejected. "
+                        "Check that it's valid, reusable, and allowed to use the configured tags") from None
+        raise
     guest.save()
     print(f"{guest.name} is on the tailnet at {guest.tailnet_name}", flush=True)
 
