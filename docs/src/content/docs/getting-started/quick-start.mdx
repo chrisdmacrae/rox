@@ -1,0 +1,59 @@
+---
+title: Quick start
+description: Launch your first workspace, open a shell in it, and tear it down.
+---
+
+import { Aside, Steps } from '@astrojs/starlight/components';
+
+<Steps>
+
+1. **Push your branch.** Rox clones the *remote* branch tip, so the guest only sees commits you've pushed. It uses the current branch's upstream when one is configured. Otherwise it uses `origin` and the current branch name.
+
+2. **Launch from anywhere inside the checkout.**
+
+   ```sh
+   rox up container
+   ```
+
+   Rox prints the workspace name, the guest checkout path, and the Rex session ID:
+
+   ```txt
+   Workspace  rv-my-project-3f9a1c2b7d40
+   Checkout   /home/workspace/.rox/rv-my-project-3f9a1c2b7d40/project
+   Session    session:01a2...
+   Inspect    rex -S rv-my-project-3f9a1c2b7d40 session inspect session:01a2...
+   ```
+
+3. **Run a command at boot (optional).** Arguments after `--` run in the guest's first Rex terminal. Without them, that terminal opens a shell.
+
+   ```sh
+   rox up container --branch feature/agent -- my-agent --model example
+   ```
+
+4. **Open a shell in the guest.**
+
+   ```sh
+   rox shell rv-my-project-3f9a1c2b7d40
+   ```
+
+   Rox registers the guest as a Rex host too, so `rex -S rv-my-project-3f9a1c2b7d40 ls` works from the launcher.
+
+5. **Remove it when you're done.**
+
+   ```sh
+   rox down rv-my-project-3f9a1c2b7d40
+   ```
+
+   Run `rox down` with no name from the project checkout to pick from that project's workspaces.
+
+</Steps>
+
+<Aside type="tip">
+	If the project has a `.rox.sh` setup hook, the first launch builds a [project image](../../guides/project-images/). Later launches skip the clone and the hook, so they start much faster.
+</Aside>
+
+## When a launch fails
+
+Rox registers the guest with Rex as soon as its server answers. If cloning or setup fails later, the guest is kept and you can still reach it with `rex -S NAME ls`. The error message prints the workspace name. Use `rox reconnect NAME` to restore access, or `rox down NAME` to remove it.
+
+Logs live under `${XDG_STATE_HOME:-$HOME/.local/state}/rox/NAME`. See [How it works](../../reference/how-it-works/).

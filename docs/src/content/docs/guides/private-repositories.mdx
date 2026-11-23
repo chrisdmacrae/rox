@@ -1,0 +1,42 @@
+---
+title: Private repositories
+description: Clone private repositories into guests without copying keys into them.
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+Manage Git SSH key paths on the launcher:
+
+```sh
+rox key add ~/.ssh/project_readonly
+rox key remove ~/.ssh/project_readonly
+```
+
+These commands update `git_keys` in `${XDG_CONFIG_HOME:-$HOME/.config}/rox/config.json`. Removing a path doesn't delete the key file. Pass `--config PATH` to `rox key` and `rox up` to use a different config file.
+
+## How keys are used
+
+Rox loads only the selected keys into a temporary SSH agent. That agent is forwarded to the guest only while Git clones, and it stops before the setup hook or any Rex terminal starts. **Private keys never leave the host.**
+
+- `git_keys` is a list of SSH private key paths on the launcher. Prefer read-only deploy keys. Repeat `--git-key PATH` to use a different list for one launch. Encrypted keys can prompt for their passphrase on the host.
+- `git_known_hosts`, or `--git-known-hosts PATH`, supplies verified host keys for your Git servers. If you leave it out, Rox copies the matching host and port entries from the launcher's `~/.ssh/known_hosts`. The guest still verifies the server's key.
+
+## Choosing the repository and branch
+
+Rox uses the current branch's upstream remote and branch when one is configured. Otherwise it uses `origin` and the current branch name.
+
+- `--remote NAME` picks a different remote.
+- `--repo URL` sets the clone URL directly.
+- `--branch NAME` picks an existing remote branch.
+
+For an HTTPS remote that needs authentication, use its SSH clone URL instead:
+
+```sh
+rox up container \
+  --repo git@github.com:organization/project.git \
+  --git-key ~/.ssh/project_readonly
+```
+
+<Aside>
+	Rox accepts only SSH and HTTPS remotes. HTTPS URLs can't include credentials.
+</Aside>

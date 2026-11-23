@@ -1,0 +1,40 @@
+---
+title: Project setup hook
+description: Prepare each guest with a .rox.sh script committed to your repository.
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+Commit a `.rox.sh` at the root of the branch you launch. Rox runs it with Bash from the guest checkout, as the guest's workspace user, and waits for it to finish.
+
+```bash title=".rox.sh"
+#!/usr/bin/env bash
+set -euo pipefail
+
+case "$ROX_BACKEND" in
+  container|linux) ./scripts/setup-linux.sh ;;
+  macos) ./scripts/setup-macos.sh ;;
+esac
+```
+
+Use it to install dependencies, write config, or install and sign in to your agent runner.
+
+- A nonzero exit marks the workspace as failed, and the initial Rex session doesn't start.
+- Changes made with `export` inside the hook only affect the hook and its child processes.
+- Git credentials aren't available. The temporary Git agent stops before the hook runs.
+- Pass `--no-hook` to skip the hook for one launch.
+
+## When the hook runs
+
+If the branch has a `.rox.sh`, the hook normally runs **once, while Rox builds a [project image](../project-images/)**, not on every boot. Later launches reuse that image and skip the hook. Check `ROX_PHASE` to tell the two cases apart:
+
+| `ROX_PHASE` | When | `REX_SERVER` | `ROX_NAME` |
+| --- | --- | --- | --- |
+| `build` | While the project image builds | Not set | The image name, such as `rox:my-project` |
+| `boot` | At boot, with `--no-prebuild` or `"prebuild": false` | The guest's running Rex server | The workspace name |
+
+The full list of variables is on the [Hook environment](../../reference/hook-environment/) page.
+
+<Aside type="caution" title="Long-running services">
+	An image doesn't keep running processes. If your hook starts Rex terminals for dev servers or other services, launch with `--no-prebuild`, or set `"prebuild": false` for that backend, so the hook runs at boot with `REX_SERVER` set.
+</Aside>

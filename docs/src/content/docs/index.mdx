@@ -1,0 +1,37 @@
+---
+title: rox
+description: Disposable project workspaces in Linux containers and Tart VMs, wired into Rex.
+template: splash
+hero:
+  tagline: Start a disposable workspace for your project in a Linux container or a Tart VM, with its own checkout and its own Rex server.
+  actions:
+    - text: Get started
+      link: getting-started/installation/
+      icon: right-arrow
+    - text: Quick start
+      link: getting-started/quick-start/
+      variant: minimal
+---
+
+import { Card, CardGrid } from '@astrojs/starlight/components';
+
+```sh
+rox up container -- my-agent --model example
+```
+
+`rox` clones your project's remote branch into a fresh guest and runs its `.rox.sh` setup hook, or starts from a project image that has already run it. It then creates a Rex session rooted at the checkout. The guest keeps running after the CLI exits, so you or an agent can reach it with `rex -S NAME`.
+
+<CardGrid>
+	<Card title="Containers or VMs" icon="laptop">
+		Use Docker or Podman for ordinary Linux work. Use [Tart](guides/tart-vms/) on Apple Silicon when the work needs macOS or a full Linux VM.
+	</Card>
+	<Card title="Fast cold starts" icon="rocket">
+		[Project images](guides/project-images/) run `.rox.sh` once at build time, so launching several workers takes seconds.
+	</Card>
+	<Card title="Private repos, private keys" icon="seti:lock">
+		Rox forwards Git keys through a temporary agent only while the guest clones. The [keys stay on the host](guides/private-repositories/).
+	</Card>
+	<Card title="Built for agents" icon="puzzle">
+		The bundled [rox skill](guides/agents/) teaches a controller agent to launch workers, delegate tasks through Rex, and collect results.
+	</Card>
+</CardGrid>

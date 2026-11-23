@@ -1,0 +1,58 @@
+---
+title: Tart VMs
+description: Prepare Ubuntu and macOS Tart templates for rox on Apple Silicon.
+---
+
+import { Aside, Steps } from '@astrojs/starlight/components';
+
+On an Apple Silicon Mac, install [Tart](https://tart.run) and prepare one template for each guest OS.
+
+```sh
+tart clone ghcr.io/cirruslabs/ubuntu:24.04 rox-ubuntu
+tart clone ghcr.io/cirruslabs/macos-tahoe-base:latest rox-macos
+```
+
+## Prepare a template
+
+Boot each template once with `tart run TEMPLATE` and set it up from its console.
+
+<Steps>
+
+1. **Enable SSH.** On macOS, turn on **System Settings → General → Sharing → Remote Login**. On Ubuntu, install `openssh-server` and run `sudo systemctl enable --now ssh`. Use key-based login, and change the image's default password before you use the template. SSH must allow local Unix-socket forwarding. For private Git clones, it must also allow SSH agent forwarding.
+
+2. **Create a VM login key on the host.**
+
+   ```sh
+   ssh-keygen -t ed25519 -f ~/.ssh/rox_vm
+   ```
+
+   Add the public key to the guest user's `~/.ssh/authorized_keys`. Set `~/.ssh` to `700` and the file to `600`. Keep the private key on the host and set `identity` to its path. If the key has a passphrase, load it into your regular SSH agent before you launch.
+
+3. **Install Git, Bash, and Rex in the guest**, then check `rex version` as the SSH user. On Ubuntu, use the official Rex Linux installer. On macOS, install the official Rex app. If the CLI isn't on SSH's PATH, link its bundled executable into `~/.local/bin`:
+
+   ```sh
+   mkdir -p ~/.local/bin
+   ln -s '/Applications/Rex.app/Contents/Helpers/Rex Server.rex/Contents/MacOS/rex' ~/.local/bin/rex
+   ~/.local/bin/rex version
+   ```
+
+   On Ubuntu, enable lingering for the guest account with `sudo loginctl enable-linger "$USER"`. See [Rex installation](https://www.superlogical.com/rex/docs/installation) and [Rex over SSH](https://www.superlogical.com/rex/docs/linux/remote-access).
+
+4. **Pin the host key.** From the guest console, read its SSH host public key, usually `/etc/ssh/ssh_host_ed25519_key.pub`. Save it to a file on the host and set `host_key` to that path. Keep the host key the same across clones.
+
+5. **Configure and shut down.** Set `image` and `user` for the template in the [config](../../reference/configuration/). Check that it boots to SSH without any manual steps, then shut the template down before launching clones.
+
+</Steps>
+
+## Launch
+
+```sh
+rox up linux
+rox up macos
+```
+
+Each launch clones the template into a new VM. If the project has a `.rox.sh`, the first launch also builds a `rox-REPO-BACKEND` [project image](../project-images/) from the template, and later launches clone that image instead.
+
+<Aside>
+	See [Tart's quick start](https://tart.run/quick-start/) for more on preparing templates and SSH.
+</Aside>

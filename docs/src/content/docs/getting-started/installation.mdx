@@ -1,0 +1,71 @@
+---
+title: Installation
+description: Install rox and prepare a container engine on the machine that runs guests.
+---
+
+import { Aside, Steps, Tabs, TabItem } from '@astrojs/starlight/components';
+
+Install rox on the machine that runs the guests. That machine is called the **launcher**. Your agent runner goes inside the guests, not on the launcher.
+
+## Requirements
+
+- Python 3.9 or later
+- Git
+- OpenSSH 8.2 or later
+- [Rex](https://www.superlogical.com/rex/docs/installation)
+- For containers, a running Docker or Podman engine. On macOS this means Docker Desktop or a running Podman machine.
+- For VMs, [Tart](https://tart.run) on an Apple Silicon Mac. See [Tart VMs](../../guides/tart-vms/).
+
+## Install the CLI
+
+<Steps>
+
+1. Clone the toolkit somewhere permanent.
+
+   ```sh
+   git clone <rox repository URL> ~/Developer/tools/rox
+   ```
+
+2. Link `rox` onto your PATH. Rox finds the guest scripts and Containerfile next to the real file, so link it rather than copying it.
+
+   ```sh
+   mkdir -p ~/.local/bin
+   ln -s ~/Developer/tools/rox/rox ~/.local/bin/rox
+   ```
+
+3. Check that it runs.
+
+   ```sh
+   rox --help
+   ```
+
+</Steps>
+
+## The base container image
+
+Rox builds the default `rox:linux` image the first time you launch a container and reuses it after that. The build installs Rex from the Rex Linux preview channel.
+
+To prebuild the image with an official Linux `rex` executable that matches your build architecture, run this from the toolkit's directory:
+
+<Tabs syncKey="engine">
+	<TabItem label="Docker">
+		```sh
+		docker build -f Containerfile -t rox:linux \
+		  --secret id=rex_binary,src=/absolute/path/to/linux/rex .
+		```
+	</TabItem>
+	<TabItem label="Podman">
+		```sh
+		podman build -f Containerfile -t rox:linux \
+		  --secret id=rex_binary,src=/absolute/path/to/linux/rex .
+		```
+
+		Then set `"engine": "podman"` under `container` in the [config](../../reference/configuration/), or pass `--engine podman` when you launch.
+	</TabItem>
+</Tabs>
+
+You can extend this image to install system packages your project needs. For per-project setup, a [setup hook](../../guides/setup-hook/) is usually simpler.
+
+<Aside>
+	Rex.app builds that keep their own host list don't pick up `rex hosts add`. When a Rex app is connected on the same machine, `rox up` and `rox reconnect` offer to copy the guest's socket address and open **Add Remote Host**. Pass `--no-app-host` to skip that prompt.
+</Aside>

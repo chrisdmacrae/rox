@@ -1,0 +1,4 @@
+*
+!Containerfile
+!guest/
+!guest/container-entrypoint.sh

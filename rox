@@ -1,0 +1,1137 @@
+#!/usr/bin/env python3
+"""Launch a project workspace in a Rex guest."""
+import argparse
+from contextlib import contextmanager
+from dataclasses import asdict, dataclass
+import fcntl
+import hashlib
+import ipaddress
+import json
+import os
+from pathlib import Path, PurePosixPath
+import re
+import secrets
+import shlex
+import shutil
+import socket
+import subprocess
+import sys
+import tempfile
+import time
+from urllib.parse import urlsplit
+
+
+HERE = Path(__file__).resolve().parent
+BACKENDS = ("container", "linux", "macos")
+DEFAULT_CONTAINER_IMAGE = "rox:linux"
+NAME_PATTERN = r"rv-[a-z0-9-]{1,24}-[a-f0-9]{12}"
+
+
+class Error(Exception):
+    pass
+
+
+def run(argv, *, capture=False, check=True, **kwargs):
+    return subprocess.run(argv, text=True, capture_output=capture, check=check, **kwargs)
+
+
+def output(argv, **kwargs):
+    result = run(argv, capture=True, check=False, **kwargs)
+    if result.returncode:
+        raise Error(result.stderr.strip() or f"{argv[0]} exited with status {result.returncode}")
+    return result.stdout.strip()
+
+
+def wait_for(probe, timeout, description):
+    deadline = time.monotonic() + timeout
+    last_error = ""
+    while True:
+        try:
+            result = probe()
+            if result:
+                return result
+        except (Error, subprocess.TimeoutExpired) as error:
+            last_error = str(error)
+        if time.monotonic() >= deadline:
+            details = f"\n{last_error}" if last_error else ""
+            raise Error(f"Timed out waiting for {description}.{details}")
+        time.sleep(1)
+
+
+def xdg(variable, fallback):
+    return Path(os.environ.get(variable) or Path.home() / fallback).expanduser().resolve()
+
+
+def state_root():
+    return xdg("XDG_STATE_HOME", ".local/state") / "rox"
+
+
+def private_directory(path):
+    path.mkdir(mode=0o700, parents=True, exist_ok=True)
+    info = path.lstat()
+    if path.is_symlink() or info.st_uid != os.getuid() or info.st_mode & 0o077:
+        raise Error(f"Expected a private directory owned by the current user at {path}")
+    return path
+
+
+@dataclass
+class Guest:
+    name: str
+    backend: str
+    image: str
+    project: str
+    branch: str
+    user: str
+    engine: str = ""
+    identity: str = ""
+    address: str = ""
+    port: int = 22
+    workspace: str = ""
+    guest_socket: str = ""
+    session_id: str = ""
+    registered: bool = False
+    phase: str = "starting"
+    container_id: str = ""
+    prebuilt: bool = False
+
+    @property
+    def directory(self):
+        return state_root() / self.name
+
+    @property
+    def runtime(self):
+        # OpenSSH control paths must fit in a Unix socket pathname.
+        return Path(f"/tmp/rox-{os.getuid()}") / self.name.rsplit("-", 1)[1]
+
+    @property
+    def control_socket(self):
+        return self.runtime / "c"
+
+    @property
+    def relay_socket(self):
+        return self.runtime / "relay.sock"
+
+    @property
+    def endpoint(self):
+        return f"unix://{self.runtime / 'rex.sock'}"
+
+    def save(self):
+        pending = self.directory / "guest.json.tmp"
+        pending.write_text(json.dumps(asdict(self), indent=2) + "\n")
+        pending.replace(self.directory / "guest.json")
+
+    @classmethod
+    def load(cls, name):
+        if not re.fullmatch(NAME_PATTERN, name):
+            raise Error(f"Invalid workspace name {name!r}")
+        try:
+            data = json.loads((state_root() / name / "guest.json").read_text())
+        except FileNotFoundError:
+            raise Error(f"No managed workspace named {name}") from None
+        if data["name"] != name or data["backend"] not in BACKENDS:
+            raise Error(f"Invalid workspace state for {name}")
+        data.pop("register_host", None)  # Older launches could opt out of registration.
+        return cls(**data)
+
+
+@contextmanager
+def guest_lock(directory):
+    with (directory / "lock").open("a") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise Error(f"Another command is working on {directory.name}") from None
+        yield
+
+
+def project_from(cwd, remote, repo, branch):
+    def git(*args, required=True):
+        argv = ["git", "-C", str(cwd), *args]
+        return output(argv) if required else run(argv, capture=True, check=False).stdout.strip()
+
+    root = Path(git("rev-parse", "--show-toplevel"))
+    local_branch = git("symbolic-ref", "--quiet", "--short", "HEAD", required=False)
+    upstream = git("config", "--get", f"branch.{local_branch}.remote", required=False) if local_branch else ""
+    selected_remote = remote or (upstream if upstream != "." else "") or "origin"
+    if selected_remote.startswith("-"):
+        raise Error(f"Invalid Git remote {selected_remote!r}")
+    if not branch:
+        merge = git("config", "--get", f"branch.{local_branch}.merge", required=False) if local_branch else ""
+        branch = local_branch
+        if selected_remote == upstream and merge.startswith("refs/heads/"):
+            branch = merge.removeprefix("refs/heads/")
+    if not branch:
+        raise Error("Choose a remote branch with --branch when starting from a detached HEAD")
+    url = repo or git("remote", "get-url", selected_remote)
+    validate_clone(url, branch)
+    return root.name, url, branch
+
+
+def validate_clone(url, branch):
+    output(["git", "check-ref-format", f"refs/heads/{branch}"])
+    parsed = urlsplit(url)
+    if parsed.scheme in {"https", "ssh"}:
+        valid = parsed.hostname and parsed.password is None and not parsed.query and not parsed.fragment
+        if parsed.scheme == "https":
+            valid = valid and parsed.username is None
+    else:
+        valid = "://" not in url and re.fullmatch(r"(?:[\w.-]+@)?[\w.-]+:[^:\s][^\r\n]*", url)
+    if not valid or url.startswith("-") or any(ord(char) < 32 for char in url):
+        raise Error("Use an SSH or HTTPS Git remote, optionally with --repo")
+
+
+def resolve_project(args):
+    if args.project is None:
+        return project_from(args.cwd, args.remote, args.repo, args.branch)
+    if not args.project.strip() or not args.repo or not args.branch:
+        raise Error("--project needs a name, --repo and --branch")
+    validate_clone(args.repo, args.branch)
+    return args.project, args.repo, args.branch
+
+
+def config_location(value):
+    if value:
+        return Path(value).expanduser().resolve()
+    return (xdg("XDG_CONFIG_HOME", ".config") / "rox" / "config.json").resolve()
+
+
+def config_for(path):
+    try:
+        config = json.loads(path.read_text())
+    except FileNotFoundError:
+        return {}
+    if not isinstance(config, dict):
+        raise Error(f"Expected a JSON object in {path}")
+    return config
+
+
+def validate_git_keys(keys, config_path):
+    if not isinstance(keys, list) or any(not isinstance(key, str) or not key for key in keys):
+        raise Error(f"Expected a list of Git key paths in {config_path}")
+    return keys
+
+
+def write_config(path, config):
+    fd, name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    pending = Path(name)
+    try:
+        with os.fdopen(fd, "w") as file:
+            json.dump(config, file, indent=2)
+            file.write("\n")
+            if path.exists():
+                os.fchmod(file.fileno(), path.stat().st_mode & 0o777)
+        pending.replace(path)
+    finally:
+        pending.unlink(missing_ok=True)
+
+
+def edit_git_keys(args):
+    config_path = config_location(args.config)
+    path = Path(args.path).expanduser().resolve()
+    adding = args.key_command == "add"
+    if adding:
+        configured_file(path)
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+    elif not config_path.exists():
+        print(f"Git SSH key is not configured at {path}")
+        return
+
+    lock_path = config_path.with_name(f"{config_path.name}.lock")
+    with lock_path.open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        config = config_for(config_path)
+        keys = validate_git_keys(config.get("git_keys", []), config_path)
+        remaining = [key for key in keys if Path(key).expanduser().resolve() != path]
+        present = len(remaining) != len(keys)
+        if adding and present:
+            print(f"Git SSH key is already configured at {path}")
+        elif not adding and not present:
+            print(f"Git SSH key is not configured at {path}")
+        else:
+            config["git_keys"] = [*keys, str(path)] if adding else remaining
+            write_config(config_path, config)
+            action = "Added" if adding else "Removed"
+            print(f"{action} Git SSH key path {path}")
+
+
+def configured_file(value):
+    if not value:
+        return None
+    path = Path(value).expanduser().resolve()
+    if not path.is_file():
+        raise Error(f"File does not exist at {path}")
+    return path
+
+
+def git_host_entries(url, override):
+    if override:
+        return configured_file(override).read_text()
+    known_hosts = Path.home() / ".ssh" / "known_hosts"
+    if not known_hosts.is_file():
+        return ""
+    parsed = urlsplit(url)
+    if parsed.scheme == "ssh":
+        host = parsed.hostname
+        if parsed.port not in (None, 22):
+            host = f"[{host}]:{parsed.port}"
+    else:
+        host = url.split(":", 1)[0].rsplit("@", 1)[-1]
+    matches = run(["ssh-keygen", "-F", host, "-f", str(known_hosts)], capture=True, check=False)
+    return "".join(f"{line}\n" for line in matches.stdout.splitlines() if line and not line.startswith("#"))
+
+
+def pin_host(guest, key):
+    fields = key.strip().split()
+    if (
+        len(fields) < 2
+        or not re.fullmatch(r"(?:ssh-|ecdsa-|sk-)[\w@.-]+", fields[0])
+        or not re.fullmatch(r"[A-Za-z0-9+/]+={0,2}", fields[1])
+    ):
+        raise Error("Expected an OpenSSH host public key")
+    (guest.directory / "known_hosts").write_text(f"{guest.name} {fields[0]} {fields[1]}\n")
+
+
+def ssh_command(guest, *options):
+    return [
+        "ssh", "-F", "/dev/null",
+        "-o", "BatchMode=yes", "-o", "ConnectTimeout=4",
+        "-o", "IdentitiesOnly=yes",
+        "-o", "StrictHostKeyChecking=yes", "-o", "GlobalKnownHostsFile=/dev/null",
+        "-o", f"HostKeyAlias={guest.name}",
+        "-o", f"UserKnownHostsFile={json.dumps(str(guest.directory / 'known_hosts'), ensure_ascii=False)}",
+        "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=3",
+        "-i", guest.identity, "-l", guest.user, "-p", str(guest.port),
+        *options, "--", guest.address,
+    ]
+
+
+def remote_command(guest, argv, agent=None, tty=False):
+    forwarding = f"ForwardAgent={agent}" if agent else "ForwardAgent=no"
+    return [*ssh_command(guest, "-t" if tty else "-T", "-S", "none", "-o", forwarding), shlex.join(argv)]
+
+
+def guest_stage(guest, stage, *args, agent=None, capture=False):
+    argv = remote_command(guest, ["bash", "-s", "--", stage, *args], agent)
+    script = (HERE / "guest" / "bootstrap.sh").read_text()
+    if capture:
+        return output(argv, input=script)
+    if run(argv, input=script, check=False).returncode:
+        raise Error(f"Guest {stage} failed for {guest.name}")
+    return None
+
+
+def git_agent(guest, keys):
+    return ssh_agent(guest.runtime / "agent.sock", keys)
+
+
+@contextmanager
+def ssh_agent(sock, keys):
+    if not keys:
+        yield None
+        return
+    agent = subprocess.Popen(["ssh-agent", "-D", "-a", str(sock)], stdout=subprocess.DEVNULL)
+    try:
+        def agent_ready():
+            if agent.poll() is not None:
+                raise Error("Could not start the temporary Git SSH agent")
+            return sock.is_socket()
+
+        wait_for(agent_ready, 5, "the temporary Git SSH agent")
+        run(["ssh-add", *map(str, keys)], env={**os.environ, "SSH_AUTH_SOCK": str(sock)})
+        yield sock
+    finally:
+        if agent.poll() is None:
+            agent.terminate()
+            agent.wait()
+
+
+def container_address(guest):
+    mapping = output([guest.engine, "port", guest.container_id, "22/tcp"], timeout=8)
+    match = re.search(r"^127\.0\.0\.1:(\d+)$", mapping, re.MULTILINE)
+    if not match:
+        raise Error(f"No loopback SSH port found in {mapping!r}")
+    return "127.0.0.1", int(match[1])
+
+
+def vm_address(guest):
+    address = output(["tart", "ip", guest.name], timeout=5)
+    try:
+        return str(ipaddress.IPv4Address(address)), 22
+    except ipaddress.AddressValueError:
+        raise Error(f"Tart did not return an IPv4 address for {guest.name}") from None
+
+
+def prepare_container_image(engine, image):
+    if image != DEFAULT_CONTAINER_IMAGE:
+        return
+
+    # Recheck after taking the lock in case another launch built the image.
+    with (state_root() / "container-image.lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        local = run([engine, "image", "inspect", image], capture=True, check=False, timeout=20)
+        if local.returncode == 0:
+            return
+        print(f"Building {image} with {engine}", flush=True)
+        try:
+            run([engine, "build", "--file", str(HERE / "Containerfile"), "--tag", image, str(HERE)])
+        except subprocess.CalledProcessError as error:
+            raise Error(f"Building {image} with {engine} failed. See the build output above.") from error
+
+
+IMAGE_PROJECT = "/home/workspace/.rox/image/project"
+PROJECT_CONTAINERFILE = """\
+FROM {base}
+USER root
+RUN install -d -m 700 -o workspace -g workspace /home/workspace/.rox /home/workspace/.rox/image
+COPY bootstrap.sh /usr/local/share/rox/bootstrap.sh
+COPY --chown=workspace:workspace project {project}
+USER workspace
+RUN {bake}
+USER root
+"""
+
+
+@dataclass
+class BuildGuest(Guest):
+    """A throwaway Tart guest that prepares a project image."""
+
+    @property
+    def directory(self):
+        return state_root() / "builds" / self.name
+
+
+@contextmanager
+def file_lock(path):
+    with path.open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        yield
+
+
+def project_image_name(backend, project, base):
+    if backend == "container":
+        slug = re.sub(r"[^a-z0-9_.-]+", "-", project.lower()).strip(".-")[:100] or "project"
+        name = f"rox:{slug}"
+    else:
+        slug = re.sub(r"[^a-z0-9-]+", "-", project.lower()).strip("-")[:60] or "project"
+        name = f"rox-{slug}-{backend}"
+    return f"{name}-project" if name == base else name
+
+
+@contextmanager
+def host_git(keys, known_hosts):
+    """Git environment on the launch machine using the same keys and host pins as the guest."""
+    with tempfile.TemporaryDirectory(prefix="rox-") as scratch:
+        ssh = ["ssh", "-F", "/dev/null", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=yes",
+               "-o", "ForwardAgent=no"]
+        if known_hosts:
+            pins = Path(scratch) / "known_hosts"
+            pins.write_text(known_hosts)
+            ssh += ["-o", f"UserKnownHostsFile={json.dumps(str(pins))}"]
+        env = {**os.environ, "GIT_TERMINAL_PROMPT": "0", "GIT_ALLOW_PROTOCOL": "ssh:https",
+               "GIT_SSH_COMMAND": shlex.join(ssh)}
+        env.pop("SSH_AUTH_SOCK", None)
+        with ssh_agent(Path(scratch) / "agent.sock", keys) as agent:
+            if agent:
+                env["SSH_AUTH_SOCK"] = str(agent)
+            yield env
+
+
+def fetch_branch(url, branch, env):
+    """Fetch a branch into a cached bare mirror. Returns the mirror, tip commit and .rox.sh blob."""
+    repos = xdg("XDG_CACHE_HOME", ".cache") / "rox" / "repos"
+    repos.mkdir(parents=True, exist_ok=True)
+    mirror = repos / f"{hashlib.sha256(url.encode()).hexdigest()[:16]}.git"
+    with file_lock(repos / f"{mirror.name}.lock"):
+        if not (mirror / "HEAD").is_file():
+            output(["git", "init", "--quiet", "--bare", str(mirror)])
+        print(f"Checking {branch} for .rox.sh", flush=True)
+        run(["git", "-C", str(mirror), "-c", "credential.helper=", "fetch", "--quiet", "--no-tags",
+             "--", url, f"+refs/heads/{branch}:refs/rox/{branch}"], env=env, stdin=subprocess.DEVNULL)
+        commit = output(["git", "-C", str(mirror), "rev-parse", f"refs/rox/{branch}^{{commit}}"])
+        hook = run(["git", "-C", str(mirror), "rev-parse", "--verify", "--quiet", f"{commit}:.rox.sh"],
+                   capture=True, check=False).stdout.strip()
+    return mirror, commit, hook
+
+
+def export_checkout(mirror, url, branch, destination):
+    """Write a checkout of the mirrored branch whose origin is the real remote."""
+    git = ["git", "-C", str(destination)]
+    output(["git", "init", "--quiet", str(destination)])
+    output([*git, "remote", "add", "origin", url])
+    output([*git, "fetch", "--quiet", "--no-tags", str(mirror),
+            f"+refs/rox/{branch}:refs/remotes/origin/{branch}"])
+    output([*git, "checkout", "--quiet", "-B", branch, f"refs/remotes/origin/{branch}"])
+    output([*git, "branch", "--quiet", f"--set-upstream-to=origin/{branch}"])
+    return output([*git, "rev-parse", "HEAD"])
+
+
+def image_info(engine, image):
+    result = run([engine, "image", "inspect", image], capture=True, check=False, timeout=20)
+    if result.returncode:
+        return None
+    data = json.loads(result.stdout)[0]
+    labels = (data.get("Config") or {}).get("Labels") or data.get("Labels") or {}
+    return data["Id"], labels
+
+
+def build_container_image(engine, base, target, mirror, url, branch, hook, rebuild):
+    with file_lock(state_root() / f"image-{target.replace(':', '-')}.lock"):
+        base_info = image_info(engine, base)
+        if base_info is None:
+            run([engine, "pull", base])
+            base_info = image_info(engine, base)
+        if base_info is None:
+            raise Error(f"Base image {base} is not available to {engine}")
+        wanted = {"io.rox.hook": hook, "io.rox.base": base_info[0], "io.rox.repo": url}
+        current = image_info(engine, target)
+        if not rebuild and current and all(current[1].get(k) == v for k, v in wanted.items()):
+            print(f"Using project image {target} (built from {current[1].get('io.rox.commit', '?')[:12]})",
+                  flush=True)
+            return
+        reason = "--rebuild" if rebuild else ("first build" if not current else ".rox.sh or base image changed")
+        print(f"Building project image {target} from {base} ({reason})", flush=True)
+        with tempfile.TemporaryDirectory(prefix="rox-image-") as context:
+            context = Path(context)
+            commit = export_checkout(mirror, url, branch, context / "project")
+            shutil.copy(HERE / "guest" / "bootstrap.sh", context / "bootstrap.sh")
+            bake = ["bash", "/usr/local/share/rox/bootstrap.sh", "bake", IMAGE_PROJECT, "container", target]
+            (context / "Containerfile").write_text(
+                PROJECT_CONTAINERFILE.format(base=base, project=IMAGE_PROJECT, bake=json.dumps(bake)))
+            labels = {**wanted, "io.rox.commit": commit, "io.rox.branch": branch}
+            try:
+                run([engine, "build", "--file", str(context / "Containerfile"), "--tag", target,
+                     *[f"--label={key}={value}" for key, value in labels.items()], str(context)])
+            except subprocess.CalledProcessError as error:
+                raise Error(f"Building {target} failed while running .rox.sh. See the build output above, "
+                            "or launch with --no-prebuild to run it at boot.") from error
+        built = image_info(engine, target)
+        if current and built and built[0] != current[0]:
+            # Drop the superseded image unless a workspace still uses it.
+            run([engine, "rmi", current[0]], capture=True, check=False)
+
+
+def tart_images():
+    return {vm["Name"] for vm in json.loads(output(["tart", "list", "--source", "local", "--format", "json"]))}
+
+
+def build_vm_image(backend, base, target, project, url, branch, hook, commit, settings, rebuild):
+    images = state_root() / "images"
+    images.mkdir(mode=0o700, exist_ok=True)
+    record = images / f"{target}.json"
+    with file_lock(images / f"{target}.lock"):
+        wanted = {"hook": hook, "base": base, "repo": url}
+        try:
+            current = json.loads(record.read_text())
+        except FileNotFoundError:
+            current = {}
+        exists = target in tart_images()
+        if not rebuild and exists and all(current.get(k) == v for k, v in wanted.items()):
+            print(f"Using project image {target} (built from {current.get('commit', '?')[:12]})", flush=True)
+            return
+        reason = "--rebuild" if rebuild else ("first build" if not exists else ".rox.sh or base image changed")
+        print(f"Building project image {target} from {base} ({reason})", flush=True)
+        bake_vm(backend, base, target, project, branch, url, settings)
+        if exists:
+            run(["tart", "delete", target])
+        run(["tart", "rename", settings["name"], target])
+        record.write_text(json.dumps({**wanted, "commit": commit, "branch": branch}, indent=2) + "\n")
+
+
+def bake_vm(backend, base, target, project, branch, url, settings):
+    guest = BuildGuest(settings["name"], backend, base, project, branch, settings["user"],
+                       identity=str(settings["identity"]))
+    guest.directory.mkdir(mode=0o700, parents=True)
+    private_directory(guest.runtime.parent)
+    private_directory(guest.runtime)
+    stopped = False
+    try:
+        pin_host(guest, settings["host_key"].read_text())
+        guest.address, guest.port = launch_guest(guest, settings["boot_timeout"])
+        check_guest_os(guest, settings["boot_timeout"])
+        workspace = guest_stage(guest, "bake-prepare", capture=True)
+        if not workspace.startswith("/") or "\n" in workspace:
+            raise Error("Guest image preparation did not return a valid checkout path")
+        if settings["known_hosts"]:
+            pins = str(PurePosixPath(workspace).parent / "git_known_hosts")
+            run(remote_command(guest, ["bash", "-c", 'umask 077; cat > "$1"', "rox", pins]),
+                input=settings["known_hosts"])
+        with git_agent(guest, settings["keys"]) as agent:
+            guest_stage(guest, "clone", workspace, url, branch, "yes" if agent else "no", agent=agent)
+        guest_stage(guest, "bake", workspace, backend, target)
+        run(remote_command(guest, ["sync"]))
+        run(["tart", "stop", guest.name])
+        stopped = True
+    except (Exception, KeyboardInterrupt):
+        print(f"Building {target} failed. The build log is in {guest.directory}. "
+              "Launch with --no-prebuild to run .rox.sh at boot instead.", file=sys.stderr)
+        raise
+    finally:
+        if not stopped:
+            run(["tart", "stop", guest.name], capture=True, check=False)
+            run(["tart", "delete", guest.name], capture=True, check=False)
+        shutil.rmtree(guest.runtime, ignore_errors=True)
+        if stopped:
+            shutil.rmtree(guest.directory, ignore_errors=True)
+
+
+def prepare_project_image(backend, engine, base, project, url, branch, keys, known_hosts, vm, rebuild):
+    """Return a project image that already ran .rox.sh, or "" to set up at boot."""
+    try:
+        with host_git(keys, known_hosts) as env:
+            mirror, commit, hook = fetch_branch(url, branch, env)
+    except (Error, subprocess.SubprocessError) as error:
+        print(f"rox: Could not read {branch} on the launch machine, so .rox.sh will run at boot. ({error})",
+              file=sys.stderr, flush=True)
+        return ""
+    if not hook:
+        return ""
+    target = project_image_name(backend, project, base)
+    if engine:
+        build_container_image(engine, base, target, mirror, url, branch, hook, rebuild)
+    else:
+        name = f"rv-build-{secrets.token_hex(6)}"
+        build_vm_image(backend, base, target, project, url, branch, hook, commit,
+                       {**vm, "name": name, "keys": keys, "known_hosts": known_hosts}, rebuild)
+    return target
+
+
+def launch_guest(guest, boot_timeout):
+    if guest.backend == "container":
+        run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", guest.identity],
+            stdin=subprocess.DEVNULL)
+        public_key = Path(f"{guest.identity}.pub").read_text().strip()
+        local_image = guest.prebuilt or guest.image == DEFAULT_CONTAINER_IMAGE
+        pull_policy = ["--pull=never"] if local_image else []
+        guest.container_id = output([
+            guest.engine, "run", "-d", *pull_policy, "--name", guest.name, "--hostname", guest.name,
+            "--label", f"io.rox.workspace={guest.name}",
+            "--publish", "127.0.0.1::22", "--env", f"ROX_SSH_PUBLIC_KEY={public_key}",
+            guest.image,
+        ])
+        guest.save()
+        key = wait_for(
+            lambda: output([guest.engine, "exec", guest.container_id, "cat",
+                            "/etc/ssh/ssh_host_ed25519_key.pub"], timeout=8),
+            boot_timeout, "the container SSH host key",
+        )
+        pin_host(guest, key)
+        return wait_for(lambda: container_address(guest), boot_timeout, "the container SSH port")
+
+    run(["tart", "clone", guest.image, guest.name])
+    log_path = guest.directory / "tart.log"
+    with log_path.open("a") as log:
+        vm = subprocess.Popen(
+            ["tart", "run", "--no-graphics", "--no-clipboard", guest.name],
+            stdin=subprocess.DEVNULL, stdout=log, stderr=log, start_new_session=True,
+        )
+
+    def address():
+        if vm.poll() is not None:
+            raise Error(f"Tart exited with status {vm.returncode}. See {log_path}")
+        try:
+            return vm_address(guest)
+        except (Error, subprocess.TimeoutExpired):
+            return None
+
+    deadline = time.monotonic() + boot_timeout
+    while time.monotonic() < deadline:
+        if found := address():
+            return found
+        time.sleep(1)
+    raise Error(f"No Tart IP address found for {guest.name}. See {log_path}")
+
+
+def check_guest_os(guest, timeout):
+    system = wait_for(
+        lambda: output(remote_command(guest, ["uname", "-s"]), timeout=8),
+        timeout, "guest SSH login",
+    )
+    expected = "Darwin" if guest.backend == "macos" else "Linux"
+    if system != expected:
+        raise Error(f"{guest.backend} expects {expected}, but the image runs {system}")
+
+
+def open_tunnel(guest):
+    private_directory(guest.runtime.parent)
+    private_directory(guest.runtime)
+    if guest.control_socket.is_socket():
+        check = run(ssh_command(guest, "-S", str(guest.control_socket), "-O", "check"), capture=True, check=False)
+        if check.returncode == 0:
+            return
+    run(ssh_command(
+        guest, "-fNM", "-S", str(guest.control_socket), "-o", "ControlPersist=no",
+        "-E", str(guest.directory / "ssh-tunnel.log"),
+        "-o", "ForwardAgent=no", "-o", "ExitOnForwardFailure=yes", "-o", "StreamLocalBindUnlink=yes",
+        "-L", f"{guest.runtime / 'rex.sock'}:{guest.guest_socket}",
+    ), timeout=15)
+
+
+def rex_on(guest):
+    return ["rex", "--autostart=false", "--timeout", "5s", "-S", guest.endpoint]
+
+
+def open_relay(guest):
+    private_directory(guest.runtime.parent)
+    private_directory(guest.runtime)
+    log_path = guest.directory / "ssh-tunnel.log"
+    dial = ["rex", "--autostart=false", "-S", f"unix://{guest.guest_socket}", "__internal", "dial-stdio"]
+    # Read the same login PATH as the guest bootstrap, without allocating a terminal.
+    command = remote_command(guest, [
+        "sh", "-c", 'export PATH="$HOME/.local/bin:/usr/local/bin:/opt/homebrew/bin:$PATH"; exec "$@"',
+        "rox", *dial,
+    ])
+    with log_path.open("a") as log:
+        process = subprocess.Popen(
+            [sys.executable, str(HERE / "guest" / "relay.py"), str(guest.runtime), *command],
+            stdin=subprocess.DEVNULL, stdout=log, stderr=log, start_new_session=True,
+        )
+    try:
+        wait_for(lambda: guest.relay_socket.is_socket() and process.poll() is None,
+                 5, "the Rex SSH relay")
+        output([*rex_on(guest), "ls", "--json"], timeout=8)
+    except (Error, subprocess.TimeoutExpired) as error:
+        if process.poll() is None:
+            close_relay(guest)
+            try:
+                process.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+        raise Error(f"Could not reach Rex through the SSH relay. See {log_path}.\n{error}") from error
+
+
+def attach_guest(guest):
+    try:
+        if not guest.relay_socket.is_socket():
+            open_tunnel(guest)
+        output([*rex_on(guest), "ls", "--json"], timeout=8)
+    except (Error, subprocess.SubprocessError):
+        guest_stage(guest, "server", guest.guest_socket)
+        close_tunnel(guest)
+        open_relay(guest)
+    if guest.session_id:
+        output([*rex_on(guest), "session", "inspect", guest.session_id, "--json"], timeout=8)
+
+
+def register_guest(guest):
+    if not guest.registered:
+        run(["rex", "hosts", "add", guest.name, guest.endpoint])
+        guest.registered = True
+        guest.save()
+        print(f"Registered Rex host {guest.name} at {guest.endpoint}", flush=True)
+
+
+def local_app_client():
+    """Return the ID of a Rex app connected to this machine's server, if any."""
+    try:
+        clients = json.loads(output(["rex", "--autostart=false", "client", "ls", "--json"], timeout=8))
+    except (Error, ValueError, subprocess.SubprocessError):
+        return None
+    for client in clients.get("clients", []):
+        if (client.get("info", {}).get("kind") == "app"
+                and client.get("connection_state") == "connected"
+                and client.get("principal", {}).get("transport") == "unix"):
+            return client["client_id"]
+    return None
+
+
+def offer_app_host(guest):
+    """Help add the guest to a Rex app that keeps its own host list.
+
+    Such apps ignore `rex hosts add`, and their Add Remote Host dialog takes no
+    arguments, so copy the endpoint and open the dialog for the user to paste.
+    Only an app on this machine can reach the guest's private socket.
+    """
+    if not guest.registered or not sys.stdin.isatty() or not shutil.which("pbcopy"):
+        return
+    client = local_app_client()
+    if not client:
+        return
+    try:
+        answer = input(f"Add {guest.name} to the Rex app's host list? [Y/n] ").strip().lower()
+    except EOFError:
+        return
+    if answer not in ("", "y", "yes"):
+        return
+    run(["pbcopy"], input=guest.endpoint)
+    result = run(["rex", "--autostart=false", "-C", client, "do", "client.host.add"],
+                 check=False, capture=True, timeout=8)
+    if result.returncode:
+        print(f"Could not open Add Remote Host. Add {guest.endpoint} in the Rex app.", file=sys.stderr)
+        return
+    print(f"Copied {guest.endpoint}. Paste it into Add Remote Host in the Rex app.", flush=True)
+
+
+def describe_guest(guest):
+    print(f"Workspace  {guest.name}")
+    print(f"Checkout   {guest.workspace}")
+    target = guest.name if guest.registered else guest.endpoint
+    if guest.session_id:
+        print(f"Session    {guest.session_id}")
+        print(f"Inspect    rex -S {target} session inspect {guest.session_id}")
+    else:
+        print(f"Inspect    rex -S {target} ls")
+
+
+def up_on_host(args, command, project, url, branch):
+    rex = ["rex", "--autostart=false", "-S", args.host]
+    launch = ["rox", "up", args.backend, f"--project={project}", f"--repo={url}",
+              f"--branch={branch}", f"--boot-timeout={args.boot_timeout}", "--open-shell"]
+    for option in ("config", "image", "engine", "git_known_hosts"):
+        if (value := getattr(args, option)) is not None:
+            launch.append(f"--{option.replace('_', '-')}={value}")
+    launch.extend(f"--git-key={key}" for key in args.git_key or [])
+    for flag in ("no_hook", "no_prebuild", "rebuild", "no_app_host"):
+        if getattr(args, flag):
+            launch.append(f"--{flag.replace('_', '-')}")
+    if command:
+        launch.extend(["--", *command])
+
+    created = json.loads(output([
+        *rex, "new", "--window", "Provision", "--keep-open", "--json",
+        f"rox {project}", "--", *launch,
+    ]))
+    session = created["session_id"]
+    block = created["initial_windows"][0]["block_ids"][0]
+    print(f"Provisioning {project} on {args.host} in Rex session {session}", flush=True)
+    status = run([*rex, "wait", "-s", session, block], check=False)
+    capture = run([*rex, "capture", "-s", session, "-b", block, "--trim", "--unwrap"],
+                  check=False, capture=True)
+    if capture.returncode == 0 and capture.stdout.strip():
+        print(capture.stdout.rstrip())
+    if status.returncode:
+        raise Error(f"Provisioning exited with status {status.returncode}. See the Provision tab in {session} on {args.host}.")
+
+
+def open_app_shell(session, name):
+    run(["rex", "--autostart=false", "window", "new", "-s", session, "--keep-open",
+         "Guest", "--", str(Path(__file__).resolve()), "shell", name])
+
+
+def up(args, command):
+    if args.host is not None and not args.host.strip():
+        raise Error("--host needs a Rex host label or address")
+    project, url, branch = resolve_project(args)
+    if args.host is not None:
+        up_on_host(args, command, project, url, branch)
+        return
+    app_session = os.environ.get("REX_SESSION") if args.open_shell else None
+    if args.open_shell and not app_session:
+        raise Error("--open-shell requires a Rex terminal")
+    config_path = config_location(args.config)
+    if args.config:
+        configured_file(config_path)
+    config = config_for(config_path)
+    settings = config.get(args.backend, {})
+    if not isinstance(settings, dict):
+        raise Error(f"Expected an object for {args.backend} in {config_path}")
+    if args.engine and args.backend != "container":
+        raise Error("--engine applies to the container backend")
+    engine = ""
+    if args.backend == "container":
+        engine = args.engine or settings.get("engine", "docker")
+        if engine not in ("docker", "podman"):
+            raise Error("Choose docker or podman as the container engine")
+    image = args.image or settings.get("image") or (DEFAULT_CONTAINER_IMAGE if engine else "")
+    if not isinstance(image, str) or not image or image.startswith("-"):
+        raise Error(f"Choose a {args.backend} image with --image or in {config_path}")
+    keys = args.git_key if args.git_key is not None else config.get("git_keys", [])
+    keys = validate_git_keys(keys, config_path)
+    use_ssh = urlsplit(url).scheme != "https"
+    keys = [configured_file(key) for key in keys] if use_ssh else []
+    known_hosts_option = args.git_known_hosts or config.get("git_known_hosts")
+    identity = None
+    host_key = None
+    user = "workspace"
+    if not engine:
+        user = settings.get("user", "admin")
+        identity = configured_file(settings.get("identity"))
+        host_key = configured_file(settings.get("host_key"))
+        if not identity or not host_key or not re.fullmatch(r"[a-zA-Z_][a-zA-Z0-9_.-]*", user):
+            raise Error(f"Configure user, identity and host_key for {args.backend} in {config_path}")
+    prebuild = settings.get("prebuild", True)
+    if not isinstance(prebuild, bool):
+        raise Error(f"Expected true or false for {args.backend}.prebuild in {config_path}")
+    prebuild = prebuild and not args.no_prebuild and not args.no_hook
+    if args.rebuild and not prebuild:
+        raise Error("--rebuild needs a project image, which --no-hook, --no-prebuild or prebuild: false disable")
+
+    required = ["rex", "ssh", engine or "tart"]
+    if prebuild:
+        required.append("git")
+    if engine or (use_ssh and not known_hosts_option):
+        required.append("ssh-keygen")
+    if keys:
+        required += ["ssh-agent", "ssh-add"]
+    for tool in required:
+        if not shutil.which(tool):
+            raise Error(f"Install {tool} and make it available on PATH")
+    if engine:
+        output([engine, "info"], timeout=20)
+    known_hosts = git_host_entries(url, known_hosts_option) if use_ssh else ""
+    private_directory(state_root())
+    if engine:
+        prepare_container_image(engine, image)
+    prebuilt = ""
+    if prebuild:
+        vm = {"user": user, "identity": identity, "host_key": host_key, "boot_timeout": args.boot_timeout}
+        prebuilt = prepare_project_image(args.backend, engine, image, project, url, branch,
+                                         keys, known_hosts, vm, args.rebuild)
+
+    slug = re.sub(r"[^a-z0-9]+", "-", project.lower()).strip("-")[:24].rstrip("-") or "project"
+    name = f"rv-{slug}-{secrets.token_hex(6)}"
+    guest = Guest(name, args.backend, prebuilt or image, project, branch, user, engine,
+                  prebuilt=bool(prebuilt))
+    guest.directory.mkdir(mode=0o700)
+    guest.identity = str(identity or guest.directory / "login")
+    with guest_lock(guest.directory):
+        guest.save()
+        print(f"Starting {guest.name} from {project} ({branch})", flush=True)
+        try:
+            if host_key:
+                pin_host(guest, host_key.read_text())
+            private_directory(guest.runtime.parent)
+            private_directory(guest.runtime)
+            guest.address, guest.port = launch_guest(guest, args.boot_timeout)
+            guest.save()
+            check_guest_os(guest, args.boot_timeout)
+            paths = guest_stage(guest, "prepare", guest.name, capture=True).splitlines()
+            if len(paths) != 2 or any(not path.startswith("/") or ":" in path for path in paths):
+                raise Error("Guest preparation did not return valid workspace and socket paths")
+            guest.workspace, guest.guest_socket = paths
+            guest.save()
+            guest_stage(guest, "server", guest.guest_socket)
+            attach_guest(guest)
+            register_guest(guest)
+            if known_hosts:
+                target = str(PurePosixPath(guest.workspace).parent / "git_known_hosts")
+                upload = ["bash", "-c", 'umask 077; cat > "$1"', "rox", target]
+                run(remote_command(guest, upload), input=known_hosts)
+            with git_agent(guest, keys) as agent:
+                guest_stage(guest, "clone", guest.workspace, url, branch, "yes" if agent else "no", agent=agent)
+            guest_stage(guest, "setup", guest.workspace, guest.name, guest.backend, guest.guest_socket,
+                        "prebuilt" if guest.prebuilt else str(args.no_hook).lower())
+            launch = ["rex", "--autostart=false", "-S", f"unix://{guest.guest_socket}",
+                      "new", guest.project, "-c", guest.workspace, "--json"]
+            if command:
+                launch += ["--keep-open", "--", *command]
+            created = json.loads(guest_stage(guest, "session", *launch, capture=True))
+            guest.session_id = created["session_id"]
+            if not guest.session_id:
+                raise Error("Rex did not return a session ID")
+            guest.save()
+            attach_guest(guest)
+            guest.phase = "ready"
+            guest.save()
+            describe_guest(guest)
+        except (Exception, KeyboardInterrupt):
+            guest.phase = "failed"
+            guest.save()
+            if guest.registered:
+                print(f"Rex host {guest.name} is available even though setup failed.", file=sys.stderr)
+            print(f"Workspace {guest.name} was retained. Run rox down {guest.name} to remove it.", file=sys.stderr)
+            raise
+
+    if not args.no_app_host:
+        offer_app_host(guest)
+    if app_session:
+        try:
+            open_app_shell(app_session, guest.name)
+        except subprocess.CalledProcessError as error:
+            raise Error(f"{guest.name} is ready. Open it on this host with rox shell {guest.name}.") from error
+
+
+def shell(name):
+    guest = Guest.load(name)
+    if guest.phase != "ready":
+        raise Error(f"{name} is not ready")
+    command = ["env", f"REX_SERVER=unix://{guest.guest_socket}", "sh", "-c",
+               'cd "$1" && exec "${SHELL:-/bin/sh}" -l', "rox", guest.workspace]
+    argv = remote_command(guest, command, tty=True)
+    os.execvpe(argv[0], argv, {**os.environ, "TERM": "xterm-256color"})
+
+
+def reconnect(name, app_host=True):
+    guest = Guest.load(name)
+    with guest_lock(guest.directory):
+        guest = Guest.load(name)
+        if not guest.guest_socket or guest.phase == "removing":
+            raise Error(f"{name} did not get far enough to start a Rex server")
+        close_tunnel(guest)
+        guest.address, guest.port = container_address(guest) if guest.engine else vm_address(guest)
+        guest.save()
+        guest_stage(guest, "server", guest.guest_socket)
+        attach_guest(guest)
+        register_guest(guest)
+        if guest.session_id:
+            guest.phase = "ready"
+            guest.save()
+        describe_guest(guest)
+    if app_host:
+        offer_app_host(guest)
+
+
+def close_relay(guest):
+    if guest.relay_socket.is_socket():
+        with socket.socket(socket.AF_UNIX) as control:
+            control.settimeout(5)
+            try:
+                control.connect(str(guest.relay_socket))
+                control.recv(1)
+            except (ConnectionRefusedError, FileNotFoundError):
+                pass  # The relay already stopped.
+
+
+def close_tunnel(guest):
+    close_relay(guest)
+    if guest.control_socket.is_socket():
+        run(ssh_command(guest, "-S", str(guest.control_socket), "-O", "exit"), capture=True, check=False)
+
+
+def down(name):
+    guest = Guest.load(name)
+    with guest_lock(guest.directory):
+        guest = Guest.load(name)
+        guest.phase = "removing"
+        guest.save()
+        close_tunnel(guest)
+        if guest.engine:
+            ids = output([guest.engine, "ps", "-aq", "--no-trunc", "--filter",
+                          f"label=io.rox.workspace={name}"]).splitlines()
+            for container_id in ids:
+                run([guest.engine, "rm", "-f", "-v", container_id])
+        else:
+            vms = json.loads(output(["tart", "list", "--source", "local", "--format", "json"]))
+            vm = next((vm for vm in vms if vm["Name"] == name), None)
+            if vm:
+                if vm["Running"]:
+                    run(["tart", "stop", name])
+                run(["tart", "delete", name])
+        if guest.registered:
+            result = run(["rex", "hosts", "remove", name], check=False)
+            if result.returncode not in (0, 3):
+                raise Error(f"Could not remove Rex host {name}")
+        if guest.runtime.is_dir():
+            shutil.rmtree(guest.runtime)
+        shutil.rmtree(guest.directory)
+        print(f"Removed {name}")
+
+
+def current_project(cwd):
+    try:
+        return Path(output(["git", "-C", str(cwd), "rev-parse", "--show-toplevel"])).name
+    except Error:
+        raise Error("Run rox down from a project checkout or name a workspace: rox down NAME") from None
+
+
+def choose_project_guest(cwd):
+    project = current_project(cwd)
+    guests = [Guest.load(path.parent.name) for path in sorted(state_root().glob("*/guest.json"))]
+    guests = [guest for guest in guests if guest.project == project]
+    if not guests:
+        raise Error(f"No workspaces for {project}. Run rox ls to see all workspaces.")
+    if len(guests) == 1:
+        return guests[0].name
+    listing = "\n".join(f"  {index}) {guest.name}  {guest.backend}  {guest.phase}  {guest.branch}"
+                        for index, guest in enumerate(guests, 1))
+    if not sys.stdin.isatty():
+        raise Error(f"{project} has {len(guests)} workspaces. Choose one with rox down NAME:\n{listing}")
+    print(f"{project} has {len(guests)} workspaces:\n{listing}")
+    try:
+        answer = input(f"Remove which workspace? [1-{len(guests)}] ").strip()
+    except EOFError:
+        answer = ""
+    if not answer.isdigit() or not 1 <= int(answer) <= len(guests):
+        raise Error("No workspace selected")
+    return guests[int(answer) - 1].name
+
+
+def list_guests():
+    for path in sorted(state_root().glob("*/guest.json")):
+        guest = Guest.load(path.parent.name)
+        print(f"{guest.name}\t{guest.backend}\t{guest.phase}\t{guest.project}:{guest.branch}")
+
+
+APP_HOST_HELP = "don't offer to add the guest to a Rex app that keeps its own host list"
+
+
+def positive_int(value):
+    number = int(value)
+    if number < 1:
+        raise argparse.ArgumentTypeError("expected a positive number of seconds")
+    return number
+
+
+def main(argv):
+    parser = argparse.ArgumentParser(description=__doc__, epilog="Pass -- COMMAND [ARG ...] to up to start a command in Rex.")
+    commands = parser.add_subparsers(dest="command", required=True)
+    start = commands.add_parser("up", help="start and provision a new guest")
+    start.add_argument("backend", choices=BACKENDS)
+    start.add_argument("-S", "--host", help="launch on this Rex remote host")
+    start.add_argument("--config", help="config file on the machine that runs the guest")
+    start.add_argument("--cwd", type=Path, default=Path.cwd(), help="directory within the source project")
+    start.add_argument("--project", help="project name for a launch from --repo and --branch without a checkout")
+    start.add_argument("--image", help="container image or prepared Tart template")
+    start.add_argument("--engine", choices=("docker", "podman"))
+    remotes = start.add_mutually_exclusive_group()
+    remotes.add_argument("--remote", help="Git remote name")
+    remotes.add_argument("--repo", help="override the repository URL")
+    start.add_argument("--branch", help="remote branch to clone")
+    start.add_argument("--git-key", action="append", help="Git SSH identity (repeatable)")
+    start.add_argument("--git-known-hosts", help="known_hosts file for Git SSH servers")
+    start.add_argument("--boot-timeout", type=positive_int, default=120, help="seconds per guest readiness check")
+    start.add_argument("--no-hook", action="store_true", help="skip the project's .rox.sh")
+    start.add_argument("--no-prebuild", action="store_true",
+                       help="clone and run .rox.sh at boot instead of using a project image")
+    start.add_argument("--rebuild", action="store_true", help="rebuild the project image before launching")
+    start.add_argument("--open-shell", action="store_true", help="open a guest shell in the current Rex session")
+    start.add_argument("--no-app-host", action="store_true", help=APP_HOST_HELP)
+    commands.add_parser("ls", help="list managed workspaces")
+    commands.add_parser("shell", help="open an interactive guest shell").add_argument("name")
+    reconnect_parser = commands.add_parser("reconnect", help="restore access to a running workspace")
+    reconnect_parser.add_argument("name")
+    reconnect_parser.add_argument("--no-app-host", action="store_true", help=APP_HOST_HELP)
+    stop = commands.add_parser("down", help="delete a guest and its workspace")
+    stop.add_argument("name", nargs="?",
+                      help="workspace to remove; omit to pick from the current project's workspaces")
+    stop.add_argument("--cwd", type=Path, default=Path.cwd(), help="directory within the project")
+    key = commands.add_parser("key", help="manage configured Git SSH key paths")
+    key_commands = key.add_subparsers(dest="key_command", required=True)
+    for action, help_text in (("add", "save a Git SSH key path"), ("remove", "forget a Git SSH key path")):
+        edit = key_commands.add_parser(action, help=help_text)
+        edit.add_argument("path", help="path to the SSH private key")
+        edit.add_argument("--config", help="alternate Rox configuration file")
+    command = []
+    if argv[:1] != ["key"] and "--" in argv:
+        index = argv.index("--")
+        argv, command = argv[:index], argv[index + 1:]
+        if not command:
+            parser.error("-- requires a command")
+    args = parser.parse_args(argv)
+    if args.command == "up":
+        up(args, command)
+    elif command:
+        parser.error("only up accepts a command after --")
+    elif args.command == "ls":
+        list_guests()
+    elif args.command == "shell":
+        shell(args.name)
+    elif args.command == "reconnect":
+        reconnect(args.name, app_host=not args.no_app_host)
+    elif args.command == "key":
+        edit_git_keys(args)
+    else:
+        down(args.name or choose_project_guest(args.cwd))
+
+
+if __name__ == "__main__":
+    try:
+        main(sys.argv[1:])
+    except (Error, OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as error:
+        message = str(error)
+        if isinstance(error, subprocess.CalledProcessError):
+            message = f"{error.cmd[0]} exited with status {error.returncode}"
+        print(f"rox: {message}", file=sys.stderr)
+        sys.exit(1)
+    except KeyboardInterrupt:
+        sys.exit(130)

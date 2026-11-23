@@ -1,0 +1,58 @@
+---
+title: Orchestrating agents
+description: Use the rox skill to have a controller agent launch, supervise, and collect results from workers.
+---
+
+import { Aside, Steps } from '@astrojs/starlight/components';
+
+The bundled **rox skill** teaches a controller agent to launch guests, delegate tasks through Rex, track each worker's output and exit status, and collect results before teardown.
+
+## Install the skill
+
+From the toolkit's directory, copy the skill into your agent's skills folder. For Codex:
+
+```sh
+skill_dir="${CODEX_HOME:-$HOME/.codex}/skills"
+mkdir -p "$skill_dir"
+cp -R skills/rox "$skill_dir/"
+```
+
+For Claude Code, copy it to `~/.claude/skills/` instead. Start a new session and invoke the skill (`$rox` in Codex, `/rox` in Claude Code). Install rox itself on the launcher, and make your agent runner available inside the guests. A [setup hook](../setup-hook/) is a good place to install it.
+
+## The workflow
+
+<Steps>
+
+1. **Launch.** The controller runs `rox up` from the project checkout and saves the `Workspace`, `Checkout`, and `Session` values it prints. With a [project image](../project-images/), extra workers start quickly.
+
+   ```sh
+   rox up container --no-app-host --cwd "$project_dir"
+   ```
+
+2. **Delegate.** Give each worker its goal, the files it owns, any constraints, how to verify the work, and what to return. Start it in a guest Rex terminal:
+
+   ```bash
+   created=$(rex --autostart=false -S "$workspace" run -s "$guest_session" \
+     -c "$guest_checkout" --label "$task_label" --focus=false --keep-open --json -- "${runner_argv[@]}")
+   worker_block=$(printf '%s\n' "$created" | jq -er '.block_ids[0]')
+   ```
+
+3. **Monitor.** `wait` can time out while a worker is still healthy. Check `process` and `last_exit` to tell a finished worker from one that's still running.
+
+   ```bash
+   rex --autostart=false -S "$workspace" wait -s "$guest_session" "$worker_block" --for 30s
+   rex --autostart=false -S "$workspace" block call -s "$guest_session" -b "$worker_block" process
+   rex --autostart=false -S "$workspace" capture -s "$guest_session" -b "$worker_block" --trim --unwrap
+   ```
+
+4. **Collect and tear down.** Review the worker's changes in the guest, verify its claims, and copy out what you need. Then run `rox down NAME`, always with an explicit name.
+
+</Steps>
+
+<Aside type="tip">
+	Pass `--no-app-host` when an agent launches from a terminal pane. Otherwise the prompt to add the guest to the Rex app's host list can block it.
+</Aside>
+
+## Remote launchers
+
+When guests run on a [Rex remote host](../remote-hosts/), the guest's socket is only reachable from that host. The controller wraps each guest `rex` command in an outer `rex run` on the launcher's session. The skill's `references/remote-launcher.md` describes this pattern step by step.

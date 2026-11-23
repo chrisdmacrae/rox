@@ -1,0 +1,20 @@
+{
+  "git_keys": ["~/.ssh/project_readonly"],
+  "git_known_hosts": "~/.ssh/rox_git_known_hosts",
+  "container": {
+    "engine": "docker",
+    "image": "rox:linux"
+  },
+  "linux": {
+    "image": "rox-ubuntu",
+    "user": "admin",
+    "identity": "~/.ssh/rox_vm",
+    "host_key": "~/.ssh/rox_ubuntu_host.pub"
+  },
+  "macos": {
+    "image": "rox-macos",
+    "user": "admin",
+    "identity": "~/.ssh/rox_vm",
+    "host_key": "~/.ssh/rox_macos_host.pub"
+  }
+}

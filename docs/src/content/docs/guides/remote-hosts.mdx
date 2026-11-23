@@ -1,0 +1,35 @@
+---
+title: Rex remote hosts
+description: Launch guests on another machine you can reach through Rex.
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+Pick a host label from `rex hosts list`. Install `rox` on that host's Rex terminal PATH and prepare the runtime you want to use there. The machine you run the command from needs Rex connectivity to that host.
+
+```sh
+rox up container --host buildbox
+rox up macos -S studio -- my-agent --model example
+```
+
+## What happens
+
+1. On your machine, Rox resolves the repository URL and branch from your current checkout.
+2. Rex starts a `rox PROJECT` session on the selected host with a **Provision** tab, which runs `rox up` there.
+3. The guest is registered on that host, which is where its private socket lives.
+4. When provisioning succeeds, a **Guest** tab opens a shell at the guest checkout. Any command after `--` runs in the guest's own Rex session. The Provision tab prints the command for inspecting that session from a terminal on the selected host.
+
+The selected host uses **its own** config, runtime images, project images, and SSH keys. Overrides such as `--config`, `--git-key`, and `--git-known-hosts` are paths on that host. Quote paths that start with `~` so the selected host expands them.
+
+## Launching without a checkout
+
+To launch from a Rex terminal that isn't inside a source checkout, give the project name, repository URL, and branch:
+
+```sh
+rox up container --host buildbox --project my-project \
+  --repo git@github.com:organization/my-project.git --branch main
+```
+
+<Aside>
+	Run `rox ls`, `rox shell NAME`, `rox reconnect NAME`, and `rox down NAME` from a terminal on the machine that launched the guest. See [Rex CLI host selection](https://www.superlogical.com/rex/docs/reference/cli#rex-hosts).
+</Aside>

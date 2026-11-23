@@ -1,0 +1,51 @@
+---
+title: Project images
+description: Run .rox.sh once at image build time and reuse the result for fast cold starts.
+---
+
+import { Aside, Steps } from '@astrojs/starlight/components';
+
+When the branch has a `.rox.sh`, Rox runs it once while building a **project image**, then starts later guests from that image. A launch from the image doesn't clone the repo or run the hook. It fetches the branch into the prepared checkout and moves it to the branch tip. Files the hook created that Git doesn't track, such as `node_modules`, stay in place.
+
+| Backend | Image name | How it's built |
+| --- | --- | --- |
+| `container` | `rox:REPO` | A generated Containerfile `FROM` the configured image, labelled with the hook, the base image, and the repository |
+| `linux`, `macos` | `rox-REPO-BACKEND` | Boots a clone of the configured Tart template, clones and runs the hook over SSH, then stops it and renames it |
+
+Tart names can't contain `:`, so VM images use a dash and include the backend.
+
+## When the image is rebuilt
+
+<Steps>
+
+1. On each launch, Rox fetches the branch into a cached mirror on the launcher, under `${XDG_CACHE_HOME:-$HOME/.cache}/rox/repos`. After the first fetch this only downloads new commits. It uses the same keys and pinned host keys as the guest.
+2. Rox reads the `.rox.sh` blob at the branch tip and compares it with the existing image.
+3. Rox rebuilds when `.rox.sh` changes, when the base image changes, or when the repository URL differs. A new commit that leaves `.rox.sh` alone reuses the image.
+
+</Steps>
+
+<Aside type="caution" title="Dependencies can go stale">
+	The image only notices changes to `.rox.sh` itself. If a push changes `package-lock.json` or another dependency manifest but not the hook, pass `--rebuild` on the next launch.
+</Aside>
+
+## Options
+
+| Option | Effect |
+| --- | --- |
+| `--rebuild` | Rebuild the project image before launching. |
+| `--no-prebuild` | Clone and run `.rox.sh` at boot instead. Set `"prebuild": false` under a backend in the [config](../../reference/configuration/) to make this the default. |
+| `--no-hook` | Skip both the hook and the project image, and start from the base image. |
+
+## Failures
+
+- If the launcher can't read the branch, Rox prints a warning and runs the hook at boot instead.
+- If the hook fails during a build, the launch stops. For Tart builds, the build log is kept under `${XDG_STATE_HOME:-$HOME/.local/state}/rox/builds`.
+
+## Removing an image
+
+```sh
+docker rmi rox:my-project       # or: podman rmi rox:my-project
+tart delete rox-my-project-linux
+```
+
+When a container image is rebuilt, Rox removes the image it replaces unless a running workspace still uses it.
