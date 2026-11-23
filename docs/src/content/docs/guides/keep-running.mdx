@@ -1,0 +1,53 @@
+---
+title: Keeping guests running
+description: Bring guests back after a reboot or a container runtime restart, with rox commands or the rox service.
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+A guest keeps its files when it stops, but stopping breaks everything that connects to it. When the Mac reboots, or Apple's container services restart, each container stops and comes back with a new IP address. The SSH tunnel and relay on the launcher stop too, along with the guest's Rex server and its tailnet node. Apple's `container` has no restart policy, so nothing starts the guest again on its own.
+
+Rox brings a guest back in two ways.
+
+## When you use it
+
+`rox shell`, `rox forward`, `rox add`, `rox reconnect` and `rox start` check the guest before they use it. If the runtime is down, Rox starts Apple's container services. If the guest stopped, Rox starts it and waits for SSH at its new address. Then it reopens the tunnel, restarts the guest's Rex server, and rejoins the tailnet. A guest that's running and reachable is used as it is.
+
+Rox can't start Docker or Podman for you. When either is down, it says so. Start Docker Desktop, or run `podman machine start`, and try again.
+
+## In the background
+
+The rox service does the same check every 15 seconds for every ready guest, so guests come back after a reboot or runtime restart without you running anything. Install it on the machine that runs the guests:
+
+```sh
+rox service install
+```
+
+On macOS this installs a launchd agent that starts at login. On Linux it's a systemd user unit. Run `loginctl enable-linger $USER` too, so the service keeps running while you're logged out. Check it with `rox service status`, and read what it did in `~/.local/state/rox/service.log`:
+
+```text
+2026-11-23 12:36:27 Watching rox guests every 15s
+Starting rv-my-project-3f9a1c2b7d40
+2026-11-23 12:36:33 Restored rv-my-project-3f9a1c2b7d40
+```
+
+When a guest can't be restored, for example because its container was deleted, the service logs why and tries again less often, up to every ten minutes. It skips a guest while another rox command is working on it. After you upgrade rox, the service restarts itself to load the new version.
+
+The service runs on the machine that runs the guests. For guests on a [remote host](../remote-hosts/), run `rox service install` on that host.
+
+<Aside>
+	Docker and Podman guests are started with `--restart unless-stopped`, so the engine brings the container back itself. The service still reopens the tunnel and the Rex server, which run outside the container.
+</Aside>
+
+## Stopping a guest on purpose
+
+Without the service, a guest you stop with `container stop` stays stopped until a rox command needs it. With the service, it comes back within seconds. To stop a guest and keep it stopped, use rox:
+
+```sh
+rox stop rv-my-project-3f9a1c2b7d40
+rox start rv-my-project-3f9a1c2b7d40
+```
+
+`rox stop` closes the tunnel and stops the container or VM without deleting anything. `rox ls` shows the guest as `stopped`. The service leaves it alone, and `rox shell`, `rox forward` and `rox add` refuse it until you run `rox start`.
+
+To remove the service, run `rox service uninstall`. Guests that are running keep running.

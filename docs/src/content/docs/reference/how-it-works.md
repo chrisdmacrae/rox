@@ -33,5 +33,6 @@ When the launcher config has `tailscale`, the guest's Rex server also serves ove
 | `${XDG_STATE_HOME:-~/.local/state}/rox/images/` | Tart project image records |
 | `${XDG_STATE_HOME:-~/.local/state}/rox/builds/` | Logs from Tart project image builds that failed |
 | `${XDG_CACHE_HOME:-~/.cache}/rox/repos/` | Bare mirrors used to check for `.rox.sh` |
+| `${XDG_STATE_HOME:-~/.local/state}/rox/service.log` | What the [rox service](../../guides/keep-running/) restored, and why a guest couldn't be |
 
 A failed launch prints the workspace name, so you can find its records or remove it with `rox down NAME`.

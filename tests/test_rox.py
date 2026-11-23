@@ -21,6 +21,9 @@ rox = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = rox
 LOADER.exec_module(rox)
 REAL_DEFAULT_ENGINE = rox.default_engine
+REAL_ENSURE_RUNTIME = rox.ensure_runtime
+REAL_GUEST_STATE = rox.guest_state
+REAL_REACHABLE = rox.reachable
 
 
 def base_image(version=None, image_id="sha256:base"):
@@ -48,6 +51,12 @@ class WorkspaceTests(unittest.TestCase):
         engine = patch.object(rox, "default_engine", return_value="docker")
         engine.start()
         self.addCleanup(engine.stop)
+        # Treat guests as running and reachable, so commands don't ask a real engine or tunnel.
+        # Tests of those checks call the REAL_ copies.
+        for name, value in (("guest_state", "running"), ("reachable", True)):
+            runtime = patch.object(rox, name, return_value=value)
+            runtime.start()
+            self.addCleanup(runtime.stop)
         # Launches read .rox.sh and .rox.json from the branch. Tests opt in to a real fetch.
         branch = patch.object(rox, "read_branch", return_value=None)
         branch.start()
@@ -278,13 +287,12 @@ class WorkspaceTests(unittest.TestCase):
         guest.save()
         with (
             patch.object(rox.shutil, "which", return_value="/fixture"),
-            patch.object(rox, "apple_container_address", return_value=("192.168.64.10", 22)),
             patch.object(rox.os, "execvp") as execvp,
             contextlib.redirect_stdout(io.StringIO()) as printed,
         ):
             rox.main(["forward", guest.name, "5173", "8080:3000"])
         argv = execvp.call_args.args[1]
-        self.assertEqual(argv[-2:], ["--", "192.168.64.10"])
+        self.assertEqual(argv[-2:], ["--", "192.168.64.9"])
         tunnels = [argv[index + 1] for index, arg in enumerate(argv) if arg == "-L"]
         self.assertEqual(tunnels, ["127.0.0.1:5173:127.0.0.1:5173", "127.0.0.1:8080:127.0.0.1:3000"])
         self.assertIn("-N", argv)
@@ -319,6 +327,8 @@ class WorkspaceTests(unittest.TestCase):
         launch = output.call_args_list[0].args[0]
         self.assertEqual(launch[:4], ["docker", "run", "-d", "--pull=never"])
         self.assertEqual(launch[-1], "rox:linux")
+        # The engine brings the container back after it restarts, unless rox stop stopped it.
+        self.assertIn("--restart unless-stopped", " ".join(launch))
 
     def test_clone_reuses_only_the_matching_trusted_host_entries(self):
         ssh_dir = self.root / ".ssh"
@@ -426,6 +436,209 @@ class WorkspaceTests(unittest.TestCase):
                 rox.main(["config", "tailscale", "--config", str(config), *argv])
         self.assertFalse(config.exists())
         self.assertFalse(config.with_name("tailscale-authkey").exists())
+
+    def saved_guest(self, name="rv-fixture-000011112222", **fields):
+        rox.private_directory(rox.state_root())
+        guest = rox.Guest(name, "container", "rox:linux", "workspace", **{
+            "engine": "container", "identity": str(self.root / "login"), "address": "192.168.64.9",
+            "guest_socket": "/home/workspace/.rox/x/r.sock", "phase": "ready", "registered": True, **fields})
+        guest.directory.mkdir(mode=0o700)
+        guest.save()
+        return guest
+
+    def test_ensure_runtime_starts_apple_container_services_and_explains_a_stopped_engine(self):
+        results = {("container", "system", "status"): 1, ("container", "system", "start"): 0}
+        commands = []
+
+        def fake_run(argv, **kwargs):
+            commands.append(argv)
+            return subprocess.CompletedProcess(argv, results.get(tuple(argv[:3]), 0), "", "")
+
+        with patch.object(rox, "run", side_effect=fake_run), contextlib.redirect_stdout(io.StringIO()):
+            REAL_ENSURE_RUNTIME("container")
+            self.assertEqual(commands[-1], ["container", "system", "start", "--disable-kernel-install"])
+            results[("container", "system", "start")] = 1
+            with self.assertRaisesRegex(rox.Error, "Could not start Apple's container services"):
+                REAL_ENSURE_RUNTIME("container")
+            commands.clear()
+            results[("container", "system", "status")] = 0
+            REAL_ENSURE_RUNTIME("container")
+            self.assertEqual(commands, [["container", "system", "status"]])
+            REAL_ENSURE_RUNTIME("")
+        with patch.object(rox, "output", side_effect=rox.Error("Cannot connect")):
+            with self.assertRaisesRegex(rox.Error, "docker isn't running"):
+                REAL_ENSURE_RUNTIME("docker")
+
+    def test_guest_state_reads_apple_container_docker_and_tart(self):
+        apple = rox.Guest("rv-fixture-000011112222", "container", "rox:linux", "workspace", engine="container")
+        docker = rox.Guest("rv-fixture-000011112222", "container", "rox:linux", "workspace",
+                           engine="docker", container_id="abc")
+        vm = rox.Guest("rv-fixture-000011112222", "linux", "rox-ubuntu", "admin")
+        replies = {}
+
+        def fake_run(argv, **kwargs):
+            return subprocess.CompletedProcess(argv, *replies[argv[0]])
+
+        cases = [
+            (apple, "container", (0, json.dumps([{"status": {"state": "running", "networks": []}}]), ""), "running"),
+            (apple, "container", (0, json.dumps([{"status": {"state": "stopped", "networks": []}}]), ""), "stopped"),
+            (apple, "container", (1, "", "Error: container not found: rv-fixture"), "missing"),
+            (docker, "docker", (0, "true\n", ""), "running"),
+            (docker, "docker", (0, "false\n", ""), "stopped"),
+            (docker, "docker", (1, "", "Error: No such object: abc"), "missing"),
+        ]
+        with patch.object(rox, "run", side_effect=fake_run):
+            for guest, tool, reply, state in cases:
+                replies[tool] = reply
+                with self.subTest(tool=tool, state=state):
+                    self.assertEqual(REAL_GUEST_STATE(guest), state)
+            replies["container"] = (1, "", "XPC connection error")
+            with self.assertRaisesRegex(rox.Error, "XPC connection error"):
+                REAL_GUEST_STATE(apple)
+        for listing, state in (([{"Name": vm.name, "Running": False}], "stopped"),
+                               ([{"Name": vm.name, "Running": True}], "running"), ([], "missing")):
+            with self.subTest(tart=state), patch.object(rox, "output", return_value=json.dumps(listing)):
+                self.assertEqual(REAL_GUEST_STATE(vm), state)
+
+    def test_resume_starts_a_stopped_guest_at_its_new_address_and_reconnects(self):
+        guest = self.saved_guest()
+        with (
+            patch.object(rox, "ensure_runtime") as runtime,
+            patch.object(rox, "guest_state", return_value="stopped"),
+            patch.object(rox, "output", return_value="") as command,
+            patch.object(rox, "apple_container_address", return_value=("192.168.64.12", 22)),
+            patch.object(rox, "check_guest_os"),
+            patch.object(rox, "close_tunnel"),
+            patch.object(rox, "connect") as connect,
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            self.assertTrue(rox.resume(guest, boot_timeout=5))
+        runtime.assert_called_once_with("container")
+        self.assertEqual(command.call_args.args[0], ["container", "start", guest.name])
+        self.assertEqual(rox.Guest.load(guest.name).address, "192.168.64.12")
+        connect.assert_called_once_with(guest, None)
+
+    def test_resume_leaves_a_healthy_guest_alone_and_reports_a_deleted_one(self):
+        guest = self.saved_guest()
+        with patch.object(rox, "ensure_runtime"), patch.object(rox, "connect") as connect:
+            self.assertFalse(rox.resume(guest))
+            connect.assert_not_called()
+            with patch.object(rox, "reachable", return_value=False), patch.object(rox, "close_tunnel"):
+                self.assertTrue(rox.resume(guest))
+            connect.assert_called_once()
+            with patch.object(rox, "guest_state", return_value="missing"), \
+                    self.assertRaisesRegex(rox.Error, "no longer exists. Remove the workspace with rox down"):
+                rox.resume(guest)
+
+    def test_stop_keeps_a_guest_stopped_until_start(self):
+        guest = self.saved_guest()
+        with (
+            patch.object(rox, "output", return_value="") as command,
+            patch.object(rox, "close_tunnel"),
+            contextlib.redirect_stdout(io.StringIO()) as printed,
+        ):
+            rox.main(["stop", guest.name])
+            self.assertEqual(command.call_args.args[0], ["container", "stop", guest.name])
+            self.assertIn(f"rox start {guest.name}", printed.getvalue())
+            self.assertTrue(rox.Guest.load(guest.name).stopped)
+            self.assertEqual(rox.local_records()[0]["phase"], "stopped")
+            for argv in (["shell", guest.name], ["forward", guest.name, "3000"]):
+                with self.subTest(argv=argv), patch.object(rox.shutil, "which", return_value="/fixture"), \
+                        self.assertRaisesRegex(rox.Error, "is stopped. Start it with rox start"):
+                    rox.main(argv)
+            with patch.object(rox, "resume") as resume, patch.object(rox, "offer_app_host") as offer:
+                rox.main(["start", guest.name])
+            self.assertEqual(resume.call_args.kwargs, {"force": False})
+            offer.assert_not_called()
+        reopened = rox.Guest.load(guest.name)
+        self.assertFalse(reopened.stopped)
+        self.assertEqual(reopened.phase, "ready")
+
+    def test_shell_restores_a_guest_whose_tunnel_went_away(self):
+        guest = self.saved_guest()
+        with (
+            patch.object(rox, "reachable", return_value=False),
+            patch.object(rox, "resume") as resume,
+            patch.object(rox.os, "execvpe"),
+        ):
+            rox.main(["shell", guest.name])
+        self.assertEqual(resume.call_args.args[0].name, guest.name)
+
+    def test_service_tick_restores_wanted_guests_and_backs_off_failures(self):
+        healthy = self.saved_guest("rv-healthy-000011112222")
+        broken = self.saved_guest("rv-broken-000011112222")
+        self.saved_guest("rv-stopped-000011112222", stopped=True)
+        self.saved_guest("rv-failed-000011112222", phase="failed")
+        attempts = []
+
+        def fake_resume(guest, tailnet=None):
+            attempts.append(guest.name)
+            if guest.name == broken.name:
+                raise rox.Error("container did not report an IPv4 address")
+            return True
+
+        retry = {}
+        with patch.object(rox, "resume", side_effect=fake_resume), \
+                contextlib.redirect_stdout(io.StringIO()) as log:
+            rox.service_tick(retry, 1000)
+            self.assertEqual(sorted(attempts), [broken.name, healthy.name])
+            self.assertEqual(retry, {broken.name: (1030, 30)})
+            self.assertIn(f"Restored {healthy.name}", log.getvalue())
+            self.assertIn(f"Could not restore {broken.name}, trying again in 30s", log.getvalue())
+            attempts.clear()
+            rox.service_tick(retry, 1010)
+            self.assertEqual(attempts, [healthy.name])
+            rox.service_tick(retry, 1031)
+            self.assertEqual(retry[broken.name], (1091, 60))
+            # A guest another command is working on is skipped, not counted as a failure.
+            with rox.guest_lock(healthy.directory):
+                attempts.clear()
+                rox.service_tick(retry, 2000)
+            self.assertEqual(attempts, [broken.name])
+
+    def test_service_install_writes_a_launch_agent_on_macos(self):
+        commands = []
+
+        def fake_run(argv, **kwargs):
+            commands.append(argv)
+            return subprocess.CompletedProcess(argv, 0, "", "")
+
+        with (
+            patch.object(rox.sys, "platform", "darwin"),
+            patch.object(rox.Path, "home", return_value=self.root),
+            patch.object(rox.shutil, "which", return_value="/fixture"),
+            patch.object(rox, "run", side_effect=fake_run),
+            contextlib.redirect_stdout(io.StringIO()) as printed,
+        ):
+            rox.main(["service", "install"])
+            plist = self.root / "Library" / "LaunchAgents" / "io.rox.service.plist"
+            agent = rox.plistlib.loads(plist.read_bytes())
+            self.assertEqual(agent["ProgramArguments"], [str(rox.HERE / "rox"), "service", "run"])
+            self.assertTrue(agent["RunAtLoad"] and agent["KeepAlive"] and agent["AbandonProcessGroup"])
+            self.assertIn(str(self.root / ".local" / "bin"), agent["EnvironmentVariables"]["PATH"])
+            self.assertEqual(agent["EnvironmentVariables"]["XDG_STATE_HOME"], str(self.root / "state"))
+            self.assertEqual(agent["StandardErrorPath"], str(rox.state_root() / "service.log"))
+            domain = f"gui/{os.getuid()}"
+            self.assertEqual(commands[-2:], [["launchctl", "bootout", f"{domain}/io.rox.service"],
+                                             ["launchctl", "bootstrap", domain, str(plist)]])
+            self.assertIn("starts at login", printed.getvalue())
+            rox.main(["service", "uninstall"])
+        self.assertFalse(plist.exists())
+
+    def test_service_install_writes_a_systemd_user_unit_on_linux(self):
+        with (
+            patch.object(rox.sys, "platform", "linux"),
+            patch.object(rox.shutil, "which", return_value="/fixture"),
+            patch.object(rox, "output", return_value="") as command,
+            contextlib.redirect_stdout(io.StringIO()) as printed,
+        ):
+            rox.main(["service", "install"])
+        unit = (self.root / "config-home" / "systemd" / "user" / "rox.service").read_text()
+        self.assertIn(f'ExecStart="{rox.HERE / "rox"}" "service" "run"', unit)
+        self.assertIn("KillMode=process", unit)
+        self.assertIn("Restart=always", unit)
+        self.assertEqual(command.call_args.args[0], ["systemctl", "--user", "restart", "rox.service"])
+        self.assertIn("loginctl enable-linger", printed.getvalue())
 
     def test_reconnect_registers_a_retained_guest_that_never_created_a_session(self):
         name = "rv-retained-000011112222"

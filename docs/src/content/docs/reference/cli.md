@@ -61,23 +61,27 @@ Each launcher keeps its own workspace records, so plain `rox ls` shows only the 
 
 ## `rox shell NAME [PROJECT]`
 
-Open an interactive login shell with `REX_SERVER` pointing at the guest's server. `PROJECT` is a project ID or name from `rox ls`. Without it, the shell opens at the guest's only checkout, or in the guest home when it has no projects or several. The guest must be ready.
+Open an interactive login shell with `REX_SERVER` pointing at the guest's server. `PROJECT` is a project ID or name from `rox ls`. Without it, the shell opens at the guest's only checkout, or in the guest home when it has no projects or several. The guest must be ready, and not stopped with `rox stop`. If the guest stopped or lost its tunnel, for example after a reboot, Rox [starts it again](../../guides/keep-running/) first.
 
 ## `rox forward NAME PORT...`
 
 Forward ports on the launcher's `localhost` to servers listening on the guest's own `localhost`, over the guest's SSH connection. It works with every backend and engine, including Docker and Podman containers, which have no address of their own. The dev server can keep listening on `localhost`, and you open it at `http://localhost:PORT`.
 
-Give each port as `PORT` to use the same number on both sides, or `LOCAL:GUEST` to choose the launcher's port. For example, `rox forward rv-app-1a2b3c4d5e6f 5173 8080:3000` opens `http://localhost:5173` and `http://localhost:8080`. The forward runs in the foreground until you press Ctrl-C, and it exits if a local port is already taken. Forwarded ports bind only to `127.0.0.1` on the launcher, and the guest can't open tunnels back to it. The guest must be ready.
+Give each port as `PORT` to use the same number on both sides, or `LOCAL:GUEST` to choose the launcher's port. For example, `rox forward rv-app-1a2b3c4d5e6f 5173 8080:3000` opens `http://localhost:5173` and `http://localhost:8080`. The forward runs in the foreground until you press Ctrl-C, and it exits if a local port is already taken. Forwarded ports bind only to `127.0.0.1` on the launcher, and the guest can't open tunnels back to it. The guest must be ready, and not stopped with `rox stop`. If the guest stopped or lost its tunnel, for example after a reboot, Rox [starts it again](../../guides/keep-running/) first.
 
 Containers started from a `rox:linux` image built before `rox forward` existed refuse the tunnel. Rox rebuilds `rox:linux` on the next `rox up container`, so start a new guest to use it.
 
 ## `rox reconnect NAME`
 
-Restore Rex access to a guest that's still running. This also works for a guest kept after a failed clone or setup. Rox restarts the guest's Rex server if needed, reopens the tunnel, and registers the host again.
+Restore Rex access to a guest. This also works for a guest kept after a failed clone or setup. Rox starts the container runtime and the guest if they stopped, restarts the guest's Rex server if needed, reopens the tunnel, rejoins the tailnet, and registers the host again. A guest stopped with `rox stop` is started again.
 
 | Option | Description |
 | --- | --- |
 | `--no-app-host` | Don't offer to add the guest to a Rex app that keeps its own host list. |
+
+## `rox start NAME` / `rox stop NAME`
+
+`rox stop` closes the guest's tunnel and stops its container or VM without deleting anything. The guest stays stopped until `rox start`: `rox ls` shows it as `stopped`, the [rox service](../../guides/keep-running/) leaves it alone, and `rox shell`, `rox forward` and `rox add` refuse it. `rox start` starts the guest and restores access to it, like `rox reconnect`, without the Rex app prompt.
 
 ## `rox down [NAME]`
 
@@ -87,6 +91,12 @@ Delete the guest, its filesystem, all of its project checkouts, and its Rex host
 | --- | --- |
 | `--cwd DIR` | Directory inside the project, used when you leave out `NAME`. |
 | `-S`, `--host HOST` | Remove a guest that runs on this [Rex remote host](../../guides/remote-hosts/), and this machine's Rex host entry for it. `NAME` is required. |
+
+## `rox service install` / `uninstall` / `status`
+
+Install a background service that [keeps guests running](../../guides/keep-running/) on this machine. Every 15 seconds it starts Apple's container services if they stopped, and restores each ready guest that stopped or lost its tunnel, the same way `rox reconnect` does. It skips guests stopped with `rox stop`. On macOS it's a launchd agent at `~/Library/LaunchAgents/io.rox.service.plist`. On Linux it's a systemd user unit at `${XDG_CONFIG_HOME:-~/.config}/systemd/user/rox.service`. Both start at login. The service records the `PATH` you install it with, so run `rox service install` again if `container`, `tart`, `rex` or `ssh` move. It logs to `${XDG_STATE_HOME:-~/.local/state}/rox/service.log`, and restarts itself when rox is upgraded.
+
+`rox service uninstall` stops and removes the service. `rox service status` shows whether it's running. `rox service run` runs the same loop in the foreground, with `--interval SECONDS` to check more or less often.
 
 ## `rox key add PATH` / `rox key remove PATH`
 

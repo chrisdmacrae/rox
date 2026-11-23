@@ -215,6 +215,16 @@ By default a guest's Rex server is reachable only on its launcher, through a Uni
 
 Use a reusable, ephemeral auth key tagged `tag:rox-guest`, stored in a file only you can read, and tailnet ACLs that let your devices reach `tag:rox-guest` without letting guests reach anything. An agent in the guest can use the guest's tailnet identity, so the tag's ACLs are what keep guests isolated. Pass `--no-tailscale` to keep one guest off the tailnet. The [tailnet guide](docs/src/content/docs/guides/tailnet.mdx) has the policy and key setup.
 
+## Keeping guests running
+
+When the Mac reboots, or Apple's container services restart, guests stop, and Apple's `container` doesn't start them again. `rox shell`, `rox forward`, `rox add` and `rox reconnect` start the runtime and the guest if they stopped, then reopen the tunnel and the guest's Rex server. To bring guests back without running anything, install the rox service on the machine that runs them:
+
+```sh
+rox service install
+```
+
+It checks every 15 seconds, logs to `~/.local/state/rox/service.log`, and leaves alone guests you stopped with `rox stop`. The [guide](docs/src/content/docs/guides/keep-running.mdx) has the details.
+
 ## Workspace commands
 
 | Command | Effect |
@@ -224,7 +234,9 @@ Use a reusable, ephemeral auth key tagged `tag:rox-guest`, stored in a file only
 | `rox shell NAME [PROJECT]` | Open an interactive shell at a project checkout. Without `PROJECT`, it opens the guest's only checkout, or the guest home when there are none or several. |
 | `rox forward NAME PORT...` | Forward `localhost` ports on the launcher to servers on the guest's `localhost`, for example dev servers. Use `LOCAL:GUEST` to pick a different local port. Runs until Ctrl-C. |
 | `rex -S NAME ls` | List the guest's Rex sessions after a local launch with host registration. |
-| `rox reconnect NAME` | Restore Rex access to a booted guest, including one retained after clone or setup failure. Offers to add it to the local Rex app's host list unless you pass `--no-app-host`. |
+| `rox reconnect NAME` | Restore Rex access to a guest, starting the container runtime and the guest first if they stopped. Also works for one retained after clone or setup failure. Offers to add it to the local Rex app's host list unless you pass `--no-app-host`. |
+| `rox stop NAME` / `rox start NAME` | Stop a guest without deleting it, and keep it stopped until `rox start`. |
+| `rox service install` | Keep guests running across reboots and container runtime restarts. See [Keeping guests running](#keeping-guests-running). |
 | `rox down NAME` | Delete the guest, its filesystem, and its Rex host entry. |
 | `rox down` | From a project checkout, remove the guest that has that project. If several do, Rox lists them and asks which one to remove. |
 

@@ -11,6 +11,7 @@ import ipaddress
 import json
 import os
 import platform
+import plistlib
 from pathlib import Path, PurePosixPath
 import re
 import secrets
@@ -39,6 +40,10 @@ LAUNCHER_KEYS = {"engine", "user", "identity", "host_key", "git_keys", "git_know
 
 class Error(Exception):
     pass
+
+
+class Busy(Error):
+    """Another rox command holds the guest's lock."""
 
 
 def run(argv, *, capture=False, check=True, **kwargs):
@@ -123,6 +128,8 @@ class Guest:
     memory: str = ""
     # The image already holds a prepared checkout of the first project.
     prebuilt: bool = False
+    # rox stop sets this, so rox and its service leave the guest stopped until rox start.
+    stopped: bool = False
     projects: list = field(default_factory=list)
 
     @property
@@ -204,12 +211,15 @@ class Guest:
 
 
 @contextmanager
-def guest_lock(directory):
+def guest_lock(directory, wait=False):
     with (directory / "lock").open("a") as lock:
         try:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
-            raise Error(f"Another command is working on {directory.name}") from None
+            if not wait:
+                raise Busy(f"Another command is working on {directory.name}") from None
+            print(f"Waiting for another command working on {directory.name}", file=sys.stderr, flush=True)
+            fcntl.flock(lock, fcntl.LOCK_EX)
         yield
 
 
@@ -547,12 +557,119 @@ def default_engine():
     return "container" if sys.platform == "darwin" and platform.machine() == "arm64" else "docker"
 
 
-def check_engine(engine):
+def ensure_runtime(engine):
+    """Start Apple's container services if they stopped. Docker and Podman must already run."""
     if engine == "container":
-        if run(["container", "system", "status"], capture=True, check=False, timeout=20).returncode:
-            raise Error("Apple's container services are not running. Start them with: container system start")
+        if run(["container", "system", "status"], capture=True, check=False, timeout=20).returncode == 0:
+            return
+        print("Starting Apple's container services", flush=True)
+        # Guests already exist, so the kernel is installed and there's nothing to prompt for.
+        result = run(["container", "system", "start", "--disable-kernel-install"],
+                     capture=True, check=False, timeout=120, stdin=subprocess.DEVNULL)
+        if result.returncode:
+            details = (result.stderr or result.stdout).strip()
+            raise Error("Could not start Apple's container services. Run container system start"
+                        + (f"\n{details}" if details else ""))
+    elif engine:
+        try:
+            output([engine, "info"], timeout=20)
+        except (Error, subprocess.TimeoutExpired):
+            hint = " with podman machine start" if engine == "podman" and sys.platform == "darwin" else ""
+            raise Error(f"{engine} isn't running. Start it{hint} and try again") from None
+
+
+def guest_state(guest):
+    """Return running, stopped or missing for the guest's container or VM."""
+    if guest.engine == "container":
+        result = run(["container", "inspect", guest.name], capture=True, check=False, timeout=20)
+        if result.returncode:
+            if "not found" in (result.stderr + result.stdout).lower():
+                return "missing"
+            raise Error(result.stderr.strip() or f"Could not inspect container {guest.name}")
+        records = json.loads(result.stdout or "[]")
+        records = records if isinstance(records, list) else [records]
+        if not records:
+            return "missing"
+        status = records[0].get("status")
+        state = status.get("state") if isinstance(status, dict) else status
+        return "running" if state == "running" else "stopped"
+    if guest.engine:
+        result = run([guest.engine, "inspect", "--format", "{{.State.Running}}", guest.container_id],
+                     capture=True, check=False, timeout=20)
+        if result.returncode:
+            if "no such" in (result.stderr + result.stdout).lower():
+                return "missing"
+            raise Error(result.stderr.strip() or f"Could not inspect container {guest.name}")
+        return "running" if result.stdout.strip() == "true" else "stopped"
+    vms = json.loads(output(["tart", "list", "--source", "local", "--format", "json"], timeout=20) or "[]")
+    vm = next((vm for vm in vms if vm.get("Name") == guest.name), None)
+    if not vm:
+        return "missing"
+    return "running" if vm.get("Running") else "stopped"
+
+
+def start_guest(guest, boot_timeout):
+    """Start a stopped guest and wait until it takes SSH logins at its new address."""
+    if guest.engine == "container":
+        output(["container", "start", guest.name], timeout=120)
+    elif guest.engine:
+        output([guest.engine, "start", guest.container_id], timeout=120)
     else:
-        output([engine, "info"], timeout=20)
+        run_vm(guest)
+    guest.address, guest.port = wait_for(
+        lambda: container_address(guest) if guest.engine else vm_address(guest),
+        boot_timeout, f"{guest.name} to get an address")
+    guest.save()
+    check_guest_os(guest, boot_timeout)
+
+
+def stop_guest(guest):
+    if guest.engine == "container":
+        output(["container", "stop", guest.name], timeout=120)
+    elif guest.engine:
+        output([guest.engine, "stop", guest.container_id], timeout=120)
+    else:
+        output(["tart", "stop", guest.name], timeout=120)
+
+
+def reachable(guest):
+    """Whether this machine reaches the guest's Rex server through its tunnel."""
+    try:
+        return run([*rex_on(guest), "ls", "--json"], capture=True, check=False, timeout=8).returncode == 0
+    except subprocess.TimeoutExpired:
+        return False
+
+
+def resume(guest, tailnet=None, boot_timeout=120, force=False):
+    """Bring the guest back after its runtime, the guest or its tunnel stopped.
+
+    Start the runtime and the guest if needed, then rebuild the tunnel, the Rex server and the
+    tailnet node. A guest that's running and reachable is left alone unless force is set.
+    Return whether anything had to be restored.
+    """
+    ensure_runtime(guest.engine)
+    state = guest_state(guest)
+    if state == "missing":
+        kind = "container" if guest.engine else "VM"
+        raise Error(f"The {kind} for {guest.name} no longer exists. Remove the workspace with rox down {guest.name}")
+    if state == "stopped":
+        print(f"Starting {guest.name}", flush=True)
+        close_tunnel(guest)
+        start_guest(guest, boot_timeout)
+    elif not force and reachable(guest):
+        return False
+    close_tunnel(guest)
+    connect(guest, tailnet)
+    register_guest(guest)
+    return True
+
+
+def saved_tailnet(guest, config_value=None):
+    """The tailnet settings for reconnecting a guest that was launched on the tailnet."""
+    if not guest.tailnet_name:
+        return None
+    config_path = config_location(config_value)
+    return tailscale_settings(config_for(config_path), config_path, False)
 
 
 def vm_address(guest):
@@ -881,7 +998,7 @@ def launch_guest(guest, boot_timeout):
         pull_policy = ["--pull=never"] if local_image else []
         guest.container_id = output([
             guest.engine, "run", "-d", *pull_policy, "--name", guest.name, "--hostname", guest.name,
-            "--label", f"io.rox.workspace={guest.name}",
+            "--label", f"io.rox.workspace={guest.name}", "--restart", "unless-stopped",
             "--publish", "127.0.0.1::22", "--env", f"ROX_SSH_PUBLIC_KEY={public_key}",
             *container_resources(guest), guest.image,
         ])
@@ -899,12 +1016,8 @@ def launch_guest(guest, boot_timeout):
         ([f"--memory={memory_megabytes(guest.memory)}"] if guest.memory else [])
     if resources:
         run(["tart", "set", guest.name, *resources])
+    vm = run_vm(guest)
     log_path = guest.directory / "tart.log"
-    with log_path.open("a") as log:
-        vm = subprocess.Popen(
-            ["tart", "run", "--no-graphics", "--no-clipboard", guest.name],
-            stdin=subprocess.DEVNULL, stdout=log, stderr=log, start_new_session=True,
-        )
 
     def address():
         if vm.poll() is not None:
@@ -920,6 +1033,15 @@ def launch_guest(guest, boot_timeout):
             return found
         time.sleep(1)
     raise Error(f"No Tart IP address found for {guest.name}. See {log_path}")
+
+
+def run_vm(guest):
+    """Run the guest's Tart VM in the background, detached from this process."""
+    with (guest.directory / "tart.log").open("a") as log:
+        return subprocess.Popen(
+            ["tart", "run", "--no-graphics", "--no-clipboard", guest.name],
+            stdin=subprocess.DEVNULL, stdout=log, stderr=log, start_new_session=True,
+        )
 
 
 def container_resources(guest):
@@ -1446,7 +1568,7 @@ def up(args, command):
                     "or choose --engine docker or --engine podman")
     require(required)
     if engine:
-        check_engine(engine)
+        ensure_runtime(engine)
     private_directory(state_root())
     if engine:
         prepare_container_image(engine, image)
@@ -1528,10 +1650,11 @@ def add(args, command):
     guest = Guest.load(args.name)
     with guest_lock(guest.directory):
         guest = Guest.load(args.name)
+        if guest.stopped:
+            raise Error(f"{guest.name} is stopped. Start it with rox start {guest.name} before adding a project")
         if guest.phase != "ready" or not guest.guest_socket:
             raise Error(f"{guest.name} is {guest.phase}. Run rox reconnect {guest.name} before adding a project")
-        connect(guest, tailscale_settings(config, config_path, False) if guest.tailnet_name else None)
-        register_guest(guest)
+        resume(guest, saved_tailnet(guest, args.config), force=True)
         project = provision_project(guest, source, command, keys, known_hosts, args.no_hook)
         describe_guest(guest, project)
     if app_session:
@@ -1542,9 +1665,7 @@ def add(args, command):
 
 
 def shell(name, key=None):
-    guest = Guest.load(name)
-    if guest.phase != "ready":
-        raise Error(f"{name} is not ready")
+    guest = ready_guest(name)
     project = guest.find_project(key) if key else None
     if not key and len(guest.projects) == 1:
         project = guest.projects[0]
@@ -1559,17 +1680,16 @@ def shell(name, key=None):
     os.execvpe(argv[0], argv, {**os.environ, "TERM": "xterm-256color"})
 
 
-def reconnect(name, app_host=True):
+def reconnect(name, app_host=True, force=True):
+    """Start the guest if it stopped, and restore its tunnel, Rex server and tailnet node."""
     guest = Guest.load(name)
     with guest_lock(guest.directory):
         guest = Guest.load(name)
         if not guest.guest_socket or guest.phase == "removing":
             raise Error(f"{name} did not get far enough to start a Rex server")
-        close_tunnel(guest)
-        config_path = config_location(None)
-        config = config_for(config_path)
-        connect(guest, tailscale_settings(config, config_path, False) if guest.tailnet_name else None)
-        register_guest(guest)
+        guest.stopped = False
+        guest.save()
+        resume(guest, saved_tailnet(guest), force=force)
         guest.phase = "ready"
         guest.save()
         describe_guest(guest)
@@ -1577,6 +1697,41 @@ def reconnect(name, app_host=True):
             print(f"Project    {project.id}  {project.phase}  {project.workspace}")
     if app_host:
         offer_app_host(guest)
+
+
+def stop_workspace(name):
+    """Stop the guest and keep it stopped until rox start, without deleting anything."""
+    guest = Guest.load(name)
+    with guest_lock(guest.directory):
+        guest = Guest.load(name)
+        if guest.phase == "removing":
+            raise Error(f"{name} is being removed")
+        guest.stopped = True
+        guest.save()
+        close_tunnel(guest)
+        if guest_state(guest) == "running":
+            stop_guest(guest)
+        print(f"Stopped {name}. Start it again with rox start {name}", flush=True)
+
+
+def ready_guest(name):
+    """Load a guest for shell or forward, starting it again if its runtime or tunnel went away."""
+    guest = Guest.load(name)
+    if guest.stopped:
+        raise Error(f"{name} is stopped. Start it with rox start {name}")
+    if guest.phase != "ready":
+        raise Error(f"{name} is not ready")
+    try:
+        healthy = guest_state(guest) == "running" and reachable(guest)
+    except (Error, ValueError, subprocess.SubprocessError):
+        healthy = False
+    if healthy:
+        # A restart breaks the tunnel, so a reachable guest is still at its saved address.
+        return guest
+    with guest_lock(guest.directory, wait=True):
+        guest = Guest.load(name)
+        resume(guest, saved_tailnet(guest))
+    return guest
 
 
 def forward_spec(value):
@@ -1592,12 +1747,8 @@ def forward_spec(value):
 
 def forward(name, ports):
     """Tunnel localhost ports on the launcher to servers on the guest's own localhost."""
-    guest = Guest.load(name)
-    if guest.phase != "ready":
-        raise Error(f"{name} is not ready")
     require(["ssh"])
-    # Look the address up again, since a restarted container or VM can come back on a new one.
-    guest.address, guest.port = container_address(guest) if guest.engine else vm_address(guest)
+    guest = ready_guest(name)
     tunnels = [option for local, port in ports for option in ("-L", f"127.0.0.1:{local}:127.0.0.1:{port}")]
     argv = ssh_command(guest, "-N", "-T", "-S", "none", "-o", "ForwardAgent=no",
                        "-o", "ExitOnForwardFailure=yes", *tunnels)
@@ -1707,7 +1858,8 @@ def local_records():
     for path in sorted(state_root().glob("*/guest.json")):
         guest = Guest.load(path.parent.name)
         records.append({
-            "name": guest.name, "backend": guest.backend, "engine": guest.engine, "phase": guest.phase,
+            "name": guest.name, "backend": guest.backend, "engine": guest.engine,
+            "phase": "stopped" if guest.stopped and guest.phase == "ready" else guest.phase,
             "ip": guest_ip(guest), "tailnet": guest.tailnet_name, "projects": project_summary(guest),
         })
     return records
@@ -1815,6 +1967,154 @@ def list_guests(scope=None, as_json=False):
                 print(f"{host}\t{record_row(record)}")
     for host, problem in problems.items():
         print(f"rox: Skipped {host}: {problem}", file=sys.stderr)
+
+
+SERVICE_LABEL = "io.rox.service"
+SERVICE_INTERVAL = 15
+
+
+def service_log(message):
+    print(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {message}", flush=True)
+
+
+def service_tick(retry, now):
+    """Restore each ready guest that should run but stopped or lost its tunnel.
+
+    retry maps a guest name to (next attempt, delay), so a guest that keeps failing is tried
+    less often, up to every ten minutes.
+    """
+    for path in sorted(state_root().glob("*/guest.json")):
+        name = path.parent.name
+        try:
+            guest = Guest.load(name)
+        except (Error, OSError, ValueError, KeyError, TypeError):
+            continue
+        if guest.phase != "ready" or guest.stopped or not guest.guest_socket:
+            retry.pop(name, None)
+            continue
+        if now < retry.get(name, (0, 0))[0]:
+            continue
+        try:
+            with guest_lock(guest.directory):
+                guest = Guest.load(name)
+                if guest.phase == "ready" and not guest.stopped and resume(guest, saved_tailnet(guest)):
+                    service_log(f"Restored {name}")
+            retry.pop(name, None)
+        except Busy:
+            continue
+        except (Error, OSError, ValueError, KeyError, subprocess.SubprocessError) as error:
+            delay = min(max(retry.get(name, (0, 0))[1] * 2, 30), 600)
+            retry[name] = (now + delay, delay)
+            service_log(f"Could not restore {name}, trying again in {delay}s: {error}")
+
+
+def service_run(interval):
+    """Keep guests running until rox is upgraded, then exit so the service manager restarts it."""
+    script = HERE / "rox"
+    installed = script.stat().st_mtime
+    retry = {}
+    service_log(f"Watching rox guests every {interval}s")
+    while True:
+        try:
+            if script.stat().st_mtime != installed:
+                service_log("rox changed on disk, so restarting to load it")
+                return
+        except FileNotFoundError:
+            pass  # An upgrade is replacing the install. Check again next time.
+        service_tick(retry, time.monotonic())
+        time.sleep(interval)
+
+
+def service_file():
+    if sys.platform == "darwin":
+        return Path.home() / "Library" / "LaunchAgents" / f"{SERVICE_LABEL}.plist"
+    return xdg("XDG_CONFIG_HOME", ".config") / "systemd" / "user" / "rox.service"
+
+
+def service_environment():
+    """The PATH and rox locations to run the service with, since service managers start with neither."""
+    home = Path.home()
+    extra = [str(home / ".local" / "bin"), "/opt/homebrew/bin", "/usr/local/bin"]
+    entries = [*os.environ.get("PATH", "").split(os.pathsep), *extra, "/usr/bin", "/bin", "/usr/sbin", "/sbin"]
+    environment = {"PATH": os.pathsep.join(dict.fromkeys(entry for entry in entries if entry))}
+    for variable in ("XDG_STATE_HOME", "XDG_CONFIG_HOME", "XDG_CACHE_HOME"):
+        if os.environ.get(variable):
+            environment[variable] = os.environ[variable]
+    return environment
+
+
+def systemd_quote(value):
+    return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def install_service():
+    path = service_file()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    private_directory(state_root())
+    log = state_root() / "service.log"
+    command = [str(HERE / "rox"), "service", "run"]
+    environment = service_environment()
+    if sys.platform == "darwin":
+        require(["launchctl"])
+        path.write_bytes(plistlib.dumps({
+            "Label": SERVICE_LABEL,
+            "ProgramArguments": command,
+            "EnvironmentVariables": environment,
+            "RunAtLoad": True,
+            "KeepAlive": True,
+            # Guests, tunnels and relays outlive the service, so restarting it mustn't stop them.
+            "AbandonProcessGroup": True,
+            "StandardOutPath": str(log),
+            "StandardErrorPath": str(log),
+        }))
+        domain = f"gui/{os.getuid()}"
+        run(["launchctl", "bootout", f"{domain}/{SERVICE_LABEL}"], capture=True, check=False)
+        # launchd can take a moment to unload the previous copy.
+        wait_for(lambda: run(["launchctl", "bootstrap", domain, str(path)], capture=True, check=False).returncode == 0,
+                 10, "launchd to load the rox service")
+        print(f"Installed the rox service at {path}. It starts at login and keeps guests running.")
+    else:
+        require(["systemctl"])
+        lines = ["[Unit]", "Description=Keep rox guests running", "", "[Service]",
+                 "ExecStart=" + " ".join(systemd_quote(part) for part in command),
+                 *(f"Environment={systemd_quote(f'{key}={value}')}" for key, value in environment.items()),
+                 "Restart=always", "RestartSec=10",
+                 # Guests, tunnels and relays outlive the service, so restarting it mustn't stop them.
+                 "KillMode=process", f"StandardOutput=append:{log}", f"StandardError=append:{log}",
+                 "", "[Install]", "WantedBy=default.target", ""]
+        path.write_text("\n".join(lines))
+        output(["systemctl", "--user", "daemon-reload"])
+        output(["systemctl", "--user", "enable", "rox.service"])
+        output(["systemctl", "--user", "restart", "rox.service"])
+        print(f"Installed the rox service at {path}. It starts at login and keeps guests running.")
+        print("To keep it running while you're logged out, run: loginctl enable-linger $USER")
+    print(f"Log: {log}")
+
+
+def uninstall_service():
+    path = service_file()
+    if sys.platform == "darwin":
+        run(["launchctl", "bootout", f"gui/{os.getuid()}/{SERVICE_LABEL}"], capture=True, check=False)
+        path.unlink(missing_ok=True)
+    else:
+        run(["systemctl", "--user", "disable", "--now", "rox.service"], capture=True, check=False)
+        path.unlink(missing_ok=True)
+        run(["systemctl", "--user", "daemon-reload"], capture=True, check=False)
+    print("Removed the rox service. Guests keep running, but nothing restarts them.")
+
+
+def service_status():
+    path = service_file()
+    if not path.exists():
+        print("The rox service isn't installed. Install it with rox service install")
+        return
+    if sys.platform == "darwin":
+        result = run(["launchctl", "print", f"gui/{os.getuid()}/{SERVICE_LABEL}"], capture=True, check=False)
+        match = re.search(r"^\s*state = (\S+)", result.stdout, re.MULTILINE)
+        state = match[1] if match else "not loaded"
+    else:
+        state = run(["systemctl", "--user", "is-active", "rox.service"], capture=True, check=False).stdout.strip()
+    print(f"Service  {state}\nFile     {path}\nLog      {state_root() / 'service.log'}")
 
 
 SKILL_AGENTS = {
@@ -1936,9 +2236,13 @@ def main(argv):
     forward_parser.add_argument("name")
     forward_parser.add_argument("ports", nargs="+", type=forward_spec, metavar="PORT|LOCAL:GUEST",
                                 help="guest port to reach at the same localhost port, or LOCAL:GUEST")
-    reconnect_parser = commands.add_parser("reconnect", help="restore access to a running workspace")
+    reconnect_parser = commands.add_parser("reconnect", help="restore access to a workspace, starting it if it stopped")
     reconnect_parser.add_argument("name")
     reconnect_parser.add_argument("--no-app-host", action="store_true", help=APP_HOST_HELP)
+    start_parser = commands.add_parser("start", help="start a stopped guest and restore access to it")
+    start_parser.add_argument("name")
+    stop_parser = commands.add_parser("stop", help="stop a guest and keep it stopped until rox start")
+    stop_parser.add_argument("name")
     stop = commands.add_parser("down", help="delete a guest and its workspace")
     stop.add_argument("name", nargs="?",
                       help="workspace to remove; omit to pick from the current project's workspaces")
@@ -1950,6 +2254,14 @@ def main(argv):
         edit = key_commands.add_parser(action, help=help_text)
         edit.add_argument("path", help="path to the SSH private key")
         edit.add_argument("--config", help="alternate Rox configuration file")
+    service = commands.add_parser("service", help="keep guests running across runtime restarts and reboots")
+    service_commands = service.add_subparsers(dest="service_command", required=True)
+    service_commands.add_parser("install", help="start the service at login with launchd or systemd")
+    service_commands.add_parser("uninstall", help="stop the service and remove it")
+    service_commands.add_parser("status", help="show whether the service is running")
+    service_loop = service_commands.add_parser("run", help="run the service in the foreground")
+    service_loop.add_argument("--interval", type=positive_int, default=SERVICE_INTERVAL,
+                              help=f"seconds between checks (default {SERVICE_INTERVAL})")
     config_parser = commands.add_parser("config", help="open the rox config in VISUAL or EDITOR")
     config_parser.add_argument("--config", help="alternate Rox configuration file")
     config_commands = config_parser.add_subparsers(dest="config_command")
@@ -1987,8 +2299,15 @@ def main(argv):
         forward(args.name, args.ports)
     elif args.command == "reconnect":
         reconnect(args.name, app_host=not args.no_app_host)
+    elif args.command == "start":
+        reconnect(args.name, app_host=False, force=False)
+    elif args.command == "stop":
+        stop_workspace(args.name)
     elif args.command == "key":
         edit_git_keys(args)
+    elif args.command == "service":
+        {"install": install_service, "uninstall": uninstall_service, "status": service_status,
+         "run": lambda: service_run(args.interval)}[args.service_command]()
     elif args.command == "config" and args.config_command == "tailscale":
         configure_tailscale(args)
     elif args.command == "config":

@@ -35,6 +35,7 @@ export default defineConfig({
 						{ label: 'Tart VMs', slug: 'guides/tart-vms' },
 						{ label: 'Rex remote hosts', slug: 'guides/remote-hosts' },
 						{ label: 'Reaching guests from other devices', slug: 'guides/tailnet' },
+						{ label: 'Keeping guests running', slug: 'guides/keep-running' },
 						{ label: 'Orchestrating agents', slug: 'guides/agents' },
 					],
 				},
