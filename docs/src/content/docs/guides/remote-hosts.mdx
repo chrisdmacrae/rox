@@ -39,6 +39,21 @@ rox up container --host buildbox --no-project
 rox add rv-host-3f9a1c2b7d40 --host buildbox
 ```
 
+## Working with guests on other hosts
+
+`rox shell`, `rox forward`, `rox reconnect`, `rox start`, `rox stop`, `rox down` and `rox add` work on any guest you can see with `rox ls --all`, not just the ones this machine launched. When this machine has no record of `NAME`, Rox asks each of your Rex hosts for it, as `rox ls --all` does, and works on the host that has it. Pass `-S HOST` to skip the search.
+
+```sh
+rox shell rv-my-project-3f9a1c2b7d40
+rox stop rv-my-project-3f9a1c2b7d40 -S mini
+```
+
+- **`rox reconnect`, `start`, `stop` and `add`** run on the guest's host and print what it printed. `rox down` also removes this machine's Rex host entry for the guest.
+- **`rox shell`** opens in this terminal when the guest is [on the tailnet](../tailnet/). Rox creates an SSH key for this machine under `~/.local/state/rox/remote/`, adds it to the guest through the guest's Rex server, and connects over a tunnel through that server. The guest's Rex server admits only the tailnet members your policy allows, so the key gives you no access you didn't already have. For a guest that isn't on the tailnet, Rox starts `rox shell` in a Rex session on the guest's host instead, and shows that session in the Rex app.
+- **`rox forward`** tunnels through the guest's Rex server, so it needs the guest on the tailnet. Without it, run `rox forward` on the guest's host.
+
+The guest's host needs rox 0.9.0 or later for `rox shell` to open from another machine.
+
 <Aside>
-	Run `rox ls`, `rox shell NAME`, `rox reconnect NAME`, and `rox down NAME` from a terminal on the machine that launched the guest. See [Rex CLI host selection](https://www.superlogical.com/rex/docs/reference/cli#rex-hosts).
+	See [Rex CLI host selection](https://www.superlogical.com/rex/docs/reference/cli#rex-hosts) for the host labels `-S` accepts.
 </Aside>

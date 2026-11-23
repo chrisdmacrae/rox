@@ -61,31 +61,44 @@ Each launcher keeps its own workspace records, so plain `rox ls` shows only the 
 
 ## `rox shell NAME [PROJECT]`
 
-Open an interactive login shell with `REX_SERVER` pointing at the guest's server. `PROJECT` is a project ID or name from `rox ls`. Without it, the shell opens at the guest's only checkout, or in the guest home when it has no projects or several. The guest must be ready, and not stopped with `rox stop`. If the guest stopped or lost its tunnel, for example after a reboot, Rox [starts it again](../../guides/keep-running/) first.
+Open an interactive login shell with `REX_SERVER` pointing at the guest's server. `PROJECT` is a project ID or name from `rox ls`. Without it, the shell opens at the guest's only checkout, or in the guest home when it has no projects or several. The guest must be ready, and not stopped with `rox stop`. If the guest stopped or lost its tunnel, for example after a reboot, Rox [starts it again](../../guides/keep-running/) first. If this machine has no record of `NAME`, Rox finds the Rex host that runs it and works there. See [Working with guests on other hosts](../../guides/remote-hosts/#working-with-guests-on-other-hosts).
+
+| Option | Description |
+| --- | --- |
+| `-S`, `--host HOST` | The Rex host that runs the guest. Without it, Rox looks for the guest on this machine, then on each Rex host. |
 
 ## `rox forward NAME PORT...`
 
 Forward ports on the launcher's `localhost` to servers listening on the guest's own `localhost`, over the guest's SSH connection. It works with every backend and engine, including Docker and Podman containers, which have no address of their own. The dev server can keep listening on `localhost`, and you open it at `http://localhost:PORT`.
 
-Give each port as `PORT` to use the same number on both sides, or `LOCAL:GUEST` to choose the launcher's port. For example, `rox forward rv-app-1a2b3c4d5e6f 5173 8080:3000` opens `http://localhost:5173` and `http://localhost:8080`. The forward runs in the foreground until you press Ctrl-C, and it exits if a local port is already taken. Forwarded ports bind only to `127.0.0.1` on the launcher, and the guest can't open tunnels back to it. The guest must be ready, and not stopped with `rox stop`. If the guest stopped or lost its tunnel, for example after a reboot, Rox [starts it again](../../guides/keep-running/) first.
+Give each port as `PORT` to use the same number on both sides, or `LOCAL:GUEST` to choose the launcher's port. For example, `rox forward rv-app-1a2b3c4d5e6f 5173 8080:3000` opens `http://localhost:5173` and `http://localhost:8080`. The forward runs in the foreground until you press Ctrl-C, and it exits if a local port is already taken. Forwarded ports bind only to `127.0.0.1` on the launcher, and the guest can't open tunnels back to it. The guest must be ready, and not stopped with `rox stop`. If the guest stopped or lost its tunnel, for example after a reboot, Rox [starts it again](../../guides/keep-running/) first. For a guest on another host, Rox tunnels through the guest's Rex server on the tailnet. If this machine has no record of `NAME`, Rox finds the Rex host that runs it and works there. See [Working with guests on other hosts](../../guides/remote-hosts/#working-with-guests-on-other-hosts).
+
+| Option | Description |
+| --- | --- |
+| `-S`, `--host HOST` | The Rex host that runs the guest. Without it, Rox looks for the guest on this machine, then on each Rex host. |
 
 Containers started from a `rox:linux` image built before `rox forward` existed refuse the tunnel. Rox rebuilds `rox:linux` on the next `rox up container`, so start a new guest to use it.
 
 ## `rox reconnect NAME`
 
-Restore Rex access to a guest. This also works for a guest kept after a failed clone or setup. Rox starts the container runtime and the guest if they stopped, restarts the guest's Rex server if needed, reopens the tunnel, rejoins the tailnet, and registers the host again. A guest stopped with `rox stop` is started again.
+Restore Rex access to a guest. This also works for a guest kept after a failed clone or setup. Rox starts the container runtime and the guest if they stopped, restarts the guest's Rex server if needed, reopens the tunnel, rejoins the tailnet, and registers the host again. A guest stopped with `rox stop` is started again. If this machine has no record of `NAME`, Rox finds the Rex host that runs it and works there. See [Working with guests on other hosts](../../guides/remote-hosts/#working-with-guests-on-other-hosts).
 
 | Option | Description |
 | --- | --- |
 | `--no-app-host` | Don't offer to add the guest to a Rex app that keeps its own host list. |
+| `-S`, `--host HOST` | The Rex host that runs the guest. Without it, Rox looks for the guest on this machine, then on each Rex host. |
 
 ## `rox start NAME` / `rox stop NAME`
 
-`rox stop` closes the guest's tunnel and stops its container or VM without deleting anything. The guest stays stopped until `rox start`: `rox ls` shows it as `stopped`, the [rox service](../../guides/keep-running/) leaves it alone, and `rox shell`, `rox forward` and `rox add` refuse it. `rox start` starts the guest and restores access to it, like `rox reconnect`, without the Rex app prompt.
+`rox stop` closes the guest's tunnel and stops its container or VM without deleting anything. The guest stays stopped until `rox start`: `rox ls` shows it as `stopped`, the [rox service](../../guides/keep-running/) leaves it alone, and `rox shell`, `rox forward` and `rox add` refuse it. `rox start` starts the guest and restores access to it, like `rox reconnect`, without the Rex app prompt. If this machine has no record of `NAME`, Rox finds the Rex host that runs it and works there. See [Working with guests on other hosts](../../guides/remote-hosts/#working-with-guests-on-other-hosts).
+
+| Option | Description |
+| --- | --- |
+| `-S`, `--host HOST` | The Rex host that runs the guest. Without it, Rox looks for the guest on this machine, then on each Rex host. |
 
 ## `rox down [NAME]`
 
-Delete the guest, its filesystem, all of its project checkouts, and its Rex host entry. If you leave out `NAME`, Rox picks the guest that has the current project. When several do, it lists them and asks which one to remove.
+Delete the guest, its filesystem, all of its project checkouts, and its Rex host entry. If you leave out `NAME`, Rox picks the guest that has the current project. When several do, it lists them and asks which one to remove. If this machine has no record of `NAME`, Rox finds the Rex host that runs it, removes the guest there, and removes this machine's Rex host entry for it.
 
 | Option | Description |
 | --- | --- |

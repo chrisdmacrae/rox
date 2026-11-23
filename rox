@@ -42,6 +42,10 @@ class Error(Exception):
     pass
 
 
+class NotFound(Error):
+    """This machine has no record of the guest."""
+
+
 class Busy(Error):
     """Another rox command holds the guest's lock."""
 
@@ -194,7 +198,7 @@ class Guest:
         try:
             data = json.loads((state_root() / name / "guest.json").read_text())
         except FileNotFoundError:
-            raise Error(f"No managed workspace named {name}") from None
+            raise NotFound(f"No managed workspace named {name}") from None
         if data["name"] != name or data["backend"] not in BACKENDS:
             raise Error(f"Invalid workspace state for {name}")
         data.pop("register_host", None)  # Older launches could opt out of registration.
@@ -1664,19 +1668,36 @@ def add(args, command):
             raise Error(f"{project.id} is ready. Open it with rox shell {guest.name} {project.id}.") from error
 
 
-def shell(name, key=None):
-    guest = ready_guest(name)
-    project = guest.find_project(key) if key else None
-    if not key and len(guest.projects) == 1:
-        project = guest.projects[0]
-    elif not key and guest.projects:
-        choices = ", ".join(project.id for project in guest.projects)
+def shell_directory(name, checkouts, home, key=None):
+    """Pick the checkout a shell opens in from (id, name, workspace) entries, or the guest home."""
+    if key:
+        matches = [entry for entry in checkouts if entry[0] == key] or [entry for entry in checkouts if entry[1] == key]
+        if len(matches) == 1:
+            return matches[0][2]
+        choices = ", ".join(entry[0] for entry in checkouts) or "none"
+        problem = "matches several projects" if matches else "is not a project"
+        raise Error(f"{key!r} {problem} on {name}. Projects: {choices}")
+    if len(checkouts) == 1:
+        return checkouts[0][2]
+    if checkouts:
+        choices = ", ".join(entry[0] for entry in checkouts)
         print(f"{name} has several projects ({choices}). Opening the guest home; "
               f"run rox shell {name} PROJECT to open a checkout.", file=sys.stderr)
-    directory = project.workspace if project else str(guest.home)
-    command = ["env", f"REX_SERVER=unix://{guest.guest_socket}", "sh", "-c",
-               'cd "$1" && exec "${SHELL:-/bin/sh}" -l', "rox", directory]
-    argv = remote_command(guest, command, tty=True)
+    return home
+
+
+def shell_command(socket_path, directory):
+    return ["env", f"REX_SERVER=unix://{socket_path}", "sh", "-c",
+            'cd "$1" && exec "${SHELL:-/bin/sh}" -l', "rox", directory]
+
+
+def shell(name, key=None):
+    guest = ready_guest(name)
+    if key:
+        guest.find_project(key)  # Explain a project that isn't there, including one still cloning.
+    checkouts = [(project.id, project.name, project.workspace) for project in guest.projects]
+    directory = shell_directory(name, checkouts, str(guest.home), key)
+    argv = remote_command(guest, shell_command(guest.guest_socket, directory), tty=True)
     os.execvpe(argv[0], argv, {**os.environ, "TERM": "xterm-256color"})
 
 
@@ -1861,6 +1882,10 @@ def local_records():
             "name": guest.name, "backend": guest.backend, "engine": guest.engine,
             "phase": "stopped" if guest.stopped and guest.phase == "ready" else guest.phase,
             "ip": guest_ip(guest), "tailnet": guest.tailnet_name, "projects": project_summary(guest),
+            # What another machine needs to open a shell in the guest through its tailnet Rex server.
+            "socket": guest.guest_socket, "home": str(guest.home) if guest.guest_socket else "", "user": guest.user,
+            "checkouts": [{"id": project.id, "name": project.name, "workspace": project.workspace}
+                          for project in guest.projects if project.workspace],
         })
     return records
 
@@ -1887,23 +1912,29 @@ LIST_COMMAND = ["sh", "-c", 'PATH="$HOME/.local/bin:/usr/local/bin:/opt/homebrew
                 'rox ls --json 2>/dev/null || { echo "#rox-plain"; rox ls; }']
 
 
-def remote_records(host):
-    """Run rox ls on a Rex host in a short-lived session and read its records."""
-    rex = ["rex", "--autostart=false", "--timeout", "10s", "-S", host]
-    # Keep the session after rox ls exits so its output can be read, then kill it.
-    created = json.loads(output([*rex, "new", "--json", "--keep-open", "rox ls", "--", *LIST_COMMAND],
-                                timeout=20))
+def rex_output(server, label, argv, wait=30):
+    """Run argv in a short-lived session on a Rex server, and return its exit status and output."""
+    rex = ["rex", "--autostart=false", "--timeout", "10s", "-S", server]
+    # Keep the session after the command exits so its output can be read, then kill it.
+    created = json.loads(output([*rex, "new", "--json", "--keep-open", label, "--", *argv], timeout=20))
     session = created["session_id"]
     block = created["initial_windows"][0]["block_ids"][0]
     try:
-        status = run([*rex, "wait", "-s", session, block, "--for", "30s"], capture=True, check=False, timeout=40)
+        status = run([*rex, "wait", "-s", session, block, "--for", f"{wait}s"],
+                     capture=True, check=False, timeout=wait + 10)
         text = output([*rex, "capture", "-s", session, "-b", block, "--trim", "--unwrap"], timeout=20)
     finally:
         run([*rex, "kill", session], capture=True, check=False, timeout=20)
-    if status.returncode == 127 or "rox: not found" in text or "rox: command not found" in text:
+    return status.returncode, text
+
+
+def remote_records(host):
+    """Run rox ls on a Rex host in a short-lived session and read its records."""
+    returncode, text = rex_output(host, "rox ls", LIST_COMMAND)
+    if returncode == 127 or "rox: not found" in text or "rox: command not found" in text:
         raise Error("rox isn't installed there")
-    if status.returncode:
-        raise Error(f"rox ls exited with status {status.returncode}: {text.strip()[-200:]}")
+    if returncode:
+        raise Error(f"rox ls exited with status {returncode}: {text.strip()[-200:]}")
     if text.lstrip().startswith("#rox-plain"):
         # An older rox without --json prints one guest per line.
         rows = [line.split(None, 4) for line in text.splitlines()[1:] if re.match(NAME_PATTERN, line)]
@@ -1926,6 +1957,27 @@ def list_guests(scope=None, as_json=False):
                 print(record_row(record))
         return
 
+    unique, problems = gather_records(scope)
+    if scope != "all" and problems:
+        raise Error(f"Could not list workspaces on {scope}: {problems[scope]}")
+    if as_json:
+        print(json.dumps([{**record, "host": host} for host, records in unique.items() for record in records],
+                         indent=2))
+    else:
+        print("HOST\tNAME\tBACKEND\tPHASE\tIP\tPROJECTS")
+        for host, records in unique.items():
+            for record in records:
+                print(f"{host}\t{record_row(record)}")
+    for host, problem in problems.items():
+        print(f"rox: Skipped {host}: {problem}", file=sys.stderr)
+
+
+def gather_records(scope):
+    """Return each host's workspace records, and why any host couldn't be asked.
+
+    scope is "all" for this machine and every Rex host, or one host label. This machine's
+    records are under "this machine".
+    """
     hosts = rex_host_labels() if scope == "all" else [scope]
     here = server_id()
     results = {"this machine": local_records()} if scope == "all" else {}
@@ -1954,19 +2006,188 @@ def list_guests(scope=None, as_json=False):
         fresh = [record for record in records if record.get("name") not in names]
         names.update(record.get("name") for record in fresh)
         unique[host] = fresh
+    return unique, problems
 
-    if scope != "all" and problems:
-        raise Error(f"Could not list workspaces on {scope}: {problems[scope]}")
-    if as_json:
-        print(json.dumps([{**record, "host": host} for host, records in unique.items() for record in records],
-                         indent=2))
+
+def is_local(name):
+    """Whether this machine runs the guest, as opposed to one of its Rex hosts."""
+    try:
+        Guest.load(name)
+    except NotFound:
+        return False
+    return True
+
+
+def find_remote_guest(name, host=None):
+    """Find the Rex host that runs a guest this machine has no record of, and its record there."""
+    unique, problems = gather_records(host or "all")
+    for label, records in unique.items():
+        for record in records:
+            if record.get("name") == name and label != "this machine":
+                return label, record
+    if host and problems:
+        raise Error(f"Could not list workspaces on {host}: {problems[host]}")
+    skipped = f" Couldn't ask {', '.join(sorted(problems))}." if problems else ""
+    where = f"on {host}" if host else "here or on any Rex host"
+    raise Error(f"No managed workspace named {name} {where}.{skipped}")
+
+
+def run_on_host(host, label, argv):
+    """Run a rox command on another host, print what it printed, and fail when it failed."""
+    returncode, text = rex_output(host, label, [*REMOTE_ROX, *argv], wait=600)
+    if text.strip():
+        print(text.rstrip(), flush=True)
+    if returncode:
+        raise Error(f"rox {argv[0]} exited with status {returncode} on {host}")
+
+
+def remote_ssh_key():
+    """This machine's key for SSH into guests on other hosts, created on first use."""
+    directory = private_directory(state_root() / "remote")
+    key = directory / "login"
+    if not key.exists():
+        require(["ssh-keygen"])
+        run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-C", "rox remote shell", "-f", str(key)],
+            stdin=subprocess.DEVNULL)
+    return key
+
+
+# Authorize a key for the guest user. The container entrypoint rewrites authorized_keys on each
+# start, so this runs before every remote shell.
+AUTHORIZE_SCRIPT = r"""set -eu
+umask 077
+mkdir -p "$HOME/.ssh"
+touch "$HOME/.ssh/authorized_keys"
+grep -qxF "$1" "$HOME/.ssh/authorized_keys" || printf '%s\n' "$1" >> "$HOME/.ssh/authorized_keys"
+"""
+
+
+def free_port():
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        return probe.getsockname()[1]
+
+
+@contextmanager
+def tailnet_forward(server, forwards):
+    """Forward local ports through a guest's tailnet Rex server for as long as the block runs."""
+    argv = ["rex", "--autostart=false", "-S", server, "forward", "new"]
+    for local, port in forwards:
+        argv += ["-L", f"127.0.0.1:{local}:127.0.0.1:{port}"]
+    process = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                               text=True)
+
+    def listening():
+        if process.poll() is not None:
+            raise Error(f"rex forward exited: {process.stderr.read().strip() or process.returncode}")
+        with socket.socket() as probe:
+            probe.settimeout(1)
+            return probe.connect_ex(("127.0.0.1", forwards[0][0])) == 0
+
+    try:
+        wait_for(listening, 20, f"the tunnel through {server}")
+        yield
+    finally:
+        if process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+
+
+def remote_shell(host, record, key=None):
+    """Open a shell in this terminal in a guest on another host, through the guest's tailnet Rex server."""
+    name, server = record["name"], record["tailnet"]
+    if not record.get("socket") or not record.get("user"):
+        raise Error(f"Upgrade rox on {host} to open shells in its guests from here")
+    require(["ssh", "ssh-keyscan", "rex"])
+    checkouts = [(entry["id"], entry["name"], entry["workspace"]) for entry in record.get("checkouts", [])]
+    directory = shell_directory(name, checkouts, record["home"], key)
+    login = remote_ssh_key()
+    public_key = Path(f"{login}.pub").read_text().strip()
+    returncode, text = rex_output(server, f"rox shell {name}", ["sh", "-c", AUTHORIZE_SCRIPT, "rox", public_key])
+    if returncode:
+        raise Error(f"Could not authorize this machine's SSH key in {name}: {text.strip()[-200:]}")
+    known_hosts = private_directory(state_root() / "remote") / f"{name}.known_hosts"
+    port = free_port()
+    argv = [
+        "ssh", "-F", "/dev/null", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-o", "IdentitiesOnly=yes",
+        "-o", "StrictHostKeyChecking=yes", "-o", "GlobalKnownHostsFile=/dev/null", "-o", f"HostKeyAlias={name}",
+        "-o", f"UserKnownHostsFile={known_hosts}", "-o", "ForwardAgent=no",
+        "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=3",
+        "-i", str(login), "-l", record["user"], "-p", str(port), "-t", "--", "127.0.0.1",
+        shlex.join(shell_command(record["socket"], directory)),
+    ]
+    with tailnet_forward(server, [(port, 22)]):
+        # The tunnel ends inside the guest, behind the Rex server's authenticated tailnet
+        # connection, so the key it reports is the guest's own.
+        scanned = output(["ssh-keyscan", "-q", "-t", "ed25519", "-p", str(port), "127.0.0.1"], timeout=20)
+        fields = next((line.split()[1:3] for line in scanned.splitlines() if len(line.split()) >= 3), None)
+        if not fields:
+            raise Error(f"{name} didn't report an SSH host key")
+        known_hosts.write_text(f"{name} {fields[0]} {fields[1]}\n")
+        status = subprocess.run(argv, env={**os.environ, "TERM": "xterm-256color"}).returncode
+    if status:
+        sys.exit(status)
+
+
+def app_shell(host, name, key=None):
+    """Open rox shell on the guest's own host in a Rex session there, and show it in the Rex app."""
+    created = json.loads(output(["rex", "--autostart=false", "-S", host, "new", "--json", f"rox shell {name}",
+                                 "--", *REMOTE_ROX, "shell", name, *([key] if key else [])], timeout=20))
+    session = created["session_id"]
+    print(f"{name} isn't on the tailnet, so its shell opened on {host} in Rex session {session}.", flush=True)
+    client = local_app_client()
+    shown = client and run(["rex", "--autostart=false", "-C", client, "do", "session.select",
+                            f"session_id={session}"], capture=True, check=False, timeout=15).returncode == 0
+    if shown:
+        print("It's showing in the Rex app.", flush=True)
     else:
-        print("HOST\tNAME\tBACKEND\tPHASE\tIP\tPROJECTS")
-        for host, records in unique.items():
-            for record in records:
-                print(f"{host}\t{record_row(record)}")
-    for host, problem in problems.items():
-        print(f"rox: Skipped {host}: {problem}", file=sys.stderr)
+        print(f"Open it from {host} in the Rex app, or run: rex -S {host} session inspect {session}", flush=True)
+
+
+def remote_forward(host, record, ports):
+    name, server = record["name"], record.get("tailnet")
+    if not server:
+        raise Error(f"{name} runs on {host} and isn't on the tailnet, so forward its ports from {host}. "
+                    f"Configure tailscale there with rox config tailscale to forward from here")
+    for local, port in ports:
+        print(f"Forwarding http://localhost:{local} to port {port} on {name}, through the tailnet", flush=True)
+    print("Press Ctrl-C to stop.", flush=True)
+    argv = ["rex", "--autostart=false", "-S", server, "forward", "new"]
+    for local, port in ports:
+        argv += ["-L", f"127.0.0.1:{local}:127.0.0.1:{port}"]
+    os.execvp(argv[0], argv)
+
+
+def route_remote(args):
+    """Run a command that names a guest on the host that runs it, when that isn't this machine.
+
+    Return True when the command was handled elsewhere.
+    """
+    name = getattr(args, "name", None)
+    host = getattr(args, "host", None)
+    if not name or (host is None and is_local(name)):
+        return False
+    if args.command in ("down", "add") and host is not None:
+        return False  # These already run on the named host.
+    host, record = find_remote_guest(name, host)
+    if args.command == "shell":
+        if record.get("tailnet"):
+            remote_shell(host, record, args.project)
+        else:
+            app_shell(host, name, args.project)
+    elif args.command == "forward":
+        remote_forward(host, record, args.ports)
+    elif args.command in ("down", "add"):
+        args.host = host
+        return False
+    else:
+        extra = ["--no-app-host"] if args.command == "reconnect" else []
+        run_on_host(host, f"rox {args.command} {name}", [args.command, name, *extra])
+    return True
 
 
 SERVICE_LABEL = "io.rox.service"
@@ -2232,6 +2453,8 @@ def main(argv):
     shell_parser = commands.add_parser("shell", help="open an interactive guest shell")
     shell_parser.add_argument("name")
     shell_parser.add_argument("project", nargs="?", help="project checkout to open; omit for the only one or the guest home")
+    HOST_HELP = "Rex host that runs the guest; found automatically when omitted"
+    shell_parser.add_argument("-S", "--host", help=HOST_HELP)
     forward_parser = commands.add_parser("forward", help="forward localhost ports to servers in a guest")
     forward_parser.add_argument("name")
     forward_parser.add_argument("ports", nargs="+", type=forward_spec, metavar="PORT|LOCAL:GUEST",
@@ -2243,6 +2466,8 @@ def main(argv):
     start_parser.add_argument("name")
     stop_parser = commands.add_parser("stop", help="stop a guest and keep it stopped until rox start")
     stop_parser.add_argument("name")
+    for named in (forward_parser, reconnect_parser, start_parser, stop_parser):
+        named.add_argument("-S", "--host", help=HOST_HELP)
     stop = commands.add_parser("down", help="delete a guest and its workspace")
     stop.add_argument("name", nargs="?",
                       help="workspace to remove; omit to pick from the current project's workspaces")
@@ -2288,9 +2513,13 @@ def main(argv):
     if args.command == "up":
         up(args, command)
     elif args.command == "add":
+        if args.host is None and re.fullmatch(NAME_PATTERN, args.name) and not is_local(args.name):
+            args.host = find_remote_guest(args.name)[0]
         add(args, command)
     elif command:
         parser.error("only up and add accept a command after --")
+    elif args.command in ("shell", "forward", "reconnect", "start", "stop", "down") and route_remote(args):
+        return
     elif args.command == "ls":
         list_guests("all" if args.all else args.host, args.json)
     elif args.command == "shell":

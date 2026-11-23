@@ -88,7 +88,7 @@ rox up container --host buildbox --project my-project \
 rox add rv-host-3f9a1c2b7d40 --host buildbox
 ```
 
-Run `rox ls`, `rox shell NAME`, `rox reconnect NAME`, and `rox down NAME` from a terminal on the machine that launched the guest. [Rex CLI host selection](https://www.superlogical.com/rex/docs/reference/cli#rex-hosts)
+`rox shell`, `rox forward`, `rox reconnect`, `rox start`, `rox stop`, `rox down` and `rox add` work on a guest on any of your Rex hosts. When this machine has no record of the guest, Rox finds the host that runs it, the way `rox ls --all` does, or you can name it with `-S HOST`. `rox shell` opens in your terminal when the guest is on the tailnet, and in the Rex app otherwise. `rox forward` needs the guest on the tailnet. See [Rex CLI host selection](https://www.superlogical.com/rex/docs/reference/cli#rex-hosts) for host labels.
 
 ## Private repositories
 

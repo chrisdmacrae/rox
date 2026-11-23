@@ -640,6 +640,116 @@ class WorkspaceTests(unittest.TestCase):
         self.assertEqual(command.call_args.args[0], ["systemctl", "--user", "restart", "rox.service"])
         self.assertIn("loginctl enable-linger", printed.getvalue())
 
+    def remote_listing(self, **fields):
+        record = {"name": "rv-remote-000011112222", "backend": "container", "phase": "ready",
+                  "tailnet": "rv-remote-000011112222.tail.ts.net", "socket": "/home/workspace/.rox/x/r.sock",
+                  "home": "/home/workspace", "user": "workspace",
+                  "checkouts": [{"id": "web", "name": "web", "workspace": "/home/workspace/web"}], **fields}
+        return patch.object(rox, "gather_records", return_value=(
+            {"this machine": [], "mini": [record]}, {"offline-box": "timed out"}))
+
+    def test_commands_find_a_guest_on_another_rex_host(self):
+        with self.remote_listing(), patch.object(rox, "rex_output", return_value=(0, "Stopped it")) as remote, \
+                contextlib.redirect_stdout(io.StringIO()) as printed:
+            for command, expected in ((["stop"], ["stop"]), (["start"], ["start"]),
+                                      (["reconnect"], ["reconnect", "--no-app-host"])):
+                with self.subTest(command=command):
+                    rox.main([*command, "rv-remote-000011112222"])
+                    host, label, argv = remote.call_args.args
+                    self.assertEqual(host, "mini")
+                    self.assertEqual(argv, [*rox.REMOTE_ROX, expected[0], "rv-remote-000011112222", *expected[1:]])
+        self.assertIn("Stopped it", printed.getvalue())
+        with self.remote_listing(), patch.object(rox, "rex_output", return_value=(1, "boom")), \
+                contextlib.redirect_stdout(io.StringIO()), \
+                self.assertRaisesRegex(rox.Error, "rox stop exited with status 1 on mini"):
+            rox.main(["stop", "rv-remote-000011112222"])
+
+    def test_down_and_add_run_on_the_host_that_has_the_guest(self):
+        with self.remote_listing(), patch.object(rox, "down_remote") as down:
+            rox.main(["down", "rv-remote-000011112222"])
+        self.assertEqual(down.call_args.args[0].host, "mini")
+        with self.remote_listing(), patch.object(rox, "add") as add:
+            rox.main(["add", "rv-remote-000011112222", "--repo", "https://git.example.test/a.git", "--branch", "main"])
+        self.assertEqual(add.call_args.args[0].host, "mini")
+
+    def test_an_unknown_guest_names_the_hosts_that_could_not_be_asked(self):
+        with self.remote_listing(), self.assertRaisesRegex(
+                rox.Error, "No managed workspace named rv-gone-000011112222 here or on any Rex host. "
+                           "Couldn't ask offline-box"):
+            rox.main(["shell", "rv-gone-000011112222"])
+
+    def test_remote_shell_uses_the_tailnet_and_falls_back_to_the_rex_app(self):
+        with self.remote_listing(), patch.object(rox, "remote_shell") as remote, \
+                patch.object(rox, "app_shell") as app:
+            rox.main(["shell", "rv-remote-000011112222", "web"])
+        self.assertEqual(remote.call_args.args[0], "mini")
+        self.assertEqual(remote.call_args.args[2], "web")
+        app.assert_not_called()
+        with self.remote_listing(tailnet=""), patch.object(rox, "remote_shell") as remote, \
+                patch.object(rox, "app_shell") as app:
+            rox.main(["shell", "rv-remote-000011112222", "-S", "mini"])
+        remote.assert_not_called()
+        self.assertEqual(app.call_args.args, ("mini", "rv-remote-000011112222", None))
+
+    def test_remote_shell_authorizes_a_key_and_ssh_goes_through_the_tailnet_tunnel(self):
+        commands = []
+
+        def fake_output(argv, **kwargs):
+            commands.append(argv)
+            return "[127.0.0.1]:40022 ssh-ed25519 AAAAhost" if argv[0] == "ssh-keyscan" else ""
+
+        @contextlib.contextmanager
+        def fake_forward(server, forwards):
+            commands.append(["forward", server, forwards])
+            yield
+
+        record = {"name": "rv-remote-000011112222", "tailnet": "rv-remote-000011112222.tail.ts.net",
+                  "socket": "/home/workspace/.rox/x/r.sock", "home": "/home/workspace", "user": "workspace",
+                  "checkouts": [{"id": "web", "name": "web", "workspace": "/home/workspace/web"}]}
+        with (
+            patch.object(rox.shutil, "which", return_value="/fixture"),
+            patch.object(rox, "run", side_effect=lambda argv, **kwargs: Path(argv[-1] + ".pub").write_text("ssh-ed25519 AAAAmine rox\n")),
+            patch.object(rox, "rex_output", return_value=(0, "")) as authorize,
+            patch.object(rox, "output", side_effect=fake_output),
+            patch.object(rox, "tailnet_forward", side_effect=fake_forward),
+            patch.object(rox, "free_port", return_value=40022),
+            patch.object(rox.subprocess, "run", return_value=subprocess.CompletedProcess([], 0)) as ssh,
+        ):
+            rox.remote_shell("mini", record)
+        server, _, argv = authorize.call_args.args
+        self.assertEqual(server, record["tailnet"])
+        self.assertEqual(argv[-1], "ssh-ed25519 AAAAmine rox")
+        self.assertIn(["forward", record["tailnet"], [(40022, 22)]], commands)
+        known_hosts = rox.state_root() / "remote" / "rv-remote-000011112222.known_hosts"
+        self.assertEqual(known_hosts.read_text(), "rv-remote-000011112222 ssh-ed25519 AAAAhost\n")
+        argv = ssh.call_args.args[0]
+        self.assertEqual(argv[argv.index("-p") + 1], "40022")
+        self.assertEqual(argv[argv.index("-l") + 1], "workspace")
+        self.assertIn("StrictHostKeyChecking=yes", argv)
+        self.assertEqual(shlex.split(argv[-1])[-1], "/home/workspace/web")
+        self.assertEqual(shlex.split(argv[-1])[1], "REX_SERVER=unix:///home/workspace/.rox/x/r.sock")
+        with self.assertRaisesRegex(rox.Error, "Upgrade rox on mini"):
+            rox.remote_shell("mini", {**record, "socket": ""})
+
+    def test_remote_forward_tunnels_through_the_guest_rex_server(self):
+        with self.remote_listing(), patch.object(rox.os, "execvp") as execvp, \
+                contextlib.redirect_stdout(io.StringIO()):
+            rox.main(["forward", "rv-remote-000011112222", "5173", "8080:3000"])
+        self.assertEqual(execvp.call_args.args[1], [
+            "rex", "--autostart=false", "-S", "rv-remote-000011112222.tail.ts.net", "forward", "new",
+            "-L", "127.0.0.1:5173:127.0.0.1:5173", "-L", "127.0.0.1:8080:127.0.0.1:3000"])
+        with self.remote_listing(tailnet=""), self.assertRaisesRegex(rox.Error, "forward its ports from mini"):
+            rox.main(["forward", "rv-remote-000011112222", "5173"])
+
+    def test_ls_json_reports_what_a_remote_shell_needs(self):
+        guest = self.saved_guest()
+        guest.projects = [rox.Project("web", "web", "", "main", workspace="/home/workspace/web", phase="ready")]
+        guest.save()
+        record = rox.local_records()[0]
+        self.assertEqual(record["socket"], guest.guest_socket)
+        self.assertEqual(record["user"], "workspace")
+        self.assertEqual(record["checkouts"], [{"id": "web", "name": "web", "workspace": "/home/workspace/web"}])
+
     def test_reconnect_registers_a_retained_guest_that_never_created_a_session(self):
         name = "rv-retained-000011112222"
         guest = rox.Guest(name, "container", "image", "workspace",
