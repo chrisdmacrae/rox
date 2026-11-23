@@ -441,7 +441,9 @@ def apple_container_address(guest):
     """Apple's containers each get their own IP address, so SSH goes straight to port 22."""
     records = json.loads(output(["container", "inspect", guest.name], timeout=8) or "[]")
     for record in records if isinstance(records, list) else [records]:
-        for network in record.get("networks") or []:
+        # container 1.x reports the address under status; earlier releases put it at the top level.
+        networks = (record.get("status") or {}).get("networks") or record.get("networks") or []
+        for network in networks:
             for key in ("ipv4Address", "address"):
                 try:
                     return str(ipaddress.IPv4Interface(network.get(key) or "").ip), 22

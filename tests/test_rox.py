@@ -557,8 +557,11 @@ class WorkspaceTests(unittest.TestCase):
         guest = rox.Guest("rv-fixture-000011112222", "container", "rox:linux", "workspace", engine="container",
                           identity=str(self.root / "login"), cpus=2, memory="4G")
         (self.root / "login.pub").write_text("ssh-ed25519 AAAA fixture\n")
-        inspect = json.dumps([{"status": "running", "networks": [
-            {"network": "default", "address": "192.168.64.7/24", "gateway": "192.168.64.1"}]}])
+        # The shape container 1.7 prints: the configured network has no address, the running one does.
+        inspect = json.dumps([{"id": guest.name, "configuration": {"networks": [
+            {"network": "default", "options": {"hostname": guest.name}}]}, "status": {
+            "state": "running", "networks": [{"network": "default", "ipv4Address": "192.168.64.7/24",
+                                              "ipv4Gateway": "192.168.64.1"}]}}])
         with (
             patch.object(rox, "run"),
             patch.object(rox, "output", side_effect=[
