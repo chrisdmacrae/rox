@@ -194,6 +194,28 @@ While the image builds, `ROX_PHASE` is `build`, `ROX_NAME` is the image name, th
 
 If the launch machine cannot read the branch, Rox prints a warning and runs the hook at boot. If the hook fails during a build, the launch stops. Remove a project image with `container image delete rox:REPO`, `docker rmi rox:REPO`, `podman rmi rox:REPO`, or `tart delete rox-REPO-BACKEND`.
 
+## Per-project and per-launch guest settings
+
+Commit a `.rox.json` at the root of the branch to set the project's backend and guest settings. Rox reads it from the launched branch, like `.rox.sh`.
+
+```json
+{
+  "backend": "container",
+  "container": { "image": "ghcr.io/acme/agent-base:2", "cpus": 4, "memory": "8G" }
+}
+```
+
+With a `backend` there, plain `rox up` picks it. Each backend section accepts `image`, `cpus`, `memory`, and `prebuild`. Machine-specific settings, such as `engine`, the VM `user`, `identity` and `host_key`, and Git keys, stay in the launcher's config, and Rox rejects them in `.rox.json`.
+
+For a one-off guest, override any of these at launch. Command-line options win over `.rox.json`, which wins over the launcher config.
+
+```sh
+rox up linux --image rox-ubuntu-cuda --cpus 8 --memory 16G
+rox up container --image ghcr.io/acme/agent-base:3 --memory 8G
+```
+
+`--cpus` and `--memory` work with every backend. Containers get them as run limits, and Tart VMs get them through `tart set` on the clone before it boots.
+
 ## Workspace commands
 
 | Command | Effect |

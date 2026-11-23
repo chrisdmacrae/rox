@@ -34,7 +34,10 @@ class WorkspaceTests(unittest.TestCase):
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
         self.root = Path(directory.name).resolve()
-        state = patch.dict(os.environ, {"XDG_STATE_HOME": str(self.root / "state")})
+        # Keep the launcher's real config, keys and Git cache out of tests.
+        state = patch.dict(os.environ, {"XDG_STATE_HOME": str(self.root / "state"),
+                                        "XDG_CONFIG_HOME": str(self.root / "config-home"),
+                                        "XDG_CACHE_HOME": str(self.root / "cache-home")})
         state.start()
         self.addCleanup(state.stop)
         # Keep the app host prompt out of tests run from a terminal.
@@ -45,6 +48,10 @@ class WorkspaceTests(unittest.TestCase):
         engine = patch.object(rox, "default_engine", return_value="docker")
         engine.start()
         self.addCleanup(engine.stop)
+        # Launches read .rox.sh and .rox.json from the branch. Tests opt in to a real fetch.
+        branch = patch.object(rox, "read_branch", return_value=None)
+        branch.start()
+        self.addCleanup(branch.stop)
 
     def make_repo(self):
         repo = self.root / "sample project"
@@ -599,9 +606,128 @@ class WorkspaceTests(unittest.TestCase):
             with self.subTest(settings=settings), patch.object(rox.shutil, "which", return_value="/fixture"):
                 with self.assertRaisesRegex(rox.Error, message):
                     rox.main(["up", "container", "--cwd", str(cwd), "--config", str(config)])
-        config.write_text(json.dumps({"linux": {"memory": "4G"}}))
-        with self.assertRaisesRegex(rox.Error, "apply to the container backend"):
-            rox.main(["up", "linux", "--cwd", str(cwd), "--config", str(config)])
+        config.write_text(json.dumps({}))
+        with self.assertRaisesRegex(rox.Error, "size such as 4G or 512M for --memory"):
+            rox.main(["up", "container", "--memory", "4096", "--cwd", str(cwd), "--config", str(config)])
+
+    def launch_record(self, argv, launcher=None, project=None):
+        """Run rox up until the guest would boot, and return its saved record."""
+        cwd = self.make_repo()
+        config = self.root / "config.json"
+        identity, host_key = self.root / "vm_key", self.root / "vm_host_key.pub"
+        identity.touch()
+        host_key.write_text("ssh-ed25519 AAAA fixture\n")
+        vm = {"image": "rox-ubuntu", "identity": str(identity), "host_key": str(host_key)}
+        config.write_text(json.dumps(launcher or {"linux": vm, "macos": vm}))
+        branch = rox.Branch(self.root, "commit", "", project) if project is not None else None
+        real_run, real_output = rox.run, rox.output
+
+        def command(argv, **kwargs):
+            if argv[0] == "git":
+                return real_run(argv, **kwargs)
+            return subprocess.CompletedProcess(argv, 0, base_image() if argv[1:3] == ["image", "inspect"] else "", "")
+
+        with (
+            patch.object(rox, "read_branch", return_value=branch),
+            patch.object(rox, "run", side_effect=command),
+            patch.object(rox, "output", side_effect=lambda argv, **kw: real_output(argv, **kw) if argv[0] == "git" else ""),
+            patch.object(rox, "git_host_entries", return_value=""),
+            patch.object(rox, "prepare_project_image", return_value=""),
+            patch.object(rox, "launch_guest", side_effect=rox.Error("stop before boot")),
+            patch.object(rox.Guest, "runtime", property(lambda guest: self.root / "runtime" / guest.name)),
+            patch.object(rox.shutil, "which", return_value="/fixture"),
+            contextlib.redirect_stdout(io.StringIO()),
+            contextlib.redirect_stderr(io.StringIO()),
+        ):
+            with self.assertRaisesRegex(rox.Error, "stop before boot"):
+                rox.main(["up", *argv, "--cwd", str(cwd), "--config", str(config)])
+        [record] = rox.state_root().glob("*/guest.json")
+        return json.loads(record.read_text())
+
+    def test_project_config_picks_the_backend_and_overrides_the_launcher_config(self):
+        record = self.launch_record([], project={
+            "backend": "container", "container": {"image": "ghcr.io/acme/agent:1", "memory": "8G"}},
+            launcher={"container": {"engine": "podman", "memory": "2G", "cpus": 2}})
+        self.assertEqual((record["backend"], record["engine"], record["image"]),
+                         ("container", "podman", "ghcr.io/acme/agent:1"))
+        self.assertEqual((record["cpus"], record["memory"]), (2, "8G"))
+
+    def test_command_line_overrides_the_project_config(self):
+        record = self.launch_record(
+            ["linux", "--image", "rox-ubuntu-gpu", "--cpus", "8", "--memory", "16G"],
+            project={"backend": "container", "linux": {"image": "rox-ubuntu-small", "cpus": 2}})
+        self.assertEqual((record["backend"], record["image"], record["cpus"], record["memory"]),
+                         ("linux", "rox-ubuntu-gpu", 8, "16G"))
+
+    def test_up_needs_a_backend_from_the_command_line_or_project_config(self):
+        cwd = self.make_repo()
+        with patch.object(rox.shutil, "which", return_value="/fixture"), \
+                patch.object(rox, "git_host_entries", return_value=""):
+            with self.assertRaisesRegex(rox.Error, "Choose a backend"):
+                rox.main(["up", "--cwd", str(cwd)])
+
+    def test_project_config_is_read_from_the_branch_and_limited_to_project_settings(self):
+        origin, git = self.make_origin(hook="")
+        (origin / ".rox.json").write_text(json.dumps({"backend": "linux", "linux": {"memory": "8G"}}))
+        subprocess.run([*git, "add", "-A"], check=True)
+        subprocess.run([*git, "commit", "--quiet", "-m", "settings"], check=True)
+        with contextlib.redirect_stdout(io.StringIO()):
+            mirror, commit, _ = rox.fetch_branch(str(origin), "main", dict(os.environ))
+        self.assertEqual(rox.project_settings(mirror, commit), {"backend": "linux", "linux": {"memory": "8G"}})
+        self.assertEqual(rox.project_settings(mirror, f"{commit}~1"), {})
+        for settings, message in (
+            ({"container": {"engine": "docker"}}, "only be set in the rox config on the launch machine"),
+            ({"linux": {"identity": "~/.ssh/id"}}, "only be set in the rox config on the launch machine"),
+            ({"git_keys": []}, "only be set in the rox config on the launch machine"),
+            ({"container": {"disk": "10G"}}, "Unknown setting container.disk"),
+            ({"backend": "windows"}, "Expected backend"),
+            ([], "Expected a JSON object"),
+        ):
+            (origin / ".rox.json").write_text(json.dumps(settings))
+            subprocess.run([*git, "commit", "--quiet", "-am", "change"], check=True)
+            with contextlib.redirect_stdout(io.StringIO()):
+                mirror, commit, _ = rox.fetch_branch(str(origin), "main", dict(os.environ))
+            with self.subTest(settings=settings), self.assertRaisesRegex(rox.Error, message):
+                rox.project_settings(mirror, commit)
+
+    def test_vm_resources_are_set_on_the_clone_before_it_boots(self):
+        guest = rox.Guest("rv-fixture-000011112222", "linux", "rox-ubuntu", "admin", cpus=6, memory="8G")
+        guest.directory.mkdir(parents=True, mode=0o700)
+        commands = []
+        with (
+            patch.object(rox, "run", side_effect=lambda argv, **kwargs: commands.append(argv)),
+            patch.object(rox.subprocess, "Popen", side_effect=rox.Error("stop before boot")),
+            self.assertRaisesRegex(rox.Error, "stop before boot"),
+        ):
+            rox.launch_guest(guest, 5)
+        self.assertEqual(commands, [["tart", "clone", "rox-ubuntu", guest.name],
+                                    ["tart", "set", guest.name, "--cpu=6", "--memory=8192"]])
+        self.assertEqual([rox.memory_megabytes(size) for size in ("512M", "2g", "1T", "2048K")],
+                         [512, 2048, 1048576, 2])
+
+    def test_docker_resources_are_passed_to_run(self):
+        guest = rox.Guest("rv-fixture-000011112222", "container", "rox:linux", "workspace", engine="docker",
+                          identity=str(self.root / "login"), cpus=2, memory="4G")
+        (self.root / "login.pub").write_text("ssh-ed25519 AAAA fixture\n")
+        with (
+            patch.object(rox, "run"),
+            patch.object(rox, "output", side_effect=["id", "ssh-ed25519 AAAA host", "127.0.0.1:33000"]) as output,
+            patch.object(rox, "pin_host"),
+            patch.object(rox.Guest, "save"),
+        ):
+            rox.launch_guest(guest, 5)
+        launch = output.call_args_list[0].args[0]
+        self.assertEqual(launch[-3:], ["--cpus=2", "--memory=4G", "rox:linux"])
+
+    def test_remote_launch_forwards_resources_and_lets_the_launcher_pick_the_backend(self):
+        cwd = self.make_repo()
+        with patch.object(rox, "dispatch") as dispatch:
+            rox.main(["up", "--host", "builder", "--cpus", "4", "--memory", "8G", "--cwd", str(cwd)])
+        launch = dispatch.call_args.args[2]
+        self.assertEqual(launch[0], "up")
+        self.assertTrue(launch[1].startswith("--project="))
+        args = dispatch.call_args.args[0]
+        self.assertEqual((args.cpus, args.memory), (4, "8G"))
 
     def test_failed_clone_or_hook_keeps_the_rex_host_registered(self):
         self.assertEqual(self.provision("linux", fail_stage="clone"), ["prepare", "server", "clone"])

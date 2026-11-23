@@ -10,6 +10,7 @@ The launcher is the machine running `rox`. Each workspace is a guest with its ow
 ## Choose and launch a workspace
 
 - Follow the requested launcher, backend, repository, branch, and runner. Use a Linux container for ordinary Linux work when a container engine is available. On an Apple Silicon Mac this defaults to Apple's container tool, which isolates each guest in its own VM. Use Tart when the work requires macOS or a Linux VM. Use separate guests when workers need isolated filesystems. Each `rox up` starts a new guest, even for the same project.
+- The project's `.rox.json` on the branch may set its default backend, image, CPUs, and memory, so plain `rox up` follows it. When a task needs a non-standard guest, such as a different image, more memory, or more CPUs, pass `--image`, `--cpus N`, or `--memory SIZE` (for example `8G`) to `rox up`. These override `.rox.json` and the launcher config for that launch only. They work for containers and Tart VMs.
 - To share one guest between projects, start it with `rox up BACKEND --no-project`, then run `rox add NAME` from each project checkout, or with `--repo URL --branch BRANCH`. Each project gets its own checkout and Rex session. Save the `Project`, `Checkout`, and `Session` values printed by each `rox add`.
 - Start from the project checkout or pass `--cwd`. Rox clones the published branch, using its upstream when configured. If the task depends on local-only changes, arrange an authorized handoff before dispatch. Outside a checkout, pass `--repo URL --branch BRANCH`, and optionally `--project NAME`. Without them, `rox up` starts a guest with no project.
 - Check that the launcher has `rox`, Rex, and the backend runtime. The runner and its authentication belong in the guest. The project can prepare the runner with `.rox.sh` on the selected branch. The first launch for a repository builds a project image that runs `.rox.sh` once. Later launches start from it and skip the hook, so starting several workers is fast. Pass `--rebuild` after dependency changes, or `--no-prebuild` when the hook starts long-running services. Git keys configured on the launcher are available during cloning.
@@ -17,6 +18,7 @@ The launcher is the machine running `rox`. Each workspace is a guest with its ow
 
 ```sh
 rox up container --cwd "$project_dir"
+rox up linux --cwd "$project_dir" --memory 16G --cpus 8
 rox up macos --host "$launcher" --cwd "$project_dir" --branch "$published_branch"
 ```
 

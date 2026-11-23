@@ -3,9 +3,9 @@ title: CLI
 description: Every rox command and option.
 ---
 
-## `rox up BACKEND`
+## `rox up [BACKEND]`
 
-Start and provision a new guest. `BACKEND` is `container`, `linux`, or `macos`. Arguments after `--` run in the guest's first Rex terminal. Each run starts a new guest, even for a project that already has one.
+Start and provision a new guest. `BACKEND` is `container`, `linux`, or `macos`. Leave it out to use the `backend` from the branch's [`.rox.json`](../configuration/#per-project-settings-roxjson). Arguments after `--` run in the guest's first Rex terminal. Each run starts a new guest, even for a project that already has one.
 
 Rox clones the project from the current checkout. Outside a checkout, with no `--repo`, or with `--no-project`, it starts a guest with no project, whose Rex session opens in the guest user's home directory.
 
@@ -20,7 +20,9 @@ rox up container [options] [-- COMMAND [ARG ...]]
 | `--cwd DIR` | A directory inside the source project. Defaults to the current directory. |
 | `--project NAME` | Project name for a launch without a checkout. Requires `--repo` and `--branch`. Outside a checkout, the name defaults to the repository name. |
 | `--no-project` | Start a guest without a project, even from inside a checkout. |
-| `--image IMAGE` | Container image or prepared Tart template. Overrides the config. |
+| `--image IMAGE` | Container image or prepared Tart template. Overrides the config and `.rox.json`. |
+| `--cpus N` | CPUs for this guest. Overrides the config and `.rox.json`. |
+| `--memory SIZE` | Memory for this guest, with a unit, such as `8G` or `512M`. Overrides the config and `.rox.json`. |
 | `--engine container\|docker\|podman` | Container engine. Defaults to `container` (Apple's container tool) on Apple Silicon Macs and `docker` elsewhere. |
 | `--remote NAME` | Git remote to clone from. Can't be combined with `--repo`. |
 | `--repo URL` | Repository URL to clone. Must be SSH or HTTPS. |

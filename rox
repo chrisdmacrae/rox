@@ -28,6 +28,11 @@ DEFAULT_CONTAINER_IMAGE = "rox:linux"
 # "container" is Apple's container CLI, which runs each container in its own lightweight VM.
 ENGINES = ("container", "docker", "podman")
 NAME_PATTERN = r"rv-[a-z0-9-]{1,24}-[a-f0-9]{12}"
+# Per-project launch settings, read from the launched branch like .rox.sh.
+PROJECT_CONFIG = ".rox.json"
+PROJECT_KEYS = {backend: {"image", "cpus", "memory", "prebuild"} for backend in BACKENDS}
+# These describe the launch machine, so only its own rox config may set them.
+LAUNCHER_KEYS = {"engine", "user", "identity", "host_key", "git_keys", "git_known_hosts"}
 
 
 class Error(Exception):
@@ -562,7 +567,7 @@ def fetch_branch(url, branch, env):
     with file_lock(repos / f"{mirror.name}.lock"):
         if not (mirror / "HEAD").is_file():
             output(["git", "init", "--quiet", "--bare", str(mirror)])
-        print(f"Checking {branch} for .rox.sh", flush=True)
+        print(f"Checking {branch} for .rox.sh and {PROJECT_CONFIG}", flush=True)
         run(["git", "-C", str(mirror), "-c", "credential.helper=", "fetch", "--quiet", "--no-tags",
              "--", url, f"+refs/heads/{branch}:refs/rox/{branch}"], env=env, stdin=subprocess.DEVNULL)
         commit = output(["git", "-C", str(mirror), "rev-parse", f"refs/rox/{branch}^{{commit}}"])
@@ -674,7 +679,8 @@ def build_vm_image(backend, base, target, project, url, branch, hook, commit, se
 
 
 def bake_vm(backend, base, target, branch, url, settings):
-    guest = BuildGuest(settings["name"], backend, base, settings["user"], identity=str(settings["identity"]))
+    guest = BuildGuest(settings["name"], backend, base, settings["user"], identity=str(settings["identity"]),
+                       cpus=settings.get("cpus", 0), memory=settings.get("memory", ""))
     guest.directory.mkdir(mode=0o700, parents=True)
     private_directory(guest.runtime.parent)
     private_directory(guest.runtime)
@@ -709,17 +715,65 @@ def bake_vm(backend, base, target, branch, url, settings):
             shutil.rmtree(guest.directory, ignore_errors=True)
 
 
-def prepare_project_image(backend, engine, base, project, url, branch, keys, known_hosts, vm, rebuild):
-    """Return a project image that already ran .rox.sh, or "" to set up at boot."""
+@dataclass
+class Branch:
+    """The launched branch as the launch machine read it."""
+    mirror: Path
+    commit: str
+    hook: str
+    settings: dict
+
+
+def read_branch(url, branch, keys, known_hosts):
+    """Fetch the branch to find its .rox.sh and .rox.json, or return None if the launcher can't read it."""
     try:
         with host_git(keys, known_hosts) as env:
             mirror, commit, hook = fetch_branch(url, branch, env)
     except (Error, subprocess.SubprocessError) as error:
-        print(f"rox: Could not read {branch} on the launch machine, so .rox.sh will run at boot. ({error})",
-              file=sys.stderr, flush=True)
+        print(f"rox: Could not read {branch} on the launch machine, so .rox.sh will run at boot "
+              f"and any {PROJECT_CONFIG} is ignored. ({error})", file=sys.stderr, flush=True)
+        return None
+    return Branch(mirror, commit, hook, project_settings(mirror, commit))
+
+
+def project_settings(mirror, commit):
+    found = run(["git", "-C", str(mirror), "cat-file", "-e", f"{commit}:{PROJECT_CONFIG}"],
+                capture=True, check=False)
+    if found.returncode:
+        return {}
+    try:
+        settings = json.loads(output(["git", "-C", str(mirror), "show", f"{commit}:{PROJECT_CONFIG}"]))
+    except ValueError as error:
+        raise Error(f"{PROJECT_CONFIG} on the branch is not valid JSON: {error}") from None
+    if not isinstance(settings, dict):
+        raise Error(f"Expected a JSON object in {PROJECT_CONFIG}")
+    for key, value in settings.items():
+        if key == "backend":
+            if value not in BACKENDS:
+                raise Error(f"Expected backend to be one of {', '.join(BACKENDS)} in {PROJECT_CONFIG}")
+        elif key in PROJECT_KEYS:
+            if not isinstance(value, dict):
+                raise Error(f"Expected an object for {key} in {PROJECT_CONFIG}")
+            for setting in value:
+                if setting in LAUNCHER_KEYS:
+                    raise Error(f"{key}.{setting} can only be set in the rox config on the launch machine, "
+                                f"not in {PROJECT_CONFIG}")
+                if setting not in PROJECT_KEYS[key]:
+                    allowed = ", ".join(sorted(PROJECT_KEYS[key]))
+                    raise Error(f"Unknown setting {key}.{setting} in {PROJECT_CONFIG}. Use {allowed}")
+        elif key in LAUNCHER_KEYS:
+            raise Error(f"{key} can only be set in the rox config on the launch machine, not in {PROJECT_CONFIG}")
+        else:
+            raise Error(f"Unknown setting {key} in {PROJECT_CONFIG}. Use backend, {', '.join(BACKENDS)}")
+    return settings
+
+
+def prepare_project_image(backend, engine, base, project, url, branch, keys, known_hosts, vm, rebuild,
+                          fetched):
+    """Return a project image that already ran .rox.sh, or "" to set up at boot."""
+    if not fetched or not fetched.hook:
         return ""
-    if not hook:
-        return ""
+    mirror, commit, hook = fetched.mirror, fetched.commit, fetched.hook
     target = project_image_name(backend, project, base)
     if engine:
         build_container_image(engine, base, target, mirror, url, branch, hook, rebuild)
@@ -743,7 +797,7 @@ def launch_guest(guest, boot_timeout):
             guest.engine, "run", "-d", *pull_policy, "--name", guest.name, "--hostname", guest.name,
             "--label", f"io.rox.workspace={guest.name}",
             "--publish", "127.0.0.1::22", "--env", f"ROX_SSH_PUBLIC_KEY={public_key}",
-            guest.image,
+            *container_resources(guest), guest.image,
         ])
         guest.save()
         key = wait_for(
@@ -755,6 +809,10 @@ def launch_guest(guest, boot_timeout):
         return wait_for(lambda: container_address(guest), boot_timeout, "the container SSH port")
 
     run(["tart", "clone", guest.image, guest.name])
+    resources = ([f"--cpu={guest.cpus}"] if guest.cpus else []) + \
+        ([f"--memory={memory_megabytes(guest.memory)}"] if guest.memory else [])
+    if resources:
+        run(["tart", "set", guest.name, *resources])
     log_path = guest.directory / "tart.log"
     with log_path.open("a") as log:
         vm = subprocess.Popen(
@@ -778,10 +836,18 @@ def launch_guest(guest, boot_timeout):
     raise Error(f"No Tart IP address found for {guest.name}. See {log_path}")
 
 
+def container_resources(guest):
+    return [f"--{option}={value}" for option, value in (("cpus", guest.cpus), ("memory", guest.memory)) if value]
+
+
+def memory_megabytes(size):
+    """Convert a size such as 4G or 512M to the megabytes Tart expects."""
+    number, unit = int(size[:-1]), size[-1].upper()
+    return max(1, number * {"K": 1, "M": 1024, "G": 1024 ** 2, "T": 1024 ** 3}[unit] // 1024)
+
+
 def launch_apple_container(guest, public_key, boot_timeout):
-    resources = [f"--{option}={value}" for option, value in
-                 (("cpus", guest.cpus), ("memory", guest.memory)) if value]
-    output(["container", "run", "--detach", "--name", guest.name, *resources,
+    output(["container", "run", "--detach", "--name", guest.name, *container_resources(guest),
             "--env", f"ROX_SSH_PUBLIC_KEY={public_key}", guest.image])
     guest.container_id = guest.name
     guest.save()
@@ -947,7 +1013,7 @@ def dispatch(args, label, launch, command):
     """Run a rox command on a Rex remote host in a Provision tab and wait for it."""
     rex = ["rex", "--autostart=false", "-S", args.host]
     launch = ["rox", *launch]
-    for option in ("config", "image", "engine", "git_known_hosts"):
+    for option in ("config", "image", "engine", "cpus", "memory", "git_known_hosts"):
         if (value := getattr(args, option, None)) is not None:
             launch.append(f"--{option.replace('_', '-')}={value}")
     launch.extend(f"--git-key={key}" for key in args.git_key or [])
@@ -1061,33 +1127,52 @@ def up(args, command):
     source = resolve_project(args)
     if args.host is not None:
         dispatch(args, source[0] if source else "host",
-                 ["up", args.backend, *project_options(source), f"--boot-timeout={args.boot_timeout}",
+                 ["up", *([args.backend] if args.backend else []), *project_options(source), f"--boot-timeout={args.boot_timeout}",
                   "--open-shell"], command)
         return
     if not source:
         print("Starting a guest without a project. Add one later with rox add NAME.", flush=True)
     app_session = app_session_for(args)
     config_path, config = load_config(args)
-    settings = config.get(args.backend, {})
-    if not isinstance(settings, dict):
-        raise Error(f"Expected an object for {args.backend} in {config_path}")
-    if args.engine and args.backend != "container":
+    keys, known_hosts = git_access(args, config, config_path, source[1]) if source else ([], "")
+    fetched = None
+    if source:
+        require(["git"])
+        fetched = read_branch(source[1], source[2], keys, known_hosts)
+    project_config = fetched.settings if fetched else {}
+    backend = args.backend or project_config.get("backend")
+    if not backend:
+        raise Error(f"Choose a backend with rox up container, linux or macos, or set \"backend\" in {PROJECT_CONFIG}")
+    if not args.backend:
+        print(f"Using the {backend} backend from {PROJECT_CONFIG}", flush=True)
+    launcher_settings = config.get(backend, {})
+    if not isinstance(launcher_settings, dict):
+        raise Error(f"Expected an object for {backend} in {config_path}")
+    project_section = project_config.get(backend, {})
+    # The project's settings override the launcher's, and command-line options override both.
+    settings = {**launcher_settings, **project_section}
+
+    def origin(key):
+        return PROJECT_CONFIG if key in project_section else config_path
+
+    if args.engine and backend != "container":
         raise Error("--engine applies to the container backend")
     engine = ""
-    if args.backend == "container":
+    if backend == "container":
         engine = args.engine or settings.get("engine") or default_engine()
         if engine not in ENGINES:
             raise Error("Choose container, docker or podman as the container engine")
-    cpus, memory = settings.get("cpus", 0), settings.get("memory", "")
-    if not engine and (cpus or memory):
-        raise Error(f"cpus and memory apply to the container backend in {config_path}")
+    cpus = args.cpus if args.cpus is not None else settings.get("cpus", 0)
+    memory = args.memory if args.memory is not None else settings.get("memory", "")
     if not isinstance(cpus, int) or isinstance(cpus, bool) or cpus < 0:
-        raise Error(f"Expected a whole number of CPUs for container.cpus in {config_path}")
-    if not isinstance(memory, str) or (memory and not re.fullmatch(r"[0-9]+[KMGT]?", memory, re.IGNORECASE)):
-        raise Error(f"Expected a size such as 4G for container.memory in {config_path}")
+        where = "--cpus" if args.cpus is not None else f"{backend}.cpus in {origin('cpus')}"
+        raise Error(f"Expected a whole number of CPUs for {where}")
+    if not isinstance(memory, str) or (memory and not re.fullmatch(r"[0-9]+[KMGT]", memory, re.IGNORECASE)):
+        where = "--memory" if args.memory is not None else f"{backend}.memory in {origin('memory')}"
+        raise Error(f"Expected a size such as 4G or 512M for {where}")
     image = args.image or settings.get("image") or (DEFAULT_CONTAINER_IMAGE if engine else "")
     if not isinstance(image, str) or not image or image.startswith("-"):
-        raise Error(f"Choose a {args.backend} image with --image or in {config_path}")
+        raise Error(f"Choose a {backend} image with --image or in {origin('image')}")
     identity = None
     host_key = None
     user = "workspace"
@@ -1096,18 +1181,16 @@ def up(args, command):
         identity = configured_file(settings.get("identity"))
         host_key = configured_file(settings.get("host_key"))
         if not identity or not host_key or not re.fullmatch(r"[a-zA-Z_][a-zA-Z0-9_.-]*", user):
-            raise Error(f"Configure user, identity and host_key for {args.backend} in {config_path}")
+            raise Error(f"Configure user, identity and host_key for {backend} in {config_path}")
     prebuild = settings.get("prebuild", True)
     if not isinstance(prebuild, bool):
-        raise Error(f"Expected true or false for {args.backend}.prebuild in {config_path}")
+        raise Error(f"Expected true or false for {backend}.prebuild in {origin('prebuild')}")
     prebuild = prebuild and bool(source) and not args.no_prebuild and not args.no_hook
     if args.rebuild and not prebuild:
         raise Error("--rebuild needs a project image, which --no-project, --no-hook, --no-prebuild "
                     "or prebuild: false disable")
 
     required = ["rex", "ssh", engine or "tart"]
-    if prebuild:
-        required.append("git")
     if engine:
         required.append("ssh-keygen")
     if engine == "container" and not shutil.which("container"):
@@ -1116,18 +1199,18 @@ def up(args, command):
     require(required)
     if engine:
         check_engine(engine)
-    keys, known_hosts = git_access(args, config, config_path, source[1]) if source else ([], "")
     private_directory(state_root())
     if engine:
         prepare_container_image(engine, image)
     prebuilt = ""
     if prebuild:
-        vm = {"user": user, "identity": identity, "host_key": host_key, "boot_timeout": args.boot_timeout}
-        prebuilt = prepare_project_image(args.backend, engine, image, source[0], source[1], source[2],
-                                         keys, known_hosts, vm, args.rebuild)
+        vm = {"user": user, "identity": identity, "host_key": host_key, "boot_timeout": args.boot_timeout,
+              "cpus": cpus, "memory": memory}
+        prebuilt = prepare_project_image(backend, engine, image, source[0], source[1], source[2],
+                                         keys, known_hosts, vm, args.rebuild, fetched)
 
     name = f"rv-{slugify(source[0] if source else 'host', 24) or 'project'}-{secrets.token_hex(6)}"
-    guest = Guest(name, args.backend, prebuilt or image, user, engine, prebuilt=bool(prebuilt),
+    guest = Guest(name, backend, prebuilt or image, user, engine, prebuilt=bool(prebuilt),
                   cpus=cpus, memory=memory)
     guest.directory.mkdir(mode=0o700)
     guest.identity = str(identity or guest.directory / "login")
@@ -1378,7 +1461,7 @@ APP_HOST_HELP = "don't offer to add the guest to a Rex app that keeps its own ho
 def positive_int(value):
     number = int(value)
     if number < 1:
-        raise argparse.ArgumentTypeError("expected a positive number of seconds")
+        raise argparse.ArgumentTypeError("expected a positive whole number")
     return number
 
 
@@ -1386,7 +1469,8 @@ def main(argv):
     parser = argparse.ArgumentParser(description=__doc__, epilog="Pass -- COMMAND [ARG ...] to up or add to start a command in Rex.")
     commands = parser.add_subparsers(dest="command", required=True)
     start = commands.add_parser("up", help="start and provision a new guest")
-    start.add_argument("backend", choices=BACKENDS)
+    start.add_argument("backend", nargs="?", choices=BACKENDS,
+                       help=f"guest type; defaults to the \"backend\" in the branch's {PROJECT_CONFIG}")
     attach = commands.add_parser("add", help="clone a project into a running guest")
     attach.add_argument("name", help="workspace to add the project to")
 
@@ -1409,6 +1493,8 @@ def main(argv):
     start.add_argument("--no-project", action="store_true",
                        help="start a guest without a project, even from inside a checkout")
     start.add_argument("--image", help="container image or prepared Tart template")
+    start.add_argument("--cpus", type=positive_int, help="CPUs for the container or VM")
+    start.add_argument("--memory", help="memory for the container or VM, such as 8G or 512M")
     start.add_argument("--engine", choices=ENGINES,
                        help="container engine; defaults to container on Apple Silicon Macs, otherwise docker")
     start.add_argument("--boot-timeout", type=positive_int, default=120, help="seconds per guest readiness check")
