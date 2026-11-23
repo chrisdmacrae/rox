@@ -38,13 +38,19 @@ Install rox on the machine that runs the guests. That machine is called the **la
    rox --help
    ```
 
+4. Optionally, install the [rox skill](../../guides/agents/) for Claude Code or Codex.
+
+   ```sh
+   rox skill install
+   ```
+
 </Steps>
 
 Rox finds its guest scripts and Containerfile next to the real file in `~/.local/share/rox`, which is why the command links `rox` instead of copying it.
 
 ### Upgrade or pin a version
 
-Run the same command again to upgrade. The installed version is in `~/.local/share/rox/VERSION`. To install a specific version, replace `latest/download` with `download/vX.Y.Z`. See [releases](https://github.com/chrisdmacrae/rox/releases) for the available versions.
+Run the same command again to upgrade, then run `rox skill install` again if you use the skill. The installed version is in `~/.local/share/rox/VERSION`. To install a specific version, replace `latest/download` with `download/vX.Y.Z`. See [releases](https://github.com/chrisdmacrae/rox/releases) for the available versions.
 
 Each release also includes `rox.tar.gz.sha256`. To check a download, keep the archive and run `shasum -a 256 -c rox.tar.gz.sha256` in the folder that holds both files.
 

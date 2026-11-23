@@ -1455,6 +1455,63 @@ def list_guests():
         print(f"{guest.name}\t{guest.backend}\t{guest.phase}\t{guest_ip(guest)}\t{project_summary(guest)}")
 
 
+SKILL_AGENTS = {
+    "claude": ("CLAUDE_CONFIG_DIR", ".claude"),
+    "codex": ("CODEX_HOME", ".codex"),
+}
+
+
+def agent_home(agent):
+    variable, fallback = SKILL_AGENTS[agent]
+    return Path(os.environ.get(variable) or Path.home() / fallback).expanduser()
+
+
+def is_rox_skill(path):
+    try:
+        header = (path / "SKILL.md").read_text().split("---", 2)[1]
+    except (OSError, IndexError):
+        return False
+    return re.search(r"^name:\s*rox\s*$", header, re.MULTILINE) is not None
+
+
+def install_skill(agents, directory, force):
+    """Copy the skill bundled with this rox into each agent's skills folder."""
+    source = HERE / "skills" / "rox"
+    if not (source / "SKILL.md").is_file():
+        raise Error(f"No bundled skill found at {source}")
+    if directory:
+        targets = [("", Path(directory).expanduser().resolve())]
+    else:
+        # Without --agent, install for each agent that's set up on this machine.
+        agents = agents or [agent for agent in SKILL_AGENTS if agent_home(agent).is_dir()]
+        if not agents:
+            raise Error("Found no Claude Code or Codex folder. Choose one with --agent claude, "
+                        "--agent codex, or --dir DIR")
+        targets = [(agent, agent_home(agent) / "skills") for agent in agents]
+    version_file = HERE / "VERSION"
+    version = version_file.read_text().strip() if version_file.is_file() else "development"
+    for agent, skills in targets:
+        destination = skills / "rox"
+        if destination.is_symlink() or (destination.exists() and not is_rox_skill(destination)):
+            if not force:
+                raise Error(f"{destination} exists and isn't a rox skill. Pass --force to replace it")
+        skills.mkdir(parents=True, exist_ok=True)
+        # Copy beside the destination, then swap it in so a failed copy leaves the old skill.
+        staging = Path(tempfile.mkdtemp(prefix=".rox-skill-", dir=skills))
+        try:
+            shutil.copytree(source, staging / "rox")
+            if destination.is_symlink() or destination.is_file():
+                destination.unlink()
+            elif destination.exists():
+                shutil.rmtree(destination)
+            (staging / "rox").rename(destination)
+        finally:
+            shutil.rmtree(staging, ignore_errors=True)
+        label = {"claude": "Claude Code", "codex": "Codex"}.get(agent, "")
+        print(f"Installed the rox skill ({version}){f' for {label}' if label else ''} at {destination}")
+    print("Start a new agent session to load it. Run rox skill install again after upgrading rox.")
+
+
 APP_HOST_HELP = "don't offer to add the guest to a Rex app that keeps its own host list"
 
 
@@ -1523,8 +1580,15 @@ def main(argv):
         edit = key_commands.add_parser(action, help=help_text)
         edit.add_argument("path", help="path to the SSH private key")
         edit.add_argument("--config", help="alternate Rox configuration file")
+    skill = commands.add_parser("skill", help="install the rox agent skill")
+    skill_commands = skill.add_subparsers(dest="skill_command", required=True)
+    install = skill_commands.add_parser("install", help="copy the bundled skill into Claude Code or Codex")
+    install.add_argument("--agent", action="append", choices=sorted(SKILL_AGENTS),
+                         help="agent to install for (repeatable); defaults to each one set up on this machine")
+    install.add_argument("--dir", help="skills folder to install into instead, such as a project's .claude/skills")
+    install.add_argument("--force", action="store_true", help="replace a folder named rox that isn't a rox skill")
     command = []
-    if argv[:1] != ["key"] and "--" in argv:
+    if argv[:1] not in (["key"], ["skill"]) and "--" in argv:
         index = argv.index("--")
         argv, command = argv[:index], argv[index + 1:]
         if not command:
@@ -1546,6 +1610,10 @@ def main(argv):
         reconnect(args.name, app_host=not args.no_app_host)
     elif args.command == "key":
         edit_git_keys(args)
+    elif args.command == "skill":
+        if args.agent and args.dir:
+            parser.error("choose --agent or --dir, not both")
+        install_skill(args.agent, args.dir, args.force)
     else:
         down(args.name or choose_project_guest(args.cwd))
 

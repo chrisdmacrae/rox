@@ -1240,6 +1240,39 @@ class WorkspaceTests(unittest.TestCase):
             "rv-tart-000000000003": "192.168.65.4", "rv-booting-000000000004": "-",
         })
 
+    def test_skill_install_copies_the_bundled_skill_for_each_agent_set_up(self):
+        claude, codex = self.root / "claude", self.root / "codex"
+        claude.mkdir()
+        with patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(claude), "CODEX_HOME": str(codex)}), \
+                contextlib.redirect_stdout(io.StringIO()) as printed:
+            rox.main(["skill", "install"])
+            self.assertEqual((claude / "skills/rox/SKILL.md").read_text(),
+                             (ROOT / "skills/rox/SKILL.md").read_text())
+            self.assertTrue((claude / "skills/rox/references/remote-launcher.md").is_file())
+            self.assertFalse(codex.exists())
+            self.assertIn("for Claude Code", printed.getvalue())
+            # Reinstalling replaces an older copy, including files the new one dropped.
+            (claude / "skills/rox/stale.md").write_text("old\n")
+            rox.main(["skill", "install", "--agent", "codex", "--agent", "claude"])
+            self.assertFalse((claude / "skills/rox/stale.md").exists())
+            self.assertTrue((codex / "skills/rox/SKILL.md").is_file())
+            self.assertEqual(sorted(path.name for path in (claude / "skills").iterdir()), ["rox"])
+
+    def test_skill_install_protects_folders_that_are_not_the_rox_skill(self):
+        target = self.root / "project-skills"
+        (target / "rox").mkdir(parents=True)
+        (target / "rox" / "notes.md").write_text("mine\n")
+        with contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaisesRegex(rox.Error, "isn't a rox skill"):
+                rox.main(["skill", "install", "--dir", str(target)])
+            self.assertTrue((target / "rox" / "notes.md").is_file())
+            rox.main(["skill", "install", "--dir", str(target), "--force"])
+        self.assertTrue((target / "rox" / "SKILL.md").is_file())
+        with patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(self.root / "none-a"),
+                                     "CODEX_HOME": str(self.root / "none-b")}):
+            with self.assertRaisesRegex(rox.Error, "Found no Claude Code or Codex folder"):
+                rox.main(["skill", "install"])
+
     def test_records_from_single_project_launches_still_load(self):
         name = "rv-legacy-000011112222"
         directory = rox.state_root() / name

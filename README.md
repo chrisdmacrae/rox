@@ -10,15 +10,13 @@ Rox registers each guest with Rex as soon as its server answers. If cloning or s
 
 The [rox skill](skills/rox/SKILL.md) teaches a controller agent to launch guests, delegate tasks through Rex, track worker output and exit status, and collect results before teardown.
 
-After you [install rox](#install), copy the skill for Codex.
+The skill ships with each release. After you [install rox](#install), install it for each agent set up on this machine, Claude Code and Codex, or pick one with `--agent claude` or `--agent codex`:
 
 ```sh
-skill_dir="${CODEX_HOME:-$HOME/.codex}/skills"
-mkdir -p "$skill_dir"
-cp -R ~/.local/share/rox/skills/rox "$skill_dir/"
+rox skill install
 ```
 
-Start a new Codex session and invoke `$rox`. Install the toolkit itself on the machine that will run the guests, and make your chosen agent runner available inside those guests.
+Start a new session and invoke `/rox` in Claude Code or `$rox` in Codex. Run `rox skill install` again after upgrading rox to update the skill. Install the toolkit itself on the machine that will run the guests, and make your chosen agent runner available inside those guests.
 
 ## Install
 

@@ -85,3 +85,13 @@ Add or remove a Git SSH private key path in `git_keys`. Removing a path doesn't 
 | Option | Description |
 | --- | --- |
 | `--config PATH` | A different rox config file. |
+
+## `rox skill install`
+
+Copy the [rox skill](../../guides/agents/) bundled with this rox version into an agent's skills folder. Without options, it installs for each agent set up on this machine: Claude Code (`${CLAUDE_CONFIG_DIR:-~/.claude}/skills/rox`) and Codex (`${CODEX_HOME:-~/.codex}/skills/rox`). Run it again after upgrading rox to update the skill.
+
+| Option | Description |
+| --- | --- |
+| `--agent claude\|codex` | Install for this agent. Repeat it for both. |
+| `--dir DIR` | Install into `DIR/rox` instead, for example a project's `.claude/skills`. Can't be combined with `--agent`. |
+| `--force` | Replace an existing folder named `rox` that isn't a rox skill. Without it, Rox only replaces its own earlier copy. |
