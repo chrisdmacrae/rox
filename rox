@@ -1492,18 +1492,99 @@ def register_guest(guest):
                   "to reach guests from other devices.", flush=True)
 
 
-def local_app_client():
-    """Return the ID of a Rex app connected to this machine's server, if any."""
+def app_clients(server=None):
+    """The Rex apps connected to a server, this machine's by default."""
+    target = ["-S", server] if server else []
+    clients = json.loads(output(["rex", "--autostart=false", "--timeout", "5s", *target, "client", "ls", "--json"],
+                                timeout=10))
+    return [client for client in clients.get("clients", [])
+            if client.get("info", {}).get("kind") == "app" and client.get("connection_state") == "connected"]
+
+
+def local_app():
+    """The Rex app running on this machine and connected to its server, if any."""
     try:
-        clients = json.loads(output(["rex", "--autostart=false", "client", "ls", "--json"], timeout=8))
+        return next((client for client in app_clients()
+                     if client.get("principal", {}).get("transport") == "unix"), None)
     except (Error, ValueError, subprocess.SubprocessError):
         return None
-    for client in clients.get("clients", []):
-        if (client.get("info", {}).get("kind") == "app"
-                and client.get("connection_state") == "connected"
-                and client.get("principal", {}).get("transport") == "unix"):
-            return client["client_id"]
-    return None
+
+
+def local_app_client():
+    """Return the ID of a Rex app connected to this machine's server, if any."""
+    app = local_app()
+    return app["client_id"] if app else None
+
+
+def open_in_app(name, server, session_id, timeout=180):
+    """Show the guest's own session in the Rex app here, so its splits and tabs run in the guest.
+
+    The app shows one host at a time, and its Switch Host picker takes no arguments, so open
+    the picker, wait for the app to connect to the guest's server, then select the session there.
+    """
+    app = local_app()
+    if not app:
+        raise Error(f"Open the Rex app on this machine to open {name} in it, or use rox shell {name}")
+    device = app.get("info", {}).get("label") or app.get("label")
+
+    def guest_app():
+        try:
+            return next((client["client_id"] for client in app_clients(server)
+                         if not device or (client.get("info", {}).get("label") or client.get("label")) == device), None)
+        except (Error, ValueError, subprocess.SubprocessError):
+            return None
+
+    client = guest_app()
+    if not client:
+        run(["rex", "--autostart=false", "-C", app["client_id"], "do", "client.host.switch"],
+            check=False, capture=True, timeout=8)
+        print(f"Choose {name} in the Rex app's Switch Host picker. If it isn't listed, add it with "
+              f"rox add-remote-host {name}, then choose it.", flush=True)
+        client = wait_for(guest_app, timeout, f"the Rex app to switch to {name}")
+    result = run(["rex", "--autostart=false", "-S", server, "-C", client, "do", "session.select",
+                  f"session_id={session_id}"], check=False, capture=True, timeout=15)
+    if result.returncode:
+        raise Error(f"The Rex app is on {name}, but couldn't open session {session_id}: "
+                    f"{(result.stderr or result.stdout).strip()}")
+    print(f"Opened {name} in the Rex app. Splits and new tabs there run in the guest.", flush=True)
+
+
+def guest_session(guest, key=None):
+    """The guest's own Rex session for a project, its only project, or the guest itself."""
+    if key:
+        return guest.find_project(key).session_id
+    if len(guest.projects) == 1:
+        return guest.projects[0].session_id
+    return guest.session_id or (guest.projects[0].session_id if guest.projects else "")
+
+
+def open_guest(name, key=None, host=None):
+    """rox open: show a guest here or on another Rex host in the Rex app on this machine."""
+    if host is None and is_local(name):
+        guest = ready_guest(name)
+        session = guest_session(guest, key)
+        server = guest.endpoint
+    else:
+        host, record = find_remote_guest(name, host)
+        if not record.get("tailnet"):
+            raise Error(f"{name} runs on {host} and isn't on the tailnet, so the Rex app here can't reach it. "
+                        f"Use rox shell {name}, or configure tailscale on {host} with rox config tailscale")
+        if "sessions" not in record:
+            raise Error(f"Upgrade rox on {host} to open its guests in the Rex app from here")
+        sessions = record["sessions"]
+        session = sessions.get(key) if key else (sessions.get("") or next(iter(sessions.values()), ""))
+        server = record["tailnet"]
+    if not session:
+        raise Error(f"{name} has no Rex session for {key or 'the guest'} yet. Run rox reconnect {name}")
+    open_in_app(name, server, session)
+
+
+def open_or_tab(app_session, guest, project=None):
+    """For --open-shell: open the guest's own session in the Rex app, or a Guest tab without an app."""
+    if local_app():
+        open_in_app(guest.name, guest.endpoint, project.session_id if project else guest.session_id)
+    else:
+        open_app_shell(app_session, guest.name, project.id if project else None)
 
 
 def add_app_host(name, address):
@@ -1577,11 +1658,10 @@ def project_options(project):
 REMOTE_ROX = ["sh", "-c", 'PATH="$HOME/.local/bin:/usr/local/bin:/opt/homebrew/bin:$PATH"; exec rox "$@"', "rox"]
 
 
-def dispatch(args, label, launch, command, keep_session=True):
+def dispatch(args, label, launch, command):
     """Run a rox command on a Rex remote host in a Provision tab and wait for it.
 
-    The tab closes when the command succeeds and stays open to inspect when it fails. With
-    keep_session false, the whole session closes, for a command that leaves nothing else in it.
+    The session closes when the command succeeds, and stays open to inspect when it fails.
     """
     rex = ["rex", "--autostart=false", "-S", args.host]
     launch = [*REMOTE_ROX, *launch]
@@ -1609,9 +1689,7 @@ def dispatch(args, label, launch, command, keep_session=True):
         print(capture.stdout.rstrip())
     if status.returncode:
         raise Error(f"Provisioning exited with status {status.returncode}. See the Provision tab in {session} on {args.host}.")
-    # up and add open the guest's shell in another tab of this session, so keep that one.
-    closing = [*rex, "block", "close", "-s", session, block] if keep_session else [*rex, "kill", session]
-    closed = run(closing, check=False, capture=True)
+    closed = run([*rex, "kill", session], check=False, capture=True)
     if closed.returncode:
         print(f"rox: Could not close the Provision tab in {session} on {args.host}. "
               f"({closed.stderr.strip()})", file=sys.stderr, flush=True)
@@ -1640,11 +1718,27 @@ def register_remote_guest(provision_output, launcher):
     suggest_app_host(workspace[1])
 
 
+def open_remote_guest(provision_output, launcher):
+    """After a remote up or add, open the guest's session in the Rex app here when it can reach it."""
+    workspace = re.search(rf"^Workspace\s+({NAME_PATTERN})\s*$", provision_output, re.MULTILINE)
+    tailnet = re.search(r"^Tailnet\s+([a-z0-9-]+(?:\.[a-z0-9-]+)+)\s*$", provision_output, re.MULTILINE)
+    session = re.search(r"^Session\s+(session:\S+)\s*$", provision_output, re.MULTILINE)
+    if not workspace:
+        return
+    if not (tailnet and session and local_app()):
+        print(f"Open a shell in it with rox shell {workspace[1]}", flush=True)
+        return
+    try:
+        open_in_app(workspace[1], tailnet[1], session[1])
+    except Error as error:
+        print(f"rox: {error}. Open it later with rox open {workspace[1]}", file=sys.stderr, flush=True)
+
+
 def down_remote(args):
     """Remove a guest on a Rex remote host, and this machine's host entry for it."""
     if not args.name or not re.fullmatch(NAME_PATTERN, args.name):
         raise Error("Name the workspace to remove on another host: rox down NAME --host HOST")
-    dispatch(args, args.name, ["down", args.name], [], keep_session=False)
+    dispatch(args, args.name, ["down", args.name], [])
     if not remove_rex_host(args.name):
         raise Error(f"Removed {args.name} on {args.host}, but could not remove its Rex host on this machine")
 
@@ -1767,8 +1861,9 @@ def up(args, command):
     if args.host is not None:
         provisioned = dispatch(args, source[0] if source else "host",
                                ["up", *([args.backend] if args.backend else []), *project_options(source),
-                                f"--boot-timeout={args.boot_timeout}", "--open-shell"], command)
+                                f"--boot-timeout={args.boot_timeout}"], command)
         register_remote_guest(provisioned, args.host)
+        open_remote_guest(provisioned, args.host)
         return
     if not source:
         print("Starting a guest without a project. Add one later with rox add NAME.", flush=True)
@@ -1898,7 +1993,7 @@ def up(args, command):
     suggest_app_host(guest.name)
     if app_session:
         try:
-            open_app_shell(app_session, guest.name, project.id if project else None)
+            open_or_tab(app_session, guest, project)
         except (Error, subprocess.SubprocessError, ValueError) as error:
             raise Error(f"{guest.name} is ready. Open it on this host with rox shell {guest.name}.") from error
 
@@ -1911,7 +2006,8 @@ def add(args, command):
         raise Error(f"Invalid workspace name {args.name!r}")
     source = resolve_project(args, required=True)
     if args.host is not None:
-        dispatch(args, source[0], ["add", args.name, *project_options(source), "--open-shell"], command)
+        provisioned = dispatch(args, source[0], ["add", args.name, *project_options(source)], command)
+        open_remote_guest(provisioned, args.host)
         return
     app_session = app_session_for(args)
     config_path, config = load_config(args)
@@ -1929,7 +2025,7 @@ def add(args, command):
         describe_guest(guest, project)
     if app_session:
         try:
-            open_app_shell(app_session, guest.name, project.id)
+            open_or_tab(app_session, guest, project)
         except (Error, subprocess.SubprocessError, ValueError) as error:
             raise Error(f"{project.id} is ready. Open it with rox shell {guest.name} {project.id}.") from error
 
@@ -1952,8 +2048,9 @@ def shell_directory(name, checkouts, home, key=None):
     return home
 
 
-def shell_command(socket_path, directory):
-    return ["env", f"REX_SERVER=unix://{socket_path}", "sh", "-c",
+def shell_command(socket_path, directory, session=""):
+    session_env = [f"REX_SESSION={session}"] if session else []
+    return ["env", f"REX_SERVER=unix://{socket_path}", *session_env, "sh", "-c",
             'cd "$1" && exec "${SHELL:-/bin/sh}" -l', "rox", directory]
 
 
@@ -1963,7 +2060,9 @@ def shell(name, key=None):
         guest.find_project(key)  # Explain a project that isn't there, including one still cloning.
     checkouts = [(project.id, project.name, project.workspace) for project in guest.projects]
     directory = shell_directory(name, checkouts, str(guest.home), key)
-    argv = remote_command(guest, shell_command(guest.guest_socket, directory), tty=True)
+    session = next((project.session_id for project in guest.projects if project.workspace == directory),
+                   guest.session_id)
+    argv = remote_command(guest, shell_command(guest.guest_socket, directory, session), tty=True)
     os.execvpe(argv[0], argv, {**os.environ, "TERM": "xterm-256color"})
 
 
@@ -2152,6 +2251,9 @@ def local_records():
             "checkouts": [{"id": project.id, "name": project.name, "workspace": project.workspace}
                           for project in guest.projects if project.workspace],
             "funnels": [{"url": f["url"], "port": f["port"]} for f in guest.funnels],
+            # Rex sessions in the guest's own server: "" for the guest's, and one per project.
+            "sessions": {**({"": guest.session_id} if guest.session_id else {}),
+                         **{project.id: project.session_id for project in guest.projects if project.session_id}},
         })
     return records
 
@@ -2371,6 +2473,9 @@ def remote_shell(host, record, key=None):
     require(["ssh", "ssh-keyscan", "rex"])
     checkouts = [(entry["id"], entry["name"], entry["workspace"]) for entry in record.get("checkouts", [])]
     directory = shell_directory(name, checkouts, record["home"], key)
+    sessions = record.get("sessions", {})
+    session = next((sessions.get(entry["id"], "") for entry in record.get("checkouts", [])
+                    if entry["workspace"] == directory), sessions.get("", ""))
     login = remote_ssh_key()
     public_key = Path(f"{login}.pub").read_text().strip()
     returncode, text = rex_output(server, f"rox shell {name}", ["sh", "-c", AUTHORIZE_SCRIPT, "rox", public_key])
@@ -2384,7 +2489,7 @@ def remote_shell(host, record, key=None):
         "-o", f"UserKnownHostsFile={known_hosts}", "-o", "ForwardAgent=no",
         "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=3",
         "-i", str(login), "-l", record["user"], "-p", str(port), "-t", "--", "127.0.0.1",
-        shlex.join(shell_command(record["socket"], directory)),
+        shlex.join(shell_command(record["socket"], directory, session)),
     ]
     with tailnet_forward(server, [(port, 22)]):
         # The tunnel ends inside the guest, behind the Rex server's authenticated tailnet
@@ -2708,7 +2813,8 @@ def main(argv):
         parser.add_argument("--git-key", action="append", help="Git SSH identity (repeatable)")
         parser.add_argument("--git-known-hosts", help="known_hosts file for Git SSH servers")
         parser.add_argument("--no-hook", action="store_true", help="skip the project's .rox.sh")
-        parser.add_argument("--open-shell", action="store_true", help="open a guest shell in the current Rex session")
+        parser.add_argument("--open-shell", action="store_true",
+                            help="open the guest's session in the Rex app here, or a Guest tab in this Rex session without one")
 
     project_arguments(start)
     project_arguments(attach)
@@ -2757,10 +2863,14 @@ def main(argv):
     funnel_parser.add_argument("--path", default="/", help="public path to serve it at (default /)")
     funnel_parser.add_argument("--off", action="store_true",
                                help="stop funneling PORT, or every funnel of the guest without PORT")
+    open_parser = commands.add_parser("open", help="show a guest's own Rex session in the Rex app, so splits run in the guest")
+    open_parser.add_argument("name")
+    open_parser.add_argument("project", nargs="?", help="project whose session to open; omit for the only one")
     app_parser = commands.add_parser("add-remote-host",
                                      help="add a guest to the Rex app on this machine, which keeps its own host list")
     app_parser.add_argument("name")
-    for named in (forward_parser, funnel_parser, reconnect_parser, start_parser, stop_parser, app_parser):
+    for named in (forward_parser, funnel_parser, reconnect_parser, start_parser, stop_parser, app_parser,
+                  open_parser):
         named.add_argument("-S", "--host", help=HOST_HELP)
     stop = commands.add_parser("down", help="delete a guest and its workspace")
     stop.add_argument("name", nargs="?",
@@ -2826,6 +2936,8 @@ def main(argv):
         reconnect(args.name, force=False)
     elif args.command == "funnel":
         funnel(args.name, args.port, args.https, args.path, args.off)
+    elif args.command == "open":
+        open_guest(args.name, args.project, args.host)
     elif args.command == "add-remote-host":
         add_remote_host(args.name, args.host)
     elif args.command == "stop":

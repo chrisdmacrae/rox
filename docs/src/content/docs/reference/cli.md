@@ -33,7 +33,7 @@ rox up container [options] [-- COMMAND [ARG ...]]
 | `--no-hook` | Skip the project's `.rox.sh` and the project image. |
 | `--no-prebuild` | Clone and run `.rox.sh` at boot instead of using a [project image](../../guides/project-images/). |
 | `--rebuild` | Rebuild the project image before launching. |
-| `--open-shell` | Open a guest shell in the current Rex session. Requires a Rex terminal. |
+| `--open-shell` | Open the guest's own Rex session in the Rex app on this machine, like `rox open`. Without a Rex app here, open a Guest tab running `rox shell` in the current Rex session instead. Requires a Rex terminal. |
 | `--no-tailscale` | Keep this guest off the tailnet even when `tailscale` is configured. See [Reaching guests from other devices](../../guides/tailnet/). |
 
 ## `rox add NAME`
@@ -100,6 +100,14 @@ Restore Rex access to a guest. This also works for a guest kept after a failed c
 ## `rox start NAME` / `rox stop NAME`
 
 `rox stop` closes the guest's tunnel and stops its container or VM without deleting anything. The guest stays stopped until `rox start`: `rox ls` shows it as `stopped`, the [rox service](../../guides/keep-running/) leaves it alone, and `rox shell`, `rox forward` and `rox add` refuse it. `rox start` starts the guest and restores access to it, like `rox reconnect`, without the Rex app prompt. If this machine has no record of `NAME`, Rox finds the Rex host that runs it and works there. See [Working with guests on other hosts](../../guides/remote-hosts/#working-with-guests-on-other-hosts).
+
+| Option | Description |
+| --- | --- |
+| `-S`, `--host HOST` | The Rex host that runs the guest. Without it, Rox looks for the guest on this machine, then on each Rex host. |
+
+## `rox open NAME [PROJECT]`
+
+Show the guest's own Rex session in the Rex app on this machine, so new tabs and splits there run in the guest. Without `PROJECT`, Rox opens the session of the guest's only project, or the guest's own session. The app shows one host at a time, and its host picker can't be driven by a command. So when the app isn't on the guest's host, Rox opens **Switch Host** and waits up to three minutes for you to choose the guest, then selects the session. Add the guest to the app first with `rox add-remote-host NAME` if it isn't listed. A guest on another Rex host must be on the tailnet. See [Working in the guest's session](../../guides/remote-hosts/#working-in-the-guests-session).
 
 | Option | Description |
 | --- | --- |

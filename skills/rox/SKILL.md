@@ -53,4 +53,4 @@ If the runner must start at boot, pass its command after `rox up ... --`. It run
 
 Rex CLI access works independently of the Rex.app sidebar. Use the CLI and the saved IDs to supervise workers.
 
-`rox up` and `rox reconnect` never prompt. When the user wants a guest in the Rex app's sidebar, run `rox add-remote-host NAME`: it copies the guest's address and opens **Add Remote Host** in the Rex app on this machine for the user to paste.
+Splits and new tabs run on the server that owns the session, so a split of a pane that SSHes into a guest opens on the launcher. To work in a guest with splits, use the guest's own session: `rex -S NAME` from the CLI, or `rox open NAME` to show it in the user's Rex app. Inside a guest shell, `REX_SESSION` already points at the guest's session. `rox up` and `rox reconnect` never prompt. When the user wants a guest in the Rex app's sidebar, run `rox add-remote-host NAME`: it copies the guest's address and opens **Add Remote Host** in the Rex app on this machine for the user to paste.

@@ -25,6 +25,7 @@ REAL_ENSURE_RUNTIME = rox.ensure_runtime
 REAL_GUEST_STATE = rox.guest_state
 REAL_REACHABLE = rox.reachable
 REAL_SUGGEST_APP_HOST = rox.suggest_app_host
+REAL_LOCAL_APP = rox.local_app
 
 
 def base_image(version=None, image_id="sha256:base"):
@@ -54,7 +55,8 @@ class WorkspaceTests(unittest.TestCase):
         self.addCleanup(engine.stop)
         # Treat guests as running and reachable, so commands don't ask a real engine or tunnel.
         # Tests of those checks call the REAL_ copies.
-        for name, value in (("guest_state", "running"), ("reachable", True), ("suggest_app_host", None)):
+        for name, value in (("guest_state", "running"), ("reachable", True), ("suggest_app_host", None),
+                            ("local_app", None)):
             runtime = patch.object(rox, name, return_value=value)
             runtime.start()
             self.addCleanup(runtime.stop)
@@ -153,14 +155,14 @@ class WorkspaceTests(unittest.TestCase):
             [*rex, "new", "--window", "Provision", "--keep-open", "--json",
              "rox sample project", "--", *rox.REMOTE_ROX, "up", "container",
              "--project=sample project", "--repo=git@git.example.test:fork/repo.git",
-             "--branch=published-feature", "--boot-timeout=60", "--open-shell",
+             "--branch=published-feature", "--boot-timeout=60",
              "--config=~/Rex Config/rox.json", "--image=custom:latest", "--engine=podman",
              "--git-known-hosts=~/.ssh/git_hosts", "--git-key=~/.ssh/remote key", "--no-hook",
              "--", "agent", "'an argument with spaces' $HOME"],
             [*rex, "wait", "-s", "session:launch", "block:provision"],
             [*rex, "capture", "-s", "session:launch", "-b", "block:provision", "--trim", "--unwrap"],
-            # The Provision tab closes once it succeeds, leaving the Guest tab.
-            [*rex, "block", "close", "-s", "session:launch", "block:provision"],
+            # The Provision session closes once it succeeds.
+            [*rex, "kill", "session:launch"],
         ])
         self.assertIn("on buildbox in Rex session session:launch", captured.getvalue())
         self.assertIn("Workspace rv-sample-000011112222", captured.getvalue())
@@ -852,6 +854,111 @@ class WorkspaceTests(unittest.TestCase):
         self.assertEqual(remote.call_args.args[2], [*rox.REMOTE_ROX, "funnel", "rv-remote-000011112222", "5173",
                                                     "--https=8443", "--path=/"])
 
+    def fake_app_servers(self, connected_after=0):
+        """Fake the Rex app here and on a guest's server, which the app reaches after some checks."""
+        here = {"client_id": "client:here", "info": {"kind": "app", "label": "laptop"},
+                "connection_state": "connected", "principal": {"transport": "unix"}}
+        there = {"client_id": "client:there", "info": {"kind": "app", "label": "laptop"},
+                 "connection_state": "connected", "principal": {"transport": "tcp"}}
+        other = {"client_id": "client:phone", "info": {"kind": "app", "label": "phone"},
+                 "connection_state": "connected", "principal": {"transport": "tcp"}}
+        checks = {"count": 0}
+        commands = []
+
+        def fake_clients(server=None):
+            if server is None:
+                return [here]
+            checks["count"] += 1
+            return [other, there] if checks["count"] > connected_after else [other]
+
+        def fake_run(argv, **kwargs):
+            commands.append(argv)
+            return subprocess.CompletedProcess(argv, 0, "", "")
+
+        for item in (patch.object(rox, "app_clients", side_effect=fake_clients),
+                     patch.object(rox, "local_app", REAL_LOCAL_APP),
+                     patch.object(rox, "run", side_effect=fake_run),
+                     patch.object(rox.time, "sleep")):
+            item.start()
+            self.addCleanup(item.stop)
+        return commands
+
+    def test_open_in_app_selects_the_session_when_the_app_is_already_on_the_guest(self):
+        commands = self.fake_app_servers()
+        with contextlib.redirect_stdout(io.StringIO()) as printed:
+            rox.open_in_app("rv-x", "rv-x.tail.ts.net", "session:guest")
+        self.assertEqual(commands, [["rex", "--autostart=false", "-S", "rv-x.tail.ts.net", "-C", "client:there",
+                                     "do", "session.select", "session_id=session:guest"]])
+        self.assertIn("Splits and new tabs there run in the guest", printed.getvalue())
+
+    def test_open_in_app_opens_switch_host_and_waits_for_the_app(self):
+        commands = self.fake_app_servers(connected_after=2)
+        with contextlib.redirect_stdout(io.StringIO()) as printed:
+            rox.open_in_app("rv-x", "rv-x.tail.ts.net", "session:guest")
+        self.assertEqual(commands[0], ["rex", "--autostart=false", "-C", "client:here", "do", "client.host.switch"])
+        self.assertEqual(commands[-1][-3:], ["do", "session.select", "session_id=session:guest"])
+        self.assertIn("Choose rv-x in the Rex app's Switch Host picker", printed.getvalue())
+        self.assertIn("rox add-remote-host rv-x", printed.getvalue())
+
+    def test_open_needs_the_app_here(self):
+        with self.assertRaisesRegex(rox.Error, "Open the Rex app on this machine"):
+            rox.open_in_app("rv-x", "rv-x.tail.ts.net", "session:guest")
+
+    def test_rox_open_picks_a_local_or_remote_guests_session(self):
+        guest = self.saved_guest()
+        guest.projects = [rox.Project("web", "web", "", "main", workspace="/w", session_id="session:web", phase="ready")]
+        guest.save()
+        with patch.object(rox, "open_in_app") as opened:
+            rox.main(["open", guest.name])
+        self.assertEqual(opened.call_args.args, (guest.name, guest.endpoint, "session:web"))
+        with self.remote_listing(sessions={"": "session:home", "web": "session:remote-web"}), \
+                patch.object(rox, "open_in_app") as opened:
+            rox.main(["open", "rv-remote-000011112222", "web"])
+        self.assertEqual(opened.call_args.args,
+                         ("rv-remote-000011112222", "rv-remote-000011112222.tail.ts.net", "session:remote-web"))
+        with self.remote_listing(), self.assertRaisesRegex(rox.Error, "Upgrade rox on mini"):
+            rox.main(["open", "rv-remote-000011112222"])
+        with self.remote_listing(tailnet="", sessions={}), self.assertRaisesRegex(rox.Error, "isn't on the tailnet"):
+            rox.main(["open", "rv-remote-000011112222"])
+
+    def test_open_shell_uses_the_app_and_falls_back_to_a_guest_tab(self):
+        guest = self.saved_guest(session_id="session:guest")
+        with patch.object(rox, "local_app", return_value={"client_id": "client:here"}), \
+                patch.object(rox, "open_in_app") as opened, patch.object(rox, "open_app_shell") as tab:
+            rox.open_or_tab("session:mine", guest)
+        self.assertEqual(opened.call_args.args, (guest.name, guest.endpoint, "session:guest"))
+        tab.assert_not_called()
+        with patch.object(rox, "open_in_app") as opened, patch.object(rox, "open_app_shell") as tab:
+            rox.open_or_tab("session:mine", guest)
+        opened.assert_not_called()
+        self.assertEqual(tab.call_args.args, ("session:mine", guest.name, None))
+
+    def test_remote_up_opens_the_guest_here_or_suggests_rox_shell(self):
+        provisioned = ("Workspace  rv-remote-000011112222\nTailnet    rv-remote-000011112222.tail.ts.net\n"
+                       "Session    session:guest\n")
+        with patch.object(rox, "local_app", return_value={"client_id": "client:here"}), \
+                patch.object(rox, "open_in_app") as opened:
+            rox.open_remote_guest(provisioned, "mini")
+        self.assertEqual(opened.call_args.args,
+                         ("rv-remote-000011112222", "rv-remote-000011112222.tail.ts.net", "session:guest"))
+        for output_text in (provisioned, provisioned.replace("Tailnet", "Other")):
+            with self.subTest(output_text=output_text), patch.object(rox, "open_in_app") as opened, \
+                    contextlib.redirect_stdout(io.StringIO()) as printed:
+                rox.open_remote_guest(output_text, "mini")
+            opened.assert_not_called()
+            self.assertIn("rox shell rv-remote-000011112222", printed.getvalue())
+
+    def test_guest_shells_point_rex_at_the_guest_session(self):
+        guest = self.saved_guest(address="127.0.0.1", session_id="session:home")
+        guest.projects = [rox.Project("web", "web", "", "main", workspace="/home/workspace/web",
+                                      session_id="session:web", phase="ready")]
+        guest.save()
+        with patch.object(rox.os, "execvpe") as exec_run:
+            rox.main(["shell", guest.name])
+        command = shlex.split(exec_run.call_args.args[1][-1])
+        self.assertIn("REX_SESSION=session:web", command)
+        self.assertEqual(rox.local_records()[0]["sessions"], {"": "session:home", "web": "session:web"})
+
     def test_reconnect_registers_a_retained_guest_that_never_created_a_session(self):
         name = "rv-retained-000011112222"
         guest = rox.Guest(name, "container", "image", "workspace",
@@ -1400,6 +1507,7 @@ class WorkspaceTests(unittest.TestCase):
         with (
             patch.object(rox.shutil, "which", return_value="/usr/bin/pbcopy"),
             patch.object(rox, "run", side_effect=command),
+            patch.object(rox, "local_app", REAL_LOCAL_APP),
             contextlib.redirect_stdout(io.StringIO()) as printed,
         ):
             rox.main(argv)
@@ -1409,7 +1517,7 @@ class WorkspaceTests(unittest.TestCase):
         guest = self.saved_guest()
         calls, printed = self.app_host_commands(["add-remote-host", guest.name])
         self.assertEqual([argv for argv, _ in calls], [
-            ["rex", "--autostart=false", "client", "ls", "--json"],
+            ["rex", "--autostart=false", "--timeout", "5s", "client", "ls", "--json"],
             ["pbcopy"],
             ["rex", "--autostart=false", "-C", "client:app", "do", "client.host.add"],
         ])
@@ -1690,11 +1798,11 @@ class WorkspaceTests(unittest.TestCase):
         launch = requests[0]
         self.assertEqual(launch[launch.index("rox sample project"):], [
             "rox sample project", "--", *rox.REMOTE_ROX, "add", "rv-host-000011112222", "--project=sample project",
-            "--repo=git@git.example.test:fork/repo.git", "--branch=published-feature", "--open-shell",
+            "--repo=git@git.example.test:fork/repo.git", "--branch=published-feature",
             "--git-key=~/.ssh/deploy", "--", "agent",
         ])
         # add's new, wait, capture and close come first.
-        self.assertEqual(requests[3][-5:], ["block", "close", "-s", "session:launch", "block:provision"])
+        self.assertEqual(requests[3][-2:], ["kill", "session:launch"])
         self.assertEqual(requests[4][requests[4].index("--") + 1:][:8],
                          [*rox.REMOTE_ROX, "up", "linux", "--no-project", "--boot-timeout=120"])
 
@@ -1938,27 +2046,26 @@ class WorkspaceTests(unittest.TestCase):
                     rox, "run", return_value=subprocess.CompletedProcess([], code, "", stderr)):
                 self.assertEqual(rox.remove_rex_host("rv-x"), removed)
 
-    def test_remote_provisioning_closes_its_tab_on_success_and_keeps_it_on_failure(self):
+    def test_remote_provisioning_closes_its_session_on_success_and_keeps_it_on_failure(self):
         args = type("Args", (), {"host": "mini"})()
-        for status, keep, closing in ((0, True, ["block", "close", "-s", "session:p", "block:p"]),
-                                      (0, False, ["kill", "session:p"]), (1, True, None)):
+        for status in (0, 1):
             commands = []
 
             def fake_run(argv, **kwargs):
                 commands.append(argv)
-                code = status if "wait" in argv else 0
-                return subprocess.CompletedProcess(argv, code, "done\n", "")
+                return subprocess.CompletedProcess(argv, status if "wait" in argv else 0, "done\n", "")
 
             created = json.dumps({"session_id": "session:p", "initial_windows": [{"block_ids": ["block:p"]}]})
-            with self.subTest(status=status, keep=keep), patch.object(rox, "output", return_value=created), \
+            with self.subTest(status=status), patch.object(rox, "output", return_value=created), \
                     patch.object(rox, "run", side_effect=fake_run), contextlib.redirect_stdout(io.StringIO()):
-                if closing:
-                    rox.dispatch(args, "label", ["down", "x"], [], keep_session=keep)
-                    self.assertEqual(commands[-1][-len(closing):], closing)
+                if status == 0:
+                    rox.dispatch(args, "label", ["down", "x"], [])
+                    self.assertEqual(commands[-1][-2:], ["kill", "session:p"])
                 else:
                     with self.assertRaisesRegex(rox.Error, "See the Provision tab in session:p on mini"):
                         rox.dispatch(args, "label", ["up"], [])
-                    self.assertFalse(any("close" in argv or "kill" in argv for argv in commands))
+                    self.assertFalse(any("kill" in argv for argv in commands))
+
 
     def test_down_signs_the_guest_out_of_the_tailnet(self):
         guest = self.tailnet_guest()

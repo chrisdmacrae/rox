@@ -76,7 +76,7 @@ rox up container --host buildbox
 rox up macos -S studio -- my-agent --model example
 ```
 
-Rex starts a session on the selected host with a **Provision** tab. It registers the guest as a Rex host, but its private socket exists only on that machine. To reach remote guests directly, configure `tailscale` in the selected host's rox config (see [Reaching guests from other devices](#reaching-guests-from-other-devices)). Your machine then also adds the guest to its own Rex hosts by its tailnet name, and `rox down NAME --host HOST` removes both. Once provisioning succeeds, its **Guest** tab opens an interactive shell at the guest checkout. In Rex.app, find the `rox PROJECT` session under the selected host. Any command after `--` runs in the guest's own Rex session. The Provision tab prints the command for inspecting that session from a terminal on the selected host.
+Rex starts a session on the selected host with a **Provision** tab. It registers the guest as a Rex host, but its private socket exists only on that machine. To reach remote guests directly, configure `tailscale` in the selected host's rox config (see [Reaching guests from other devices](#reaching-guests-from-other-devices)). Your machine then also adds the guest to its own Rex hosts by its tailnet name, and `rox down NAME --host HOST` removes both. Once provisioning succeeds, the Provision session closes. When the guest is on the tailnet and the Rex app is open on your machine, Rox opens the guest's own Rex session in the app, so new tabs and splits there run in the guest. Otherwise it prints `rox shell NAME`. Any command after `--` runs in the guest's own Rex session. If provisioning fails, the Provision tab stays open to inspect.
 
 Rox resolves the source repository and branch from your current checkout before dispatching. The selected host uses its own config, runtime images, and SSH keys. Overrides such as `--config`, `--git-key`, and `--git-known-hosts` are paths on that host. Quote paths containing a leading `~` to have the selected host expand it.
 
@@ -236,6 +236,7 @@ It checks every 15 seconds, logs to `~/.local/state/rox/service.log`, and leaves
 | `rox funnel NAME PORT` | Put a server in the guest on the internet with Tailscale Funnel, through the launcher's Tailscale. `--https 8443` or `10000` and `--path` pick the public address, and `--off` stops it. See the [tailnet guide](docs/src/content/docs/guides/tailnet.mdx#sharing-a-guests-server-on-the-internet). |
 | `rex -S NAME ls` | List the guest's Rex sessions after a local launch with host registration. |
 | `rox reconnect NAME` | Restore Rex access to a guest, starting the container runtime and the guest first if they stopped. Also works for one retained after clone or setup failure. |
+| `rox open NAME [PROJECT]` | Show the guest's own Rex session in the Rex app on this machine, so splits and new tabs run in the guest. Opens the app's Switch Host picker if the app isn't on the guest yet. |
 | `rox add-remote-host NAME` | Add a guest to the Rex app on this machine, for app builds that keep their own host list. |
 | `rox stop NAME` / `rox start NAME` | Stop a guest without deleting it, and keep it stopped until `rox start`. |
 | `rox service install` | Keep guests running across reboots and container runtime restarts. See [Keeping guests running](#keeping-guests-running). |

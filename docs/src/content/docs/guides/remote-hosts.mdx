@@ -17,7 +17,7 @@ rox up macos -S studio -- my-agent --model example
 1. On your machine, Rox resolves the repository URL and branch from your current checkout.
 2. Rex starts a `rox PROJECT` session on the selected host with a **Provision** tab, which runs `rox up` there.
 3. The guest is registered as a Rex host. Its private socket exists only on the selected host, so from your own machine you reach the guest through that host's Rex terminals, unless the selected host puts guests on your tailnet. With [tailnet access](../tailnet/) configured on the selected host, your machine also adds the guest to its own Rex hosts by its tailnet name, so `rex -S WORKSPACE` works directly from where you launched. Remove such a guest with `rox down WORKSPACE --host HOST`, which also removes that host entry.
-4. When provisioning succeeds, a **Guest** tab opens a shell at the guest checkout, or in the guest home for a guest without a project. Any command after `--` runs in the guest's own Rex session. The Provision tab prints the command for inspecting that session from a terminal on the selected host.
+4. When provisioning succeeds, the Provision session closes. If it fails, the tab stays open so you can see why. When the guest is on the tailnet and the Rex app is open on your machine, Rox [opens the guest's own session](#working-in-the-guests-session) in the app. Otherwise it prints `rox shell NAME`. Any command after `--` runs in the guest's own Rex session.
 
 The selected host uses **its own** config, runtime images, project images, and SSH keys. Overrides such as `--config`, `--git-key`, and `--git-known-hosts` are paths on that host. Quote paths that start with `~` so the selected host expands them.
 
@@ -38,6 +38,18 @@ rox up container --host buildbox --no-project
 ```sh
 rox add rv-host-3f9a1c2b7d40 --host buildbox
 ```
+
+## Working in the guest's session
+
+A Rex pane belongs to the server whose session it's in, and a new split or tab runs on that same server. A shell you open into a guest from another session, such as `rox shell` in a tab on your machine, is one pane over SSH: splitting it opens a shell on your machine, not in the guest. To split and open tabs in the guest, work in the guest's own Rex session:
+
+```sh
+rox open rv-my-project-3f9a1c2b7d40
+```
+
+The Rex app shows one host at a time, and its host picker can't be driven by a command. So when the app isn't on the guest's host yet, `rox open` opens **Switch Host** and waits for you to choose the guest. If the guest isn't in the list, add it first with `rox add-remote-host NAME`. Once the app is on the guest, Rox selects the guest's project session. `rox up` and `rox add` with `--host` do this for you when they finish.
+
+Inside a guest shell, `REX_SESSION` points at the guest's session, so `rex split` and `rex run` there open in that session too.
 
 ## Working with guests on other hosts
 
