@@ -35,7 +35,7 @@ Rox reads `${XDG_CONFIG_HOME:-$HOME/.config}/rox/config.json` on the machine tha
 
 | Key | Type | Description |
 | --- | --- | --- |
-| `git_keys` | list of paths | SSH private keys loaded into the temporary Git agent. Manage them with `rox key`. `--git-key` overrides this list. |
+| `git_keys` | list of paths | SSH private keys loaded into the temporary Git agent. Manage them with `rox key`. `--git-key` overrides this list. Without it, Rox uses your default SSH keys in `~/.ssh`. |
 | `git_known_hosts` | path | Verified host keys for your Git servers. If you leave it out, Rox copies the matching entries from `~/.ssh/known_hosts`. |
 | `tailscale` | object | Put each guest's Rex server on your tailnet so other devices can reach it. See [Reaching guests from other devices](../../guides/tailnet/). |
 | `agents` | object | Install Claude Code (`claude`) and Codex (`codex`) in new guests, with their credentials. Set it up with `rox config agents`. See [Agent CLIs in guests](../../guides/agent-clis/). |

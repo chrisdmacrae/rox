@@ -18,7 +18,7 @@ These commands update `git_keys` in `${XDG_CONFIG_HOME:-$HOME/.config}/rox/confi
 
 Rox loads only the selected keys into a temporary SSH agent. That agent is forwarded to the guest only while Git clones, and it stops before the setup hook or any Rex terminal starts. **Private keys never leave the host.**
 
-- `git_keys` is a list of SSH private key paths on the launcher. Prefer read-only deploy keys. Repeat `--git-key PATH` to use a different list for one launch. Encrypted keys can prompt for their passphrase on the host.
+- `git_keys` is a list of SSH private key paths on the launcher. Prefer read-only deploy keys. Without `git_keys`, Rox uses your default SSH keys in `~/.ssh` (`id_ed25519`, `id_ecdsa`, `id_rsa` and their security-key variants), the ones `git clone` would use. Set `"git_keys": []` to clone with no key. Repeat `--git-key PATH` to use a different list for one launch. Encrypted keys can prompt for their passphrase on the host.
 - `git_known_hosts`, or `--git-known-hosts PATH`, supplies verified host keys for your Git servers. If you leave it out, Rox copies the matching host and port entries from the launcher's `~/.ssh/known_hosts`. The guest still verifies the server's key.
 
 ## Choosing the repository and branch

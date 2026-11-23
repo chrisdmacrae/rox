@@ -2171,12 +2171,32 @@ def require(tools):
             raise Error(f"Install {tool} and make it available on PATH")
 
 
+# The identities ssh tries when none is configured, in its own order.
+DEFAULT_SSH_KEYS = ("id_rsa", "id_ecdsa", "id_ecdsa_sk", "id_ed25519", "id_ed25519_sk")
+
+
+def default_git_keys(url):
+    """The launcher's default SSH identities, which git clone on the launcher would use too."""
+    keys = [path for name in DEFAULT_SSH_KEYS if (path := Path.home() / ".ssh" / name).is_file()]
+    if not keys:
+        print(f"rox: No Git SSH key is configured and ~/.ssh has none of ssh's default keys, so the guest "
+              f"probably can't clone {url}. Add a key with rox key add PATH, or clone over HTTPS with --repo",
+              file=sys.stderr, flush=True)
+        return []
+    names = ", ".join(f"~/.ssh/{path.name}" for path in keys)
+    print(f"Using your default SSH {'key' if len(keys) == 1 else 'keys'} {names} for Git. "
+          "Choose others with rox key add PATH", flush=True)
+    return keys
+
+
 def git_access(args, config, config_path, url):
     """Return the launcher's Git SSH keys and pinned server keys for cloning url."""
-    keys = args.git_key if args.git_key is not None else config.get("git_keys", [])
-    keys = validate_git_keys(keys, config_path)
+    keys = args.git_key if args.git_key is not None else config.get("git_keys")
     if urlsplit(url).scheme == "https":
+        validate_git_keys(keys or [], config_path)
         return [], ""
+    # Without configured keys, use the ones ssh would. An explicit empty list means no keys.
+    keys = default_git_keys(url) if keys is None else validate_git_keys(keys, config_path)
     keys = [configured_file(key) for key in keys]
     known_hosts_option = args.git_known_hosts or config.get("git_known_hosts")
     require((["ssh-agent", "ssh-add"] if keys else []) + ([] if known_hosts_option else ["ssh-keygen"]))

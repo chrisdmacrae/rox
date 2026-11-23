@@ -42,7 +42,8 @@ class WorkspaceTests(unittest.TestCase):
         # Keep the launcher's real config, keys and Git cache out of tests.
         state = patch.dict(os.environ, {"XDG_STATE_HOME": str(self.root / "state"),
                                         "XDG_CONFIG_HOME": str(self.root / "config-home"),
-                                        "XDG_CACHE_HOME": str(self.root / "cache-home")})
+                                        "XDG_CACHE_HOME": str(self.root / "cache-home"),
+                                        "HOME": str(self.root / "home")})
         state.start()
         self.addCleanup(state.stop)
         # Keep prompts out of tests run from a terminal.
@@ -2442,6 +2443,24 @@ class WorkspaceTests(unittest.TestCase):
             rox.main(["update-agents", "rv-fixture-000011112222", "--config", str(self.root / "none.json")])
         with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
             rox.main(["update-agents"])
+
+    def test_ssh_clones_fall_back_to_the_default_ssh_keys(self):
+        args = rox.argparse.Namespace(git_key=None, git_known_hosts="known")
+        url = "git@github.com:acme/app.git"
+        with patch.object(rox, "git_host_entries", return_value=""), patch.object(rox, "require"), \
+                contextlib.redirect_stderr(io.StringIO()) as warned:
+            self.assertEqual(rox.git_access(args, {}, "c", url)[0], [])
+        self.assertIn("the guest probably can't clone git@github.com:acme/app.git", warned.getvalue())
+        ssh = self.root / "home" / ".ssh"
+        ssh.mkdir(parents=True)
+        (ssh / "id_ed25519").write_text("key")
+        (ssh / "id_rsa").write_text("key")
+        with patch.object(rox, "git_host_entries", return_value=""), patch.object(rox, "require"), \
+                contextlib.redirect_stdout(io.StringIO()) as printed:
+            self.assertEqual(rox.git_access(args, {}, "c", url)[0], [ssh / "id_rsa", ssh / "id_ed25519"])
+            self.assertEqual(rox.git_access(args, {"git_keys": []}, "c", url)[0], [])
+            self.assertEqual(rox.git_access(args, {}, "c", "https://github.com/acme/app.git"), ([], ""))
+        self.assertIn("Using your default SSH keys ~/.ssh/id_rsa, ~/.ssh/id_ed25519 for Git", printed.getvalue())
 
     def test_config_agents_saves_private_credentials(self):
         config = self.root / "config" / "config.json"
