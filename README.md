@@ -76,7 +76,7 @@ rox up container --host buildbox
 rox up macos -S studio -- my-agent --model example
 ```
 
-Rex starts a session on the selected host with a **Provision** tab. It registers the guest as a Rex host, but its private socket exists only on that machine. To reach remote guests directly from your own devices, configure `tailscale` in the selected host's rox config (see [Reaching guests from other devices](#reaching-guests-from-other-devices)). Once provisioning succeeds, its **Guest** tab opens an interactive shell at the guest checkout. In Rex.app, find the `rox PROJECT` session under the selected host. Any command after `--` runs in the guest's own Rex session. The Provision tab prints the command for inspecting that session from a terminal on the selected host.
+Rex starts a session on the selected host with a **Provision** tab. It registers the guest as a Rex host, but its private socket exists only on that machine. To reach remote guests directly, configure `tailscale` in the selected host's rox config (see [Reaching guests from other devices](#reaching-guests-from-other-devices)). Your machine then also adds the guest to its own Rex hosts by its tailnet name, and `rox down NAME --host HOST` removes both. Once provisioning succeeds, its **Guest** tab opens an interactive shell at the guest checkout. In Rex.app, find the `rox PROJECT` session under the selected host. Any command after `--` runs in the guest's own Rex session. The Provision tab prints the command for inspecting that session from a terminal on the selected host.
 
 Rox resolves the source repository and branch from your current checkout before dispatching. The selected host uses its own config, runtime images, and SSH keys. Overrides such as `--config`, `--git-key`, and `--git-known-hosts` are paths on that host. Quote paths containing a leading `~` to have the selected host expand it.
 
@@ -207,7 +207,7 @@ rox up container --image ghcr.io/acme/agent-base:3 --memory 8G
 
 ## Reaching guests from other devices
 
-By default a guest's Rex server is reachable only on its launcher, through a Unix socket. To reach guests from any device, including the Rex app, add a `tailscale` section to the launcher's config. Rox then puts each guest's Rex server on your tailnet as its own device, named after the workspace, and registers that name as the host's second address.
+By default a guest's Rex server is reachable only on its launcher, through a Unix socket. To reach guests from any device, including the Rex app, add a `tailscale` section to the launcher's config. Rox then puts each guest's Rex server on your tailnet as its own device, named after the workspace, and registers that name as the host's second address. After `rox up --host`, the machine you launched from registers the guest by that name too. Other devices can reach it at the tailnet name.
 
 ```json
 { "tailscale": { "auth_key_file": "~/.config/rox/tailscale-authkey", "tags": ["tag:rox-guest"] } }

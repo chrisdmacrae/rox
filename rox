@@ -1016,6 +1016,14 @@ def enable_tailnet(guest, settings, timeout):
                         "Check that it's valid, reusable, and allowed to use the configured tags") from None
         raise
     guest.save()
+    # Rex serves the tailnet over HTTPS, and other devices are refused until Tailscale issues the
+    # node's certificate, which takes a few seconds after it joins.
+    try:
+        wait_for(lambda: tailnet_status(guest).get("https", {}).get("state") == "available",
+                 min(timeout, 90), "the guest's tailnet HTTPS certificate")
+    except Error:
+        print(f"rox: {guest.name} joined the tailnet, but its HTTPS certificate isn't ready yet. "
+              "Other devices can reach it once Tailscale issues one.", file=sys.stderr, flush=True)
     print(f"{guest.name} is on the tailnet at {guest.tailnet_name}", flush=True)
 
 
@@ -1049,8 +1057,8 @@ def leave_tailnet(guest):
 
 def register_guest(guest):
     if not guest.registered:
-        # Rex shares hosts with every device that follows your home. The socket works only on this
-        # machine; other devices skip it and use the tailnet name.
+        # The socket works only on this machine. Devices that share this Rex home skip it and use
+        # the tailnet name.
         endpoints = [guest.endpoint, *([guest.tailnet_name] if guest.tailnet_name else [])]
         run(["rex", "hosts", "add", guest.name, *endpoints])
         guest.registered = True
@@ -1138,7 +1146,7 @@ def dispatch(args, label, launch, command):
     for option in ("config", "image", "engine", "cpus", "memory", "git_known_hosts"):
         if (value := getattr(args, option, None)) is not None:
             launch.append(f"--{option.replace('_', '-')}={value}")
-    launch.extend(f"--git-key={key}" for key in args.git_key or [])
+    launch.extend(f"--git-key={key}" for key in getattr(args, "git_key", None) or [])
     for flag in ("no_hook", "no_prebuild", "rebuild", "no_app_host", "no_tailscale"):
         if getattr(args, flag, False):
             launch.append(f"--{flag.replace('_', '-')}")
@@ -1159,6 +1167,38 @@ def dispatch(args, label, launch, command):
         print(capture.stdout.rstrip())
     if status.returncode:
         raise Error(f"Provisioning exited with status {status.returncode}. See the Provision tab in {session} on {args.host}.")
+    return capture.stdout if capture.returncode == 0 else ""
+
+
+def register_remote_guest(provision_output, launcher):
+    """Add a guest launched on another host to this machine's Rex hosts, by its tailnet name.
+
+    Each Rex home keeps its own host list, so the launcher's entry may not reach this machine.
+    """
+    workspace = re.search(rf"^Workspace\s+({NAME_PATTERN})\s*$", provision_output, re.MULTILINE)
+    tailnet = re.search(r"^Tailnet\s+([a-z0-9-]+(?:\.[a-z0-9-]+)+)\s*$", provision_output, re.MULTILINE)
+    if not workspace:
+        return
+    if not tailnet:
+        print(f"{workspace[1]} is reachable only on {launcher}, because it isn't on the tailnet. "
+              f"Configure tailscale in the rox config on {launcher} to reach guests from here.", flush=True)
+        return
+    result = run(["rex", "hosts", "add", workspace[1], tailnet[1]], capture=True, check=False)
+    if result.returncode:
+        print(f"rox: Could not add {workspace[1]} to this machine's Rex hosts. Use rex -S {tailnet[1]} instead. "
+              f"({result.stderr.strip()})", file=sys.stderr, flush=True)
+        return
+    print(f"Registered Rex host {workspace[1]} on this machine at {tailnet[1]}", flush=True)
+
+
+def down_remote(args):
+    """Remove a guest on a Rex remote host, and this machine's host entry for it."""
+    if not args.name or not re.fullmatch(NAME_PATTERN, args.name):
+        raise Error("Name the workspace to remove on another host: rox down NAME --host HOST")
+    dispatch(args, args.name, ["down", args.name], [])
+    result = run(["rex", "hosts", "remove", args.name], capture=True, check=False)
+    if result.returncode not in (0, 3):
+        raise Error(f"Removed {args.name} on {args.host}, but could not remove its Rex host on this machine")
 
 
 def open_app_shell(session, name, project_id=None):
@@ -1248,9 +1288,10 @@ def up(args, command):
         raise Error("--host needs a Rex host label or address")
     source = resolve_project(args)
     if args.host is not None:
-        dispatch(args, source[0] if source else "host",
-                 ["up", *([args.backend] if args.backend else []), *project_options(source), f"--boot-timeout={args.boot_timeout}",
-                  "--open-shell"], command)
+        provisioned = dispatch(args, source[0] if source else "host",
+                               ["up", *([args.backend] if args.backend else []), *project_options(source),
+                                f"--boot-timeout={args.boot_timeout}", "--open-shell"], command)
+        register_remote_guest(provisioned, args.host)
         return
     if not source:
         print("Starting a guest without a project. Add one later with rox add NAME.", flush=True)
@@ -1704,6 +1745,7 @@ def main(argv):
     stop.add_argument("name", nargs="?",
                       help="workspace to remove; omit to pick from the current project's workspaces")
     stop.add_argument("--cwd", type=Path, default=Path.cwd(), help="directory within the project")
+    stop.add_argument("-S", "--host", help="remove a guest that runs on this Rex remote host")
     key = commands.add_parser("key", help="manage configured Git SSH key paths")
     key_commands = key.add_subparsers(dest="key_command", required=True)
     for action, help_text in (("add", "save a Git SSH key path"), ("remove", "forget a Git SSH key path")):
@@ -1745,7 +1787,10 @@ def main(argv):
             parser.error("choose --agent or --dir, not both")
         install_skill(args.agent, args.dir, args.force)
     else:
-        down(args.name or choose_project_guest(args.cwd))
+        if args.host is not None:
+            down_remote(args)
+        else:
+            down(args.name or choose_project_guest(args.cwd))
 
 
 if __name__ == "__main__":

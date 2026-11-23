@@ -155,7 +155,7 @@ class WorkspaceTests(unittest.TestCase):
         self.assertFalse(rox.state_root().exists())
 
     def test_explicit_project_can_launch_without_a_checkout(self):
-        with patch.object(rox, "dispatch") as launch:
+        with patch.object(rox, "dispatch", return_value="") as launch:
             rox.main([
                 "up", "linux", "-S", "buildbox", "--cwd", str(self.root / "missing"),
                 "--project", "fixture", "--repo", "https://git.example.test/repo.git", "--branch", "main",
@@ -721,7 +721,7 @@ class WorkspaceTests(unittest.TestCase):
 
     def test_remote_launch_forwards_resources_and_lets_the_launcher_pick_the_backend(self):
         cwd = self.make_repo()
-        with patch.object(rox, "dispatch") as dispatch:
+        with patch.object(rox, "dispatch", return_value="") as dispatch:
             rox.main(["up", "--host", "builder", "--cpus", "4", "--memory", "8G", "--cwd", str(cwd)])
         launch = dispatch.call_args.args[2]
         self.assertEqual(launch[0], "up")
@@ -1309,14 +1309,17 @@ class WorkspaceTests(unittest.TestCase):
     def test_tailnet_enrollment_sends_the_key_on_stdin_and_registers_both_endpoints(self):
         guest = self.tailnet_guest()
         settings = {"key": self.auth_key(), "tags": ["tag:rox-guest"], "control_url": ""}
-        # Tailscale reports needs_login briefly while it processes the key.
-        calls, states = [], iter(["starting", "needs_login", "running"])
+        # Tailscale reports needs_login briefly while it processes the key, then issues the certificate.
+        calls = []
+        states = iter([("starting", "pending"), ("needs_login", "pending"), ("running", "pending"),
+                       ("running", "pending"), ("running", "available")])
 
         def fake_output(argv, **kwargs):
             calls.append((argv, kwargs.get("input")))
             if "status" in argv:
-                state = next(states)
-                return json.dumps({"tailscale": {"state": state, "dns_name": "rv-fixture-000011112222.tail.ts.net."}})
+                state, https = next(states)
+                return json.dumps({"tailscale": {"state": state, "https": {"state": https},
+                                                 "dns_name": "rv-fixture-000011112222.tail.ts.net."}})
             return "{}"
 
         commands = []
@@ -1337,6 +1340,7 @@ class WorkspaceTests(unittest.TestCase):
         self.assertIn("--allow-tailnet-members", remote)
         self.assertEqual(remote[-2:], ["--auth-key-file", "-"])
         self.assertEqual(guest.tailnet_name, "rv-fixture-000011112222.tail.ts.net")
+        self.assertEqual(sum("status" in argv for argv, _ in calls), 5)
         self.assertEqual(commands, [["rex", "hosts", "add", guest.name, guest.endpoint, guest.tailnet_name]])
 
     def test_untagged_nodes_stay_owner_only_and_a_rejected_key_fails_clearly(self):
@@ -1360,6 +1364,59 @@ class WorkspaceTests(unittest.TestCase):
             with self.assertRaisesRegex(rox.Error, "auth key was rejected"):
                 rox.enable_tailnet(guest, settings, 30)
         self.assertNotIn("--allow-tailnet-members", shlex.split(calls[0][-1]))
+
+    def test_remote_launch_registers_the_guest_here_by_its_tailnet_name(self):
+        provisioned = ("Starting rv-host-000011112222\nWorkspace  rv-host-000011112222\n"
+                       "Tailnet    rv-host-000011112222.tail1234.ts.net\nSession    session:1\n")
+        commands = []
+        with (
+            patch.object(rox, "dispatch", return_value=provisioned),
+            patch.object(rox, "run", side_effect=lambda argv, **kwargs: commands.append(argv) or
+                         subprocess.CompletedProcess(argv, 0, "", "")),
+            contextlib.redirect_stdout(io.StringIO()) as printed,
+        ):
+            rox.main(["up", "container", "--no-project", "--host", "mini"])
+        self.assertEqual(commands, [["rex", "hosts", "add", "rv-host-000011112222",
+                                     "rv-host-000011112222.tail1234.ts.net"]])
+        self.assertIn("on this machine at rv-host-000011112222.tail1234.ts.net", printed.getvalue())
+
+    def test_remote_launch_without_a_tailnet_says_the_guest_stays_on_the_launcher(self):
+        with (
+            patch.object(rox, "dispatch", return_value="Workspace  rv-host-000011112222\n"),
+            patch.object(rox, "run") as command,
+            contextlib.redirect_stdout(io.StringIO()) as printed,
+        ):
+            rox.main(["up", "container", "--no-project", "--host", "mini"])
+        command.assert_not_called()
+        self.assertIn("reachable only on mini", printed.getvalue())
+
+    def test_down_on_a_remote_host_removes_the_guest_there_and_its_host_here(self):
+        commands = []
+        with (
+            patch.object(rox, "dispatch", return_value="Removed rv-host-000011112222\n") as dispatch,
+            patch.object(rox, "run", side_effect=lambda argv, **kwargs: commands.append(argv) or
+                         subprocess.CompletedProcess(argv, 3, "", "")),
+        ):
+            rox.main(["down", "rv-host-000011112222", "--host", "mini"])
+        self.assertEqual(dispatch.call_args.args[2], ["down", "rv-host-000011112222"])
+        self.assertEqual(commands, [["rex", "hosts", "remove", "rv-host-000011112222"]])
+        with self.assertRaisesRegex(rox.Error, "Name the workspace"):
+            rox.main(["down", "--host", "mini"])
+
+    def test_down_on_a_remote_host_dispatches_only_the_down_command(self):
+        requests = []
+
+        def fake_output(argv, **kwargs):
+            requests.append(argv)
+            return json.dumps({"session_id": "session:down", "initial_windows": [{"block_ids": ["block:down"]}]})
+
+        with (
+            patch.object(rox, "output", side_effect=fake_output),
+            patch.object(rox, "run", side_effect=lambda argv, **kwargs: subprocess.CompletedProcess(argv, 0, "", "")),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            rox.main(["down", "rv-host-000011112222", "-S", "mini"])
+        self.assertEqual(requests[0][requests[0].index("--") + 1:], [*rox.REMOTE_ROX, "down", "rv-host-000011112222"])
 
     def test_down_signs_the_guest_out_of_the_tailnet(self):
         guest = self.tailnet_guest()

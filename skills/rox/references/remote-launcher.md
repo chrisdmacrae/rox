@@ -6,7 +6,7 @@ Use these commands from a controller that can reach the launcher in Rex. The lau
 
 Run `rex hosts list` to find the launcher label and `rex --autostart=false -S "$launcher" ls --json` to check it. Launch from the source checkout with `rox up BACKEND --host "$launcher" --cwd "$project_dir"`. Machine-specific paths in `--config`, `--git-key`, and `--git-known-hosts` are interpreted on the launcher. The controller's checkout supplies the clone URL and branch.
 
-Save the launcher session ID from the `Provisioning` line. Save the workspace name, guest checkout path, and guest session ID after setup. If the launch printed a `Tailnet` line, the guest's Rex server is on the tailnet and a controller-local `rex -S "$workspace"` reaches it directly. Use the guest commands from the main skill as written. Otherwise the guest's socket exists only on the launcher, so run guest commands from a Rex terminal on the launcher, or dispatch them there with an outer Rex command as below.
+Save the launcher session ID from the `Provisioning` line. Save the workspace name, guest checkout path, and guest session ID after setup. If the launch printed a `Tailnet` line, the guest's Rex server is on the tailnet and rox registered it on the controller, so a controller-local `rex -S "$workspace"` reaches it directly. Remove it later with `rox down "$workspace" --host "$launcher"`. Use the guest commands from the main skill as written. Otherwise the guest's socket exists only on the launcher, so run guest commands from a Rex terminal on the launcher, or dispatch them there with an outer Rex command as below.
 
 ## Dispatch from the controller
 

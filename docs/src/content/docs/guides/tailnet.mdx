@@ -7,10 +7,13 @@ import { Aside, Steps } from '@astrojs/starlight/components';
 
 By default, a guest's Rex server is reachable only on its launcher. Rox forwards it over SSH to a Unix socket such as `/tmp/rox-501/ID/rex.sock`, and a socket path means nothing on another machine. This matters most when you [launch on a remote host](../remote-hosts/): the guest runs on the launcher, but you work from a different device.
 
-With Tailscale configured on the launcher, Rox also puts each guest's Rex server on your tailnet as its own device, named after the workspace. The guest's Rex host then works from every device that follows your Rex home, including the Rex app:
+With Tailscale configured on the launcher, Rox also puts each guest's Rex server on your tailnet as its own device, named after the workspace. Any of your devices can then reach the guest by its tailnet name, and the machine you launched from can also use the workspace name:
 
 ```sh
-rex -S rv-my-project-3f9a1c2b7d40 ls      # from a laptop, while the guest runs on the Mac mini
+# On the laptop that ran rox up --host mini, while the guest runs on the Mac mini:
+rex -S rv-my-project-3f9a1c2b7d40 ls
+# On any other device on your tailnet:
+rex -S rv-my-project-3f9a1c2b7d40.tail1234.ts.net ls
 ```
 
 Rex runs the tailnet node inside the guest's Rex server. Nothing needs to be installed in the guest, and the guest's own network is unchanged.
@@ -60,13 +63,13 @@ Auth keys expire, after 90 days at most. When one does, launches stop with a mes
 
 ## What changes
 
-- **Launch.** After the guest's Rex server starts, Rox enrolls it on the tailnet with the key and waits for it to come up. It prints the tailnet name, for example `Tailnet  rv-my-project-3f9a1c2b7d40.tail1234.ts.net`. Rox sends the key to the guest's Rex server over SSH, on stdin, so it never appears in a process list. Rex uses it only to enroll the device. Enrollment happens before your setup hook and agent runner start.
-- **Host entry.** The Rex host lists two addresses, the launcher's socket first and the tailnet name second. The launcher uses the socket, and other devices skip it and use the tailnet name.
+- **Launch.** After the guest's Rex server starts, Rox enrolls it on the tailnet with the key and waits for it to come up and for Tailscale to issue its HTTPS certificate, which takes a few seconds. It prints the tailnet name, for example `Tailnet  rv-my-project-3f9a1c2b7d40.tail1234.ts.net`. Rox sends the key to the guest's Rex server over SSH, on stdin, so it never appears in a process list. Rex uses it only to enroll the device. Enrollment happens before your setup hook and agent runner start.
+- **Host entries.** On the launcher, the Rex host lists two addresses, the socket first and the tailnet name second. After `rox up --host`, the machine you launched from also adds the guest to its own Rex hosts at the tailnet name, so `rex -S WORKSPACE` works there too. Each Rex home keeps its own host list, so a host added on one machine only reaches another when both follow the same home. On any other device, use the tailnet name, or add it with `rex hosts add WORKSPACE TAILNET_NAME`.
 - **Who can connect.** A tagged guest belongs to its tag, not to you, so Rox lets the tailnet decide who may connect, and the grant above admits your tailnet's members. Without `tags`, the guest belongs to whoever created the key, Rex admits only that person, and the guest gets that person's ACL access. That's why you should use a tag.
 - **Rex app.** When `rox up` offers to add the guest to the Rex app, it copies the tailnet name, which works from the app on any device.
 - **Dev servers.** From any device, `rex -S WORKSPACE forward open BLOCK` forwards a server running in a guest terminal. `rox forward` still works on the launcher.
 - **Reconnect.** `rox reconnect` and `rox add` turn tailnet serving back on if the guest's Rex server restarted, and use the key again if Tailscale removed the ephemeral device.
-- **Removal.** `rox down` signs the guest's device out of the tailnet before deleting the guest.
+- **Removal.** `rox down` signs the guest's device out of the tailnet before deleting the guest. For a guest you launched with `--host`, run `rox down WORKSPACE --host LAUNCHER` from the machine you launched from. It removes the guest on the launcher and the host entry on your machine.
 
 Pass `--no-tailscale` to `rox up` to keep a single guest off the tailnet. A project's `.rox.json` can't turn this on or off. Only the launcher's config controls it.
 

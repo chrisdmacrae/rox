@@ -78,6 +78,7 @@ Delete the guest, its filesystem, all of its project checkouts, and its Rex host
 | Option | Description |
 | --- | --- |
 | `--cwd DIR` | Directory inside the project, used when you leave out `NAME`. |
+| `-S`, `--host HOST` | Remove a guest that runs on this [Rex remote host](../../guides/remote-hosts/), and this machine's Rex host entry for it. `NAME` is required. |
 
 ## `rox key add PATH` / `rox key remove PATH`
 
