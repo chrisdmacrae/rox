@@ -20,6 +20,8 @@ description: What rox does during a launch, how Rex connects, and where state li
 
 Rex connects to the guest over a private Unix socket forwarded through SSH, at `/tmp/rox-UID/ID/rex.sock` on the launcher. If socket forwarding fails, Rox falls back to a relay that carries each connection over its own authenticated SSH session. Docker and Podman containers publish only their SSH port, and only to `127.0.0.1`. Apple's containers publish no ports. Their SSH server is reachable only on the Mac's private container network.
 
+When the launcher config has `tailscale`, the guest's Rex server also serves over the tailnet as its own device, and the Rex host lists the tailnet name after the socket. Other devices reach the guest that way. See [Reaching guests from other devices](../../guides/tailnet/).
+
 `rox forward` uses the same SSH login to tunnel launcher ports to the guest's `localhost`. The container's SSH server allows only these launcher-to-guest tunnels. It refuses tunnels from the guest back to the launcher, and binds nothing on the guest's network interfaces.
 
 ## Where things live

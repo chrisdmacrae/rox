@@ -93,6 +93,7 @@ Some settings describe the launch machine rather than the project, so they belon
 | `engine` | Which container tool is installed varies by machine. |
 | `user`, `identity`, `host_key` | They're the launcher's SSH login and the pinned host key for its Tart templates. |
 | `git_keys`, `git_known_hosts` | They're the launcher's private keys and trusted Git servers. |
+| `tailscale` | It holds the launcher's Tailscale auth key and decides whether guests join your tailnet. |
 
 Rox stops with an error if `.rox.json` sets any of these, or any key it doesn't recognize, so a typo can't be silently ignored. The file can't point Rox at files on your machine or change which keys it uses.
 

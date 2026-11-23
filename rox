@@ -32,7 +32,7 @@ NAME_PATTERN = r"rv-[a-z0-9-]{1,24}-[a-f0-9]{12}"
 PROJECT_CONFIG = ".rox.json"
 PROJECT_KEYS = {backend: {"image", "cpus", "memory", "prebuild"} for backend in BACKENDS}
 # These describe the launch machine, so only its own rox config may set them.
-LAUNCHER_KEYS = {"engine", "user", "identity", "host_key", "git_keys", "git_known_hosts"}
+LAUNCHER_KEYS = {"engine", "user", "identity", "host_key", "git_keys", "git_known_hosts", "tailscale"}
 
 
 class Error(Exception):
@@ -112,6 +112,8 @@ class Guest:
     # The guest's own session, used when it was started without a project.
     session_id: str = ""
     registered: bool = False
+    # The guest's Rex server also serves over the tailnet at this name, so other devices can reach it.
+    tailnet_name: str = ""
     phase: str = "starting"
     container_id: str = ""
     # Resource limits for Apple's container, which gives each VM 4 CPUs and 1 GB by default.
@@ -931,20 +933,125 @@ def attach_guest(guest, session_id=""):
         output([*rex_on(guest), "session", "inspect", session_id, "--json"], timeout=8)
 
 
-def connect(guest):
+def connect(guest, tailnet=None):
     """Find the running guest's SSH address, make sure its Rex server runs, and attach to it."""
     guest.address, guest.port = container_address(guest) if guest.engine else vm_address(guest)
     guest.save()
     guest_stage(guest, "server", guest.guest_socket)
     attach_guest(guest)
+    if guest.tailnet_name:
+        resume_tailnet(guest, tailnet)
+
+
+def tailscale_settings(config, config_path, disabled):
+    """Return the launcher's tailnet settings for guests, or None to keep guests off the tailnet."""
+    settings = config.get("tailscale")
+    if settings is None or disabled:
+        return None
+    if not isinstance(settings, dict):
+        raise Error(f"Expected an object for tailscale in {config_path}")
+    unknown = set(settings) - {"auth_key_file", "tags", "control_url"}
+    if unknown:
+        raise Error(f"Unknown tailscale setting {sorted(unknown)[0]} in {config_path}. "
+                    "Use auth_key_file, tags and control_url")
+    key = configured_file(settings.get("auth_key_file"))
+    if not key:
+        raise Error(f"Set tailscale.auth_key_file in {config_path} to a file holding a Tailscale auth key")
+    if key.stat().st_mode & 0o077:
+        raise Error(f"{key} holds a Tailscale auth key, so only you may read it. Run chmod 600 {key}")
+    tags = settings.get("tags", [])
+    if not isinstance(tags, list) or any(not isinstance(tag, str) or not re.fullmatch(r"tag:[a-z0-9-]+", tag)
+                                         for tag in tags):
+        raise Error(f"Expected a list of tags such as [\"tag:rox-guest\"] for tailscale.tags in {config_path}")
+    control_url = settings.get("control_url", "")
+    if not isinstance(control_url, str) or (control_url and not control_url.startswith("https://")):
+        raise Error(f"Expected an https:// URL for tailscale.control_url in {config_path}")
+    return {"key": key, "tags": tags, "control_url": control_url}
+
+
+def guest_rex(guest, *args):
+    """A rex command for the guest's own server, with the same login PATH as the guest bootstrap."""
+    return ["sh", "-c", 'export PATH="$HOME/.local/bin:/usr/local/bin:/opt/homebrew/bin:$PATH"; exec "$@"',
+            "rox", "rex", "--autostart=false", "-S", f"unix://{guest.guest_socket}", *args]
+
+
+def tailscale_on(guest, tags=(), control_url="", auth_key=None):
+    """Turn on the guest server's tailnet node. The auth key goes over SSH on stdin, never in argv."""
+    argv = guest_rex(guest, "server", "tailscale", "on", "--hostname", guest.name, "--json")
+    for tag in tags:
+        argv += ["--advertise-tag", tag]
+    if tags:
+        # A tagged node belongs to its tags rather than a person, so the tailnet ACLs decide who may connect.
+        argv.append("--allow-tailnet-members")
+    if control_url:
+        argv += ["--control-url", control_url]
+    if auth_key is not None:
+        argv += ["--auth-key-file", "-"]
+    output(remote_command(guest, argv), input=auth_key or "", timeout=30)
+
+
+def tailnet_status(guest):
+    status = json.loads(output([*rex_on(guest), "server", "status", "--json"], timeout=8))
+    return status.get("tailscale") or {}
+
+
+def enable_tailnet(guest, settings, timeout):
+    print(f"Adding {guest.name} to the tailnet", flush=True)
+    tailscale_on(guest, settings["tags"], settings["control_url"], settings["key"].read_text().strip())
+
+    def settled():
+        state = tailnet_status(guest)
+        return state if state.get("state") in ("running", "needs_login") else None
+
+    state = wait_for(settled, timeout, "the guest to join the tailnet")
+    if state["state"] == "needs_login" or not state.get("dns_name"):
+        raise Error("Tailscale asked for a browser sign-in, so the auth key was rejected. "
+                    "Check that it's valid, reusable, and allowed to use the configured tags")
+    guest.tailnet_name = state["dns_name"].rstrip(".")
+    guest.save()
+    print(f"{guest.name} is on the tailnet at {guest.tailnet_name}", flush=True)
+
+
+def resume_tailnet(guest, settings=None):
+    """Serve over the tailnet again after a server restart.
+
+    The saved node identity usually needs no key, but Tailscale deletes an ephemeral node that
+    stays offline, so send the configured key too when there is one.
+    """
+    try:
+        if tailnet_status(guest).get("state") != "running":
+            key = settings["key"].read_text().strip() if settings else None
+            tags, control_url = (settings["tags"], settings["control_url"]) if settings else ((), "")
+            tailscale_on(guest, tags, control_url, key)
+            wait_for(lambda: tailnet_status(guest).get("state") == "running", 30, "the guest to rejoin the tailnet")
+    except (Error, ValueError, subprocess.SubprocessError) as error:
+        print(f"rox: {guest.name} could not rejoin the tailnet, so only this machine can reach it. ({error})",
+              file=sys.stderr, flush=True)
+
+
+def leave_tailnet(guest):
+    """Sign the guest's node out so it doesn't linger on the tailnet after the guest is gone."""
+    if guest.tailnet_name and guest.guest_socket:
+        try:
+            run(remote_command(guest, guest_rex(guest, "server", "tailscale", "logout")),
+                capture=True, check=False, timeout=20)
+        except subprocess.TimeoutExpired:
+            print(f"rox: Could not sign {guest.name} out of the tailnet. Remove it in the Tailscale admin "
+                  "console if it's still listed.", file=sys.stderr, flush=True)
 
 
 def register_guest(guest):
     if not guest.registered:
-        run(["rex", "hosts", "add", guest.name, guest.endpoint])
+        # Rex shares hosts with every device that follows your home. The socket works only on this
+        # machine; other devices skip it and use the tailnet name.
+        endpoints = [guest.endpoint, *([guest.tailnet_name] if guest.tailnet_name else [])]
+        run(["rex", "hosts", "add", guest.name, *endpoints])
         guest.registered = True
         guest.save()
-        print(f"Registered Rex host {guest.name} at {guest.endpoint}", flush=True)
+        print(f"Registered Rex host {guest.name} at {', '.join(endpoints)}", flush=True)
+        if not guest.tailnet_name:
+            print(f"Only this machine can reach {guest.name}. Configure tailscale in the rox config "
+                  "to reach guests from other devices.", flush=True)
 
 
 def local_app_client():
@@ -979,17 +1086,21 @@ def offer_app_host(guest):
         return
     if answer not in ("", "y", "yes"):
         return
-    run(["pbcopy"], input=guest.endpoint)
+    # A tailnet name works from the app on any device. The socket works only here.
+    address = guest.tailnet_name or guest.endpoint
+    run(["pbcopy"], input=address)
     result = run(["rex", "--autostart=false", "-C", client, "do", "client.host.add"],
                  check=False, capture=True, timeout=8)
     if result.returncode:
-        print(f"Could not open Add Remote Host. Add {guest.endpoint} in the Rex app.", file=sys.stderr)
+        print(f"Could not open Add Remote Host. Add {address} in the Rex app.", file=sys.stderr)
         return
-    print(f"Copied {guest.endpoint}. Paste it into Add Remote Host in the Rex app.", flush=True)
+    print(f"Copied {address}. Paste it into Add Remote Host in the Rex app.", flush=True)
 
 
 def describe_guest(guest, project=None):
     print(f"Workspace  {guest.name}")
+    if guest.tailnet_name:
+        print(f"Tailnet    {guest.tailnet_name}")
     target = guest.name if guest.registered else guest.endpoint
     if project:
         print(f"Project    {project.id}")
@@ -1009,15 +1120,19 @@ def project_options(project):
     return [f"--project={name}", f"--repo={url}", f"--branch={branch}"]
 
 
+# Rex starts remote commands with its own PATH, which may lack the release install's ~/.local/bin.
+REMOTE_ROX = ["sh", "-c", 'PATH="$HOME/.local/bin:/usr/local/bin:/opt/homebrew/bin:$PATH"; exec rox "$@"', "rox"]
+
+
 def dispatch(args, label, launch, command):
     """Run a rox command on a Rex remote host in a Provision tab and wait for it."""
     rex = ["rex", "--autostart=false", "-S", args.host]
-    launch = ["rox", *launch]
+    launch = [*REMOTE_ROX, *launch]
     for option in ("config", "image", "engine", "cpus", "memory", "git_known_hosts"):
         if (value := getattr(args, option, None)) is not None:
             launch.append(f"--{option.replace('_', '-')}={value}")
     launch.extend(f"--git-key={key}" for key in args.git_key or [])
-    for flag in ("no_hook", "no_prebuild", "rebuild", "no_app_host"):
+    for flag in ("no_hook", "no_prebuild", "rebuild", "no_app_host", "no_tailscale"):
         if getattr(args, flag, False):
             launch.append(f"--{flag.replace('_', '-')}")
     if command:
@@ -1135,6 +1250,7 @@ def up(args, command):
     app_session = app_session_for(args)
     config_path, config = load_config(args)
     keys, known_hosts = git_access(args, config, config_path, source[1]) if source else ([], "")
+    tailnet = tailscale_settings(config, config_path, args.no_tailscale)
     fetched = None
     if source:
         require(["git"])
@@ -1232,6 +1348,8 @@ def up(args, command):
             guest.save()
             guest_stage(guest, "server", guest.guest_socket)
             attach_guest(guest)
+            if tailnet:
+                enable_tailnet(guest, tailnet, args.boot_timeout)
             register_guest(guest)
             if not source:
                 guest.session_id = start_session(guest, guest.name, guest.home, command)
@@ -1280,7 +1398,7 @@ def add(args, command):
         guest = Guest.load(args.name)
         if guest.phase != "ready" or not guest.guest_socket:
             raise Error(f"{guest.name} is {guest.phase}. Run rox reconnect {guest.name} before adding a project")
-        connect(guest)
+        connect(guest, tailscale_settings(config, config_path, False) if guest.tailnet_name else None)
         register_guest(guest)
         project = provision_project(guest, source, command, keys, known_hosts, args.no_hook)
         describe_guest(guest, project)
@@ -1316,7 +1434,9 @@ def reconnect(name, app_host=True):
         if not guest.guest_socket or guest.phase == "removing":
             raise Error(f"{name} did not get far enough to start a Rex server")
         close_tunnel(guest)
-        connect(guest)
+        config_path = config_location(None)
+        config = config_for(config_path)
+        connect(guest, tailscale_settings(config, config_path, False) if guest.tailnet_name else None)
         register_guest(guest)
         guest.phase = "ready"
         guest.save()
@@ -1378,6 +1498,7 @@ def down(name):
         guest = Guest.load(name)
         guest.phase = "removing"
         guest.save()
+        leave_tailnet(guest)
         close_tunnel(guest)
         if guest.engine == "container":
             result = run(["container", "delete", "--force", name], capture=True, check=False)
@@ -1559,6 +1680,8 @@ def main(argv):
                        help="clone and run .rox.sh at boot instead of using a project image")
     start.add_argument("--rebuild", action="store_true", help="rebuild the project image before launching")
     start.add_argument("--no-app-host", action="store_true", help=APP_HOST_HELP)
+    start.add_argument("--no-tailscale", action="store_true",
+                       help="keep this guest off the tailnet even when tailscale is configured")
     commands.add_parser("ls", help="list managed workspaces")
     shell_parser = commands.add_parser("shell", help="open an interactive guest shell")
     shell_parser.add_argument("name")

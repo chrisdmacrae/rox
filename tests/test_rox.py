@@ -141,7 +141,7 @@ class WorkspaceTests(unittest.TestCase):
             ])
         self.assertEqual(requests, [
             [*rex, "new", "--window", "Provision", "--keep-open", "--json",
-             "rox sample project", "--", "rox", "up", "container",
+             "rox sample project", "--", *rox.REMOTE_ROX, "up", "container",
              "--project=sample project", "--repo=git@git.example.test:fork/repo.git",
              "--branch=published-feature", "--boot-timeout=60", "--open-shell",
              "--config=~/Rex Config/rox.json", "--image=custom:latest", "--engine=podman",
@@ -1194,12 +1194,12 @@ class WorkspaceTests(unittest.TestCase):
             rox.main(["up", "linux", "-S", "buildbox", "--cwd", str(self.root)])
         launch = requests[0]
         self.assertEqual(launch[launch.index("rox sample project"):], [
-            "rox sample project", "--", "rox", "add", "rv-host-000011112222", "--project=sample project",
+            "rox sample project", "--", *rox.REMOTE_ROX, "add", "rv-host-000011112222", "--project=sample project",
             "--repo=git@git.example.test:fork/repo.git", "--branch=published-feature", "--open-shell",
             "--git-key=~/.ssh/deploy", "--", "agent",
         ])
-        self.assertEqual(requests[3][requests[3].index("--") + 1:][:5],
-                         ["rox", "up", "linux", "--no-project", "--boot-timeout=120"])
+        self.assertEqual(requests[3][requests[3].index("--") + 1:][:8],
+                         [*rox.REMOTE_ROX, "up", "linux", "--no-project", "--boot-timeout=120"])
 
     def test_shell_opens_the_only_project_a_named_one_or_the_guest_home(self):
         guest = rox.Guest("rv-host-000011112222", "container", "image", "workspace", phase="ready",
@@ -1272,6 +1272,107 @@ class WorkspaceTests(unittest.TestCase):
                                      "CODEX_HOME": str(self.root / "none-b")}):
             with self.assertRaisesRegex(rox.Error, "Found no Claude Code or Codex folder"):
                 rox.main(["skill", "install"])
+
+    def tailnet_guest(self):
+        guest = rox.Guest("rv-fixture-000011112222", "container", "rox:linux", "workspace", engine="container",
+                          identity=str(self.root / "login"), address="192.168.64.9",
+                          guest_socket="/home/workspace/.rox/rv-fixture-000011112222/r.sock")
+        guest.directory.mkdir(parents=True, mode=0o700)
+        return guest
+
+    def auth_key(self, mode=0o600):
+        key = self.root / "ts-authkey"
+        key.write_text("tskey-auth-secret\n")
+        key.chmod(mode)
+        return key
+
+    def test_tailscale_settings_are_validated(self):
+        config_path = self.root / "config.json"
+        self.assertIsNone(rox.tailscale_settings({}, config_path, False))
+        key = self.auth_key()
+        settings = {"tailscale": {"auth_key_file": str(key), "tags": ["tag:rox-guest"]}}
+        self.assertIsNone(rox.tailscale_settings(settings, config_path, True))
+        self.assertEqual(rox.tailscale_settings(settings, config_path, False),
+                         {"key": key, "tags": ["tag:rox-guest"], "control_url": ""})
+        for tailscale, message in (
+            ({}, "auth_key_file"),
+            ({"auth_key_file": str(key), "tags": ["rox-guest"]}, "list of tags"),
+            ({"auth_key_file": str(key), "control_url": "http://hs.test"}, "https:// URL"),
+            ({"auth_key_file": str(key), "authkey": "x"}, "Unknown tailscale setting authkey"),
+        ):
+            with self.subTest(tailscale=tailscale), self.assertRaisesRegex(rox.Error, message):
+                rox.tailscale_settings({"tailscale": tailscale}, config_path, False)
+        key.chmod(0o644)
+        with self.assertRaisesRegex(rox.Error, "chmod 600"):
+            rox.tailscale_settings(settings, config_path, False)
+
+    def test_tailnet_enrollment_sends_the_key_on_stdin_and_registers_both_endpoints(self):
+        guest = self.tailnet_guest()
+        settings = {"key": self.auth_key(), "tags": ["tag:rox-guest"], "control_url": ""}
+        calls, states = [], iter(["starting", "running"])
+
+        def fake_output(argv, **kwargs):
+            calls.append((argv, kwargs.get("input")))
+            if "status" in argv:
+                state = next(states)
+                return json.dumps({"tailscale": {"state": state, "dns_name": "rv-fixture-000011112222.tail.ts.net."}})
+            return "{}"
+
+        commands = []
+        with (
+            patch.object(rox, "output", side_effect=fake_output),
+            patch.object(rox, "run", side_effect=lambda argv, **kwargs: commands.append(argv)),
+            patch.object(rox.time, "sleep"),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            rox.enable_tailnet(guest, settings, 10)
+            rox.register_guest(guest)
+        on_argv, key_input = calls[0]
+        remote = shlex.split(on_argv[-1])
+        self.assertEqual(key_input, "tskey-auth-secret")
+        self.assertFalse(any("tskey" in arg for arg in on_argv))
+        self.assertEqual(remote[remote.index("--hostname") + 1], guest.name)
+        self.assertEqual(remote[remote.index("--advertise-tag") + 1], "tag:rox-guest")
+        self.assertIn("--allow-tailnet-members", remote)
+        self.assertEqual(remote[-2:], ["--auth-key-file", "-"])
+        self.assertEqual(guest.tailnet_name, "rv-fixture-000011112222.tail.ts.net")
+        self.assertEqual(commands, [["rex", "hosts", "add", guest.name, guest.endpoint, guest.tailnet_name]])
+
+    def test_untagged_nodes_stay_owner_only_and_a_rejected_key_fails_clearly(self):
+        guest = self.tailnet_guest()
+        settings = {"key": self.auth_key(), "tags": [], "control_url": ""}
+        calls = []
+
+        def fake_output(argv, **kwargs):
+            calls.append(argv)
+            if "status" in argv:
+                return json.dumps({"tailscale": {"state": "needs_login", "auth_url": "https://login.test/a"}})
+            return "{}"
+
+        with patch.object(rox, "output", side_effect=fake_output), contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaisesRegex(rox.Error, "auth key was rejected"):
+                rox.enable_tailnet(guest, settings, 5)
+        self.assertNotIn("--allow-tailnet-members", shlex.split(calls[0][-1]))
+
+    def test_down_signs_the_guest_out_of_the_tailnet(self):
+        guest = self.tailnet_guest()
+        guest.tailnet_name = "rv-fixture-000011112222.tail.ts.net"
+        guest.phase = "ready"
+        guest.save()
+        commands = []
+
+        def command(argv, **kwargs):
+            commands.append(argv)
+            return subprocess.CompletedProcess(argv, 0, "", "")
+
+        with patch.object(rox, "run", side_effect=command), contextlib.redirect_stdout(io.StringIO()):
+            rox.main(["down", guest.name])
+        logout = [argv for argv in commands if argv[0] == "ssh"]
+        self.assertEqual(shlex.split(logout[0][-1])[-3:], ["server", "tailscale", "logout"])
+        self.assertIn(["container", "delete", "--force", guest.name], commands)
+
+    def test_project_config_cannot_put_guests_on_the_tailnet(self):
+        self.assertIn("tailscale", rox.LAUNCHER_KEYS)
 
     def test_records_from_single_project_launches_still_load(self):
         name = "rv-legacy-000011112222"

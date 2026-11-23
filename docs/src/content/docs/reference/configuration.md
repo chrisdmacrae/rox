@@ -37,6 +37,15 @@ Rox reads `${XDG_CONFIG_HOME:-$HOME/.config}/rox/config.json` on the machine tha
 | --- | --- | --- |
 | `git_keys` | list of paths | SSH private keys loaded into the temporary Git agent. Manage them with `rox key`. `--git-key` overrides this list. |
 | `git_known_hosts` | path | Verified host keys for your Git servers. If you leave it out, Rox copies the matching entries from `~/.ssh/known_hosts`. |
+| `tailscale` | object | Put each guest's Rex server on your tailnet so other devices can reach it. See [Reaching guests from other devices](../../guides/tailnet/). |
+
+### `tailscale`
+
+| Key | Type | Description |
+| --- | --- | --- |
+| `auth_key_file` | path | File holding a reusable, ephemeral Tailscale auth key. It must be readable only by you. Required. |
+| `tags` | list of `tag:NAME` | ACL tags for guest devices, such as `["tag:rox-guest"]`. With tags, the tailnet ACLs decide who may connect. |
+| `control_url` | `https://` URL | A self-hosted control server, such as Headscale. |
 
 ## Backend settings
 
@@ -55,7 +64,7 @@ Put these under `container`, `linux`, or `macos`.
 
 ## Per-project settings: `.rox.json`
 
-A branch can commit a `.rox.json` to set its default `backend` and, for each backend, `image`, `cpus`, `memory`, and `prebuild`. Its values override this config, and command-line options override both. It can't set `engine`, `user`, `identity`, `host_key`, `git_keys`, or `git_known_hosts`. See [Project settings](../../guides/project-settings/) for the format and how settings combine.
+A branch can commit a `.rox.json` to set its default `backend` and, for each backend, `image`, `cpus`, `memory`, and `prebuild`. Its values override this config, and command-line options override both. It can't set `engine`, `user`, `identity`, `host_key`, `git_keys`, `git_known_hosts`, or `tailscale`. See [Project settings](../../guides/project-settings/) for the format and how settings combine.
 
 ```json title=".rox.json"
 {

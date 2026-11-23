@@ -34,6 +34,7 @@ export default defineConfig({
 						{ label: 'Private repositories', slug: 'guides/private-repositories' },
 						{ label: 'Tart VMs', slug: 'guides/tart-vms' },
 						{ label: 'Rex remote hosts', slug: 'guides/remote-hosts' },
+						{ label: 'Reaching guests from other devices', slug: 'guides/tailnet' },
 						{ label: 'Orchestrating agents', slug: 'guides/agents' },
 					],
 				},

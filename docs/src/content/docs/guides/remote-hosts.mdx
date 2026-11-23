@@ -16,7 +16,7 @@ rox up macos -S studio -- my-agent --model example
 
 1. On your machine, Rox resolves the repository URL and branch from your current checkout.
 2. Rex starts a `rox PROJECT` session on the selected host with a **Provision** tab, which runs `rox up` there.
-3. The guest is registered on that host, which is where its private socket lives.
+3. The guest is registered as a Rex host. Its private socket exists only on the selected host, so from your own machine you reach the guest through that host's Rex terminals, unless the selected host puts guests on your tailnet. See [Reaching guests from other devices](../tailnet/), which lets you run `rex -S WORKSPACE` directly from any device.
 4. When provisioning succeeds, a **Guest** tab opens a shell at the guest checkout, or in the guest home for a guest without a project. Any command after `--` runs in the guest's own Rex session. The Provision tab prints the command for inspecting that session from a terminal on the selected host.
 
 The selected host uses **its own** config, runtime images, project images, and SSH keys. Overrides such as `--config`, `--git-key`, and `--git-known-hosts` are paths on that host. Quote paths that start with `~` so the selected host expands them.

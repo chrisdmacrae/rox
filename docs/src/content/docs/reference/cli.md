@@ -35,6 +35,7 @@ rox up container [options] [-- COMMAND [ARG ...]]
 | `--rebuild` | Rebuild the project image before launching. |
 | `--open-shell` | Open a guest shell in the current Rex session. Requires a Rex terminal. |
 | `--no-app-host` | Don't offer to add the guest to a Rex app that keeps its own host list. |
+| `--no-tailscale` | Keep this guest off the tailnet even when `tailscale` is configured. See [Reaching guests from other devices](../../guides/tailnet/). |
 
 ## `rox add NAME`
 
