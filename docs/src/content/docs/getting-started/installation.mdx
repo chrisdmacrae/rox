@@ -65,5 +65,5 @@ Apple's container gives each container 1 GB of memory by default. For heavier ag
 For project dependencies, use a [setup hook](../../guides/setup-hook/) rather than changing the base image.
 
 <Aside>
-	Rex.app builds that keep their own host list don't pick up `rex hosts add`. When a Rex app is connected on the same machine, `rox up` and `rox reconnect` offer to copy the guest's socket address and open **Add Remote Host**. Pass `--no-app-host` to skip that prompt.
+	Rex.app builds that keep their own host list don't pick up `rex hosts add`. To add a guest to the Rex app on this machine, run `rox add-remote-host NAME`. It copies the guest's address, its tailnet name when it has one, and opens **Add Remote Host** so you can paste it. It works for guests on other Rex hosts too, when they're on the tailnet.
 </Aside>

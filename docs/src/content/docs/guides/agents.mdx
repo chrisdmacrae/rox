@@ -33,7 +33,7 @@ The installed skill is a copy of the one bundled with your rox version. After yo
 1. **Launch.** The controller runs `rox up` from the project checkout and saves the `Workspace`, `Checkout`, and `Session` values it prints. With a [project image](../project-images/), extra workers start quickly. To run work for several projects in one guest, it starts the guest with `rox up BACKEND --no-project` and adds each project with `rox add NAME`, which prints the same values.
 
    ```sh
-   rox up container --no-app-host --cwd "$project_dir"
+   rox up container --cwd "$project_dir"
    ```
 
 2. **Delegate.** Give each worker its goal, the files it owns, any constraints, how to verify the work, and what to return. Start it in a guest Rex terminal:
@@ -56,9 +56,6 @@ The installed skill is a copy of the one bundled with your rox version. After yo
 
 </Steps>
 
-<Aside type="tip">
-	Pass `--no-app-host` when an agent launches from a terminal pane. Otherwise the prompt to add the guest to the Rex app's host list can block it.
-</Aside>
 
 ## Remote launchers
 

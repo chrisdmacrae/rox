@@ -24,6 +24,7 @@ REAL_DEFAULT_ENGINE = rox.default_engine
 REAL_ENSURE_RUNTIME = rox.ensure_runtime
 REAL_GUEST_STATE = rox.guest_state
 REAL_REACHABLE = rox.reachable
+REAL_SUGGEST_APP_HOST = rox.suggest_app_host
 
 
 def base_image(version=None, image_id="sha256:base"):
@@ -43,7 +44,7 @@ class WorkspaceTests(unittest.TestCase):
                                         "XDG_CACHE_HOME": str(self.root / "cache-home")})
         state.start()
         self.addCleanup(state.stop)
-        # Keep the app host prompt out of tests run from a terminal.
+        # Keep prompts out of tests run from a terminal.
         stdin = patch.object(rox.sys, "stdin", io.StringIO())
         stdin.start()
         self.addCleanup(stdin.stop)
@@ -53,7 +54,7 @@ class WorkspaceTests(unittest.TestCase):
         self.addCleanup(engine.stop)
         # Treat guests as running and reachable, so commands don't ask a real engine or tunnel.
         # Tests of those checks call the REAL_ copies.
-        for name, value in (("guest_state", "running"), ("reachable", True)):
+        for name, value in (("guest_state", "running"), ("reachable", True), ("suggest_app_host", None)):
             runtime = patch.object(rox, name, return_value=value)
             runtime.start()
             self.addCleanup(runtime.stop)
@@ -548,10 +549,9 @@ class WorkspaceTests(unittest.TestCase):
                 with self.subTest(argv=argv), patch.object(rox.shutil, "which", return_value="/fixture"), \
                         self.assertRaisesRegex(rox.Error, "is stopped. Start it with rox start"):
                     rox.main(argv)
-            with patch.object(rox, "resume") as resume, patch.object(rox, "offer_app_host") as offer:
+            with patch.object(rox, "resume") as resume:
                 rox.main(["start", guest.name])
             self.assertEqual(resume.call_args.kwargs, {"force": False})
-            offer.assert_not_called()
         reopened = rox.Guest.load(guest.name)
         self.assertFalse(reopened.stopped)
         self.assertEqual(reopened.phase, "ready")
@@ -1378,82 +1378,82 @@ class WorkspaceTests(unittest.TestCase):
             rox.main(["up", "container", "--no-hook", "--rebuild", "--project", "fixture",
                       "--repo", "https://git.example.test/repo.git", "--branch", "main"])
 
-    def app_host_fixture(self, transport="unix", answer="\n"):
-        guest = rox.Guest("rv-app-000011112222", "container", "image", "workspace",
-                          guest_socket="/home/workspace/r.sock", registered=True)
-        clients = {"clients": [
-            {"client_id": "client:cli", "info": {"kind": "cli"}, "connection_state": "connected",
-             "principal": {"transport": "unix"}},
-            {"client_id": "client:lost", "info": {"kind": "app"}, "connection_state": "lost",
-             "principal": {"transport": "unix"}},
-            {"client_id": "client:app", "info": {"kind": "app"}, "connection_state": "connected",
-             "principal": {"transport": transport}},
-        ]}
+    APP_CLIENTS = {"clients": [
+        {"client_id": "client:cli", "info": {"kind": "cli"}, "connection_state": "connected",
+         "principal": {"transport": "unix"}},
+        {"client_id": "client:lost", "info": {"kind": "app"}, "connection_state": "lost",
+         "principal": {"transport": "unix"}},
+        {"client_id": "client:app", "info": {"kind": "app"}, "connection_state": "connected",
+         "principal": {"transport": "unix"}},
+    ]}
+
+    def app_host_commands(self, argv, clients=None):
+        """Run argv with a fake Rex app and clipboard, and return the commands and clipboard input."""
         calls = []
+        clients = self.APP_CLIENTS if clients is None else clients
 
-        def command(argv, **kwargs):
-            calls.append((argv, kwargs.get("input")))
-            stdout = json.dumps(clients) if argv[-3:] == ["client", "ls", "--json"] else ""
-            return subprocess.CompletedProcess(argv, 0, stdout, "")
+        def command(args, **kwargs):
+            calls.append((args, kwargs.get("input")))
+            stdout = json.dumps(clients) if args[-3:] == ["client", "ls", "--json"] else ""
+            return subprocess.CompletedProcess(args, 0, stdout, "")
 
-        stdin = io.StringIO(answer)
-        stdin.isatty = lambda: True
-        captured = io.StringIO()
         with (
-            patch.object(rox.sys, "stdin", stdin),
             patch.object(rox.shutil, "which", return_value="/usr/bin/pbcopy"),
             patch.object(rox, "run", side_effect=command),
-            contextlib.redirect_stdout(captured),
+            contextlib.redirect_stdout(io.StringIO()) as printed,
         ):
-            rox.offer_app_host(guest)
-        return guest, [argv for argv, _ in calls], calls, captured.getvalue()
+            rox.main(argv)
+        return calls, printed.getvalue()
 
-    def test_app_host_copies_the_endpoint_and_opens_the_local_app_dialog(self):
-        guest, argvs, calls, printed = self.app_host_fixture()
-        self.assertEqual(argvs, [
+    def test_add_remote_host_copies_a_local_guest_and_opens_the_app_dialog(self):
+        guest = self.saved_guest()
+        calls, printed = self.app_host_commands(["add-remote-host", guest.name])
+        self.assertEqual([argv for argv, _ in calls], [
             ["rex", "--autostart=false", "client", "ls", "--json"],
             ["pbcopy"],
             ["rex", "--autostart=false", "-C", "client:app", "do", "client.host.add"],
         ])
         self.assertEqual(calls[1][1], guest.endpoint)
-        self.assertIn(f"Add {guest.name} to the Rex app's host list?", printed)
-        self.assertIn(f"Copied {guest.endpoint}", printed)
-
-    def test_app_host_is_skipped_when_declined_or_the_app_is_remote(self):
-        _, argvs, _, _ = self.app_host_fixture(answer="n\n")
-        self.assertEqual(argvs, [["rex", "--autostart=false", "client", "ls", "--json"]])
-        _, argvs, _, printed = self.app_host_fixture(transport="tcp")
-        self.assertEqual(argvs, [["rex", "--autostart=false", "client", "ls", "--json"]])
-        self.assertNotIn("host list?", printed)
-
-    def test_app_host_is_skipped_without_a_terminal(self):
-        guest = rox.Guest("rv-app-000011112222", "container", "image", "workspace",
-                          guest_socket="/home/workspace/r.sock", registered=True)
-        with patch.object(rox, "run") as command:
-            rox.offer_app_host(guest)
-        command.assert_not_called()
-
-    def test_reconnect_offers_the_app_host_unless_disabled(self):
-        name = "rv-retained-000011112222"
-        guest = rox.Guest(name, "container", "image", "workspace",
-                          engine="docker", guest_socket="/home/workspace/r.sock")
-        guest.directory.mkdir(parents=True)
+        self.assertIn(f"Copied {guest.endpoint}. Paste it into Add Remote Host", printed)
+        guest.tailnet_name = "rv-fixture-000011112222.tail.ts.net"
         guest.save()
-        for argv, offered in ((["reconnect", name], True), (["reconnect", name, "--no-app-host"], False)):
-            with self.subTest(argv=argv):
-                with (
-                    patch.object(rox, "container_address", return_value=("127.0.0.1", 33000)),
-                    patch.object(rox, "guest_stage"),
-                    patch.object(rox, "attach_guest"),
-                    patch.object(rox, "close_tunnel"),
-                    patch.object(rox, "run", return_value=subprocess.CompletedProcess([], 0, "", "")),
-                    patch.object(rox, "offer_app_host") as offer,
-                    contextlib.redirect_stdout(io.StringIO()),
-                ):
-                    rox.main(argv)
-                self.assertEqual(offer.called, offered)
-                if offered:
-                    self.assertEqual(offer.call_args.args[0].name, name)
+        calls, _ = self.app_host_commands(["add-remote-host", guest.name])
+        self.assertEqual(calls[1][1], guest.tailnet_name)
+
+    def test_add_remote_host_uses_a_remote_guests_tailnet_name(self):
+        with self.remote_listing():
+            calls, printed = self.app_host_commands(["add-remote-host", "rv-remote-000011112222"])
+        self.assertEqual(calls[1][1], "rv-remote-000011112222.tail.ts.net")
+        with self.remote_listing(tailnet=""), self.assertRaisesRegex(rox.Error, "only mini can reach it"):
+            self.app_host_commands(["add-remote-host", "rv-remote-000011112222"])
+
+    def test_add_remote_host_needs_the_app_open_here(self):
+        guest = self.saved_guest()
+        remote_app = {"clients": [{"client_id": "client:app", "info": {"kind": "app"},
+                                   "connection_state": "connected", "principal": {"transport": "tcp"}}]}
+        with self.assertRaisesRegex(rox.Error, "Open the Rex app on this machine"):
+            self.app_host_commands(["add-remote-host", guest.name], remote_app)
+        unregistered = self.saved_guest("rv-new-000011112222", registered=False)
+        with self.assertRaisesRegex(rox.Error, "isn't a Rex host yet"):
+            self.app_host_commands(["add-remote-host", unregistered.name])
+
+    def test_up_suggests_add_remote_host_only_when_an_app_is_open_here(self):
+        for client, suggested in (("client:app", True), (None, False)):
+            with self.subTest(client=client), patch.object(rox, "local_app_client", return_value=client), \
+                    contextlib.redirect_stdout(io.StringIO()) as printed:
+                REAL_SUGGEST_APP_HOST("rv-fixture-000011112222")
+            self.assertEqual("run rox add-remote-host rv-fixture-000011112222" in printed.getvalue(), suggested)
+
+    def test_reconnect_no_longer_prompts_and_still_accepts_no_app_host(self):
+        guest = self.saved_guest()
+        stdin = io.StringIO("y\n")
+        stdin.isatty = lambda: True
+        for argv in (["reconnect", guest.name], ["reconnect", guest.name, "--no-app-host"]):
+            with self.subTest(argv=argv), patch.object(rox.sys, "stdin", stdin), \
+                    patch.object(rox, "resume"), patch.object(rox, "input", create=True) as asked, \
+                    contextlib.redirect_stdout(io.StringIO()):
+                rox.main(argv)
+            asked.assert_not_called()
 
     def test_remote_launch_forwards_no_app_host(self):
         real_run = rox.run

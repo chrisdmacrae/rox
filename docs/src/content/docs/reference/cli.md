@@ -34,7 +34,6 @@ rox up container [options] [-- COMMAND [ARG ...]]
 | `--no-prebuild` | Clone and run `.rox.sh` at boot instead of using a [project image](../../guides/project-images/). |
 | `--rebuild` | Rebuild the project image before launching. |
 | `--open-shell` | Open a guest shell in the current Rex session. Requires a Rex terminal. |
-| `--no-app-host` | Don't offer to add the guest to a Rex app that keeps its own host list. |
 | `--no-tailscale` | Keep this guest off the tailnet even when `tailscale` is configured. See [Reaching guests from other devices](../../guides/tailnet/). |
 
 ## `rox add NAME`
@@ -96,12 +95,19 @@ Restore Rex access to a guest. This also works for a guest kept after a failed c
 
 | Option | Description |
 | --- | --- |
-| `--no-app-host` | Don't offer to add the guest to a Rex app that keeps its own host list. |
 | `-S`, `--host HOST` | The Rex host that runs the guest. Without it, Rox looks for the guest on this machine, then on each Rex host. |
 
 ## `rox start NAME` / `rox stop NAME`
 
 `rox stop` closes the guest's tunnel and stops its container or VM without deleting anything. The guest stays stopped until `rox start`: `rox ls` shows it as `stopped`, the [rox service](../../guides/keep-running/) leaves it alone, and `rox shell`, `rox forward` and `rox add` refuse it. `rox start` starts the guest and restores access to it, like `rox reconnect`, without the Rex app prompt. If this machine has no record of `NAME`, Rox finds the Rex host that runs it and works there. See [Working with guests on other hosts](../../guides/remote-hosts/#working-with-guests-on-other-hosts).
+
+| Option | Description |
+| --- | --- |
+| `-S`, `--host HOST` | The Rex host that runs the guest. Without it, Rox looks for the guest on this machine, then on each Rex host. |
+
+## `rox add-remote-host NAME`
+
+Add a guest to the Rex app on this machine. Rex.app builds that keep their own host list don't pick up `rex hosts add`, and their **Add Remote Host** dialog takes no arguments, so Rox copies the guest's address to the clipboard and opens the dialog for you to paste it. The address is the guest's tailnet name, which works from the app on any device, or its socket, which works only on the machine that runs the guest. For a guest on another Rex host, the guest must be on the tailnet. The Rex app must be open on this machine. `rox up` suggests this command when it is.
 
 | Option | Description |
 | --- | --- |

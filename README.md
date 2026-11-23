@@ -4,7 +4,7 @@ Start a disposable project workspace in a Linux container or a Tart VM. `rox` cl
 
 A guest doesn't have to belong to one project. Start one with no project, start as many separate guests for the same project as you like, or clone more projects into a guest that's already running with `rox add`.
 
-Rox registers each guest with Rex as soon as its server answers. If cloning or setup fails, you can still reach the guest with `rex -S NAME ls`. Rox prints the host label and private socket address when it registers the guest. Rex.app builds that keep their own host list don't pick up `rex hosts add`. When a Rex app is connected on the same machine and Rox runs in a terminal, `rox up` and `rox reconnect` offer to copy the socket address and open **Add Remote Host** so you can paste it. Pass `--no-app-host` to skip the prompt.
+Rox registers each guest with Rex as soon as its server answers. If cloning or setup fails, you can still reach the guest with `rex -S NAME ls`. Rox prints the host label and private socket address when it registers the guest. Rex.app builds that keep their own host list don't pick up `rex hosts add`. To add a guest to the Rex app on this machine, run `rox add-remote-host NAME`. It copies the guest's address, its tailnet name when it has one, and opens **Add Remote Host** so you can paste it. It works for guests on other Rex hosts too, when they're on the tailnet.
 
 ## Install the AI skill
 
@@ -235,7 +235,8 @@ It checks every 15 seconds, logs to `~/.local/state/rox/service.log`, and leaves
 | `rox forward NAME PORT...` | Forward `localhost` ports on the launcher to servers on the guest's `localhost`, for example dev servers. Use `LOCAL:GUEST` to pick a different local port. Runs until Ctrl-C. |
 | `rox funnel NAME PORT` | Put a server in the guest on the internet with Tailscale Funnel, through the launcher's Tailscale. `--https 8443` or `10000` and `--path` pick the public address, and `--off` stops it. See the [tailnet guide](docs/src/content/docs/guides/tailnet.mdx#sharing-a-guests-server-on-the-internet). |
 | `rex -S NAME ls` | List the guest's Rex sessions after a local launch with host registration. |
-| `rox reconnect NAME` | Restore Rex access to a guest, starting the container runtime and the guest first if they stopped. Also works for one retained after clone or setup failure. Offers to add it to the local Rex app's host list unless you pass `--no-app-host`. |
+| `rox reconnect NAME` | Restore Rex access to a guest, starting the container runtime and the guest first if they stopped. Also works for one retained after clone or setup failure. |
+| `rox add-remote-host NAME` | Add a guest to the Rex app on this machine, for app builds that keep their own host list. |
 | `rox stop NAME` / `rox start NAME` | Stop a guest without deleting it, and keep it stopped until `rox start`. |
 | `rox service install` | Keep guests running across reboots and container runtime restarts. See [Keeping guests running](#keeping-guests-running). |
 | `rox down NAME` | Delete the guest, its filesystem, and its Rex host entry. |

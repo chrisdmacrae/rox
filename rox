@@ -1506,33 +1506,48 @@ def local_app_client():
     return None
 
 
-def offer_app_host(guest):
-    """Help add the guest to a Rex app that keeps its own host list.
+def add_app_host(name, address):
+    """Add a guest to the Rex app on this machine, which keeps its own host list.
 
     Such apps ignore `rex hosts add`, and their Add Remote Host dialog takes no
-    arguments, so copy the endpoint and open the dialog for the user to paste.
-    Only an app on this machine can reach the guest's private socket.
+    arguments, so copy the address and open the dialog for the user to paste.
     """
-    if not guest.registered or not sys.stdin.isatty() or not shutil.which("pbcopy"):
-        return
     client = local_app_client()
     if not client:
-        return
-    try:
-        answer = input(f"Add {guest.name} to the Rex app's host list? [Y/n] ").strip().lower()
-    except EOFError:
-        return
-    if answer not in ("", "y", "yes"):
-        return
-    # A tailnet name works from the app on any device. The socket works only here.
-    address = guest.tailnet_name or guest.endpoint
-    run(["pbcopy"], input=address)
+        raise Error("Open the Rex app on this machine, then run this again")
+    copied = bool(shutil.which("pbcopy")) and run(["pbcopy"], input=address, check=False).returncode == 0
     result = run(["rex", "--autostart=false", "-C", client, "do", "client.host.add"],
                  check=False, capture=True, timeout=8)
     if result.returncode:
-        print(f"Could not open Add Remote Host. Add {address} in the Rex app.", file=sys.stderr)
+        raise Error(f"Could not open Add Remote Host in the Rex app, so add {address} there yourself. "
+                    f"({(result.stderr or result.stdout).strip()})")
+    if copied:
+        print(f"Copied {address}. Paste it into Add Remote Host in the Rex app to add {name}.", flush=True)
+    else:
+        print(f"Enter {address} in Add Remote Host in the Rex app to add {name}.", flush=True)
+
+
+def add_remote_host(name, host=None):
+    """Add a guest, here or on another Rex host, to the Rex app on this machine."""
+    if host is None and is_local(name):
+        guest = Guest.load(name)
+        if not guest.registered:
+            raise Error(f"{name} isn't a Rex host yet. Run rox reconnect {name} first")
+        # A tailnet name works from the app on any device. The socket works only here.
+        add_app_host(name, guest.tailnet_name or guest.endpoint)
         return
-    print(f"Copied {address}. Paste it into Add Remote Host in the Rex app.", flush=True)
+    host, record = find_remote_guest(name, host)
+    if not record.get("tailnet"):
+        raise Error(f"{name} runs on {host} and isn't on the tailnet, so only {host} can reach it. "
+                    f"Run rox add-remote-host {name} there, or configure tailscale on {host} with "
+                    "rox config tailscale")
+    add_app_host(name, record["tailnet"])
+
+
+def suggest_app_host(name):
+    """Point to rox add-remote-host when a Rex app here keeps its own host list."""
+    if local_app_client():
+        print(f"To add {name} to the Rex app's host list, run rox add-remote-host {name}", flush=True)
 
 
 def describe_guest(guest, project=None):
@@ -1622,6 +1637,7 @@ def register_remote_guest(provision_output, launcher):
               f"({result.stderr.strip()})", file=sys.stderr, flush=True)
         return
     print(f"Registered Rex host {workspace[1]} on this machine at {tailnet[1]}", flush=True)
+    suggest_app_host(workspace[1])
 
 
 def down_remote(args):
@@ -1879,8 +1895,7 @@ def up(args, command):
                                         image_checkout=bool(prebuilt))
         describe_guest(guest, project)
 
-    if not args.no_app_host:
-        offer_app_host(guest)
+    suggest_app_host(guest.name)
     if app_session:
         try:
             open_app_shell(app_session, guest.name, project.id if project else None)
@@ -1952,7 +1967,7 @@ def shell(name, key=None):
     os.execvpe(argv[0], argv, {**os.environ, "TERM": "xterm-256color"})
 
 
-def reconnect(name, app_host=True, force=True):
+def reconnect(name, force=True):
     """Start the guest if it stopped, and restore its tunnel, Rex server and tailnet node."""
     guest = Guest.load(name)
     with guest_lock(guest.directory):
@@ -1967,8 +1982,6 @@ def reconnect(name, app_host=True, force=True):
         describe_guest(guest)
         for project in guest.projects:
             print(f"Project    {project.id}  {project.phase}  {project.workspace}")
-    if app_host:
-        offer_app_host(guest)
 
 
 def stop_workspace(name):
@@ -2652,7 +2665,9 @@ def install_skill(agents, directory, force):
     print("Start a new agent session to load it. Run rox skill install again after upgrading rox.")
 
 
-APP_HOST_HELP = "don't offer to add the guest to a Rex app that keeps its own host list"
+# Older releases asked to add each guest to the Rex app, and --no-app-host skipped that. rox
+# add-remote-host does it now, so the option is accepted and ignored.
+APP_HOST_HELP = argparse.SUPPRESS
 
 
 def port_number(value):
@@ -2742,7 +2757,10 @@ def main(argv):
     funnel_parser.add_argument("--path", default="/", help="public path to serve it at (default /)")
     funnel_parser.add_argument("--off", action="store_true",
                                help="stop funneling PORT, or every funnel of the guest without PORT")
-    for named in (forward_parser, funnel_parser, reconnect_parser, start_parser, stop_parser):
+    app_parser = commands.add_parser("add-remote-host",
+                                     help="add a guest to the Rex app on this machine, which keeps its own host list")
+    app_parser.add_argument("name")
+    for named in (forward_parser, funnel_parser, reconnect_parser, start_parser, stop_parser, app_parser):
         named.add_argument("-S", "--host", help=HOST_HELP)
     stop = commands.add_parser("down", help="delete a guest and its workspace")
     stop.add_argument("name", nargs="?",
@@ -2803,11 +2821,13 @@ def main(argv):
     elif args.command == "forward":
         forward(args.name, args.ports)
     elif args.command == "reconnect":
-        reconnect(args.name, app_host=not args.no_app_host)
+        reconnect(args.name)
     elif args.command == "start":
-        reconnect(args.name, app_host=False, force=False)
+        reconnect(args.name, force=False)
     elif args.command == "funnel":
         funnel(args.name, args.port, args.https, args.path, args.off)
+    elif args.command == "add-remote-host":
+        add_remote_host(args.name, args.host)
     elif args.command == "stop":
         stop_workspace(args.name)
     elif args.command == "key":

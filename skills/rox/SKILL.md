@@ -53,4 +53,4 @@ If the runner must start at boot, pass its command after `rox up ... --`. It run
 
 Rex CLI access works independently of the Rex.app sidebar. Use the CLI and the saved IDs to supervise workers.
 
-When `rox up` or `rox reconnect` runs in a terminal with a Rex app connected on the same machine, it asks whether to add the guest to the app's host list, then copies the socket address and opens **Add Remote Host**. Pass `--no-app-host` when you launch in a terminal pane so the prompt doesn't block you, unless the user wants the guest in the app's sidebar.
+`rox up` and `rox reconnect` never prompt. When the user wants a guest in the Rex app's sidebar, run `rox add-remote-host NAME`: it copies the guest's address and opens **Add Remote Host** in the Rex app on this machine for the user to paste.
