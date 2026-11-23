@@ -5,7 +5,7 @@ description: Every rox command and option.
 
 ## `rox up [BACKEND]`
 
-Start and provision a new guest. `BACKEND` is `container`, `linux`, or `macos`. Leave it out to use the `backend` from the branch's [`.rox.json`](../configuration/#per-project-settings-roxjson). Arguments after `--` run in the guest's first Rex terminal. Each run starts a new guest, even for a project that already has one.
+Start and provision a new guest. `BACKEND` is `container`, `linux`, or `macos`. Leave it out to use the `backend` from the branch's [`.rox.json`](../../guides/project-settings/). Arguments after `--` run in the guest's first Rex terminal. Each run starts a new guest, even for a project that already has one.
 
 Rox clones the project from the current checkout. Outside a checkout, with no `--repo`, or with `--no-project`, it starts a guest with no project, whose Rex session opens in the guest user's home directory.
 

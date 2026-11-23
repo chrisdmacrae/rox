@@ -55,28 +55,11 @@ Put these under `container`, `linux`, or `macos`.
 
 ## Per-project settings: `.rox.json`
 
-Commit a `.rox.json` at the root of a branch to choose that project's guest. Rox reads it from the launched branch, the same way it reads `.rox.sh`, so what you've pushed is what applies, not your local working tree.
+A branch can commit a `.rox.json` to set its default `backend` and, for each backend, `image`, `cpus`, `memory`, and `prebuild`. Its values override this config, and command-line options override both. It can't set `engine`, `user`, `identity`, `host_key`, `git_keys`, or `git_known_hosts`. See [Project settings](../../guides/project-settings/) for the format and how settings combine.
 
 ```json title=".rox.json"
 {
   "backend": "container",
-  "container": { "image": "ghcr.io/acme/agent-base:2", "cpus": 4, "memory": "8G" },
-  "linux": { "memory": "16G", "prebuild": false }
+  "container": { "image": "ghcr.io/acme/agent-base:2", "cpus": 4, "memory": "8G" }
 }
 ```
-
-| Key | Description |
-| --- | --- |
-| `backend` | The backend plain `rox up` uses for this project: `container`, `linux`, or `macos`. |
-| `container`, `linux`, `macos` | Per-backend `image`, `cpus`, `memory`, and `prebuild`, with the same meaning as in the launcher config. |
-
-Settings are applied in this order, and later ones win:
-
-1. Built-in defaults
-2. The launcher's rox config
-3. The branch's `.rox.json`
-4. Command-line options such as `--image`, `--cpus`, and `--memory`
-
-`.rox.json` can't set `engine`, `user`, `identity`, `host_key`, `git_keys`, or `git_known_hosts`, because those describe the launch machine and its keys. Rox stops with an error if the file sets one, or any key it doesn't know. A VM `image` in `.rox.json` must be a Tart template on the launcher that works with the launcher's `user`, `identity`, and `host_key` for that backend.
-
-If the launcher can't read the branch, Rox prints a warning and ignores `.rox.json`, so you need to name the backend on the command line.

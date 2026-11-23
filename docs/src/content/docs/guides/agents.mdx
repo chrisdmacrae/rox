@@ -9,12 +9,12 @@ The bundled **rox skill** teaches a controller agent to launch guests, delegate 
 
 ## Install the skill
 
-From the toolkit's directory, copy the skill into your agent's skills folder. For Codex:
+After you [install rox](../../getting-started/installation/), copy the skill from the install folder into your agent's skills folder. For Codex:
 
 ```sh
 skill_dir="${CODEX_HOME:-$HOME/.codex}/skills"
 mkdir -p "$skill_dir"
-cp -R skills/rox "$skill_dir/"
+cp -R ~/.local/share/rox/skills/rox "$skill_dir/"
 ```
 
 For Claude Code, copy it to `~/.claude/skills/` instead. Start a new session and invoke the skill (`$rox` in Codex, `/rox` in Claude Code). Install rox itself on the launcher, and make your agent runner available inside the guests. A [setup hook](../setup-hook/) is a good place to install it.

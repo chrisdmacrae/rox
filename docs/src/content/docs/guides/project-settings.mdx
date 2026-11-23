@@ -1,0 +1,104 @@
+---
+title: Project settings
+description: Choose a project's backend, image, CPUs, and memory with a .rox.json committed to the repository.
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+Commit a `.rox.json` at the root of the branch you launch to describe the guest the project needs. With it, anyone on the team can run plain `rox up` and get the right guest, without editing their own config or remembering options.
+
+```json title=".rox.json"
+{
+  "backend": "container",
+  "container": { "image": "ghcr.io/acme/agent-base:2", "cpus": 4, "memory": "8G" },
+  "linux": { "memory": "16G", "prebuild": false }
+}
+```
+
+With this file, `rox up` starts an 8 GB container from `ghcr.io/acme/agent-base:2`. `rox up linux` starts a 16 GB Tart VM from the launcher's usual template and runs `.rox.sh` at boot.
+
+<Aside>
+	Rox reads `.rox.json` from the **remote branch** it launches, the same way it reads [`.rox.sh`](../setup-hook/). Push changes to the file before you launch. Edits in your working tree have no effect until they're pushed.
+</Aside>
+
+## Settings
+
+Every key is optional.
+
+| Key | Type | Description |
+| --- | --- | --- |
+| `backend` | `"container"`, `"linux"`, or `"macos"` | The backend `rox up` uses when you don't name one. |
+| `container`, `linux`, `macos` | object | Settings for that backend, from the table below. Only the section for the backend being launched applies. |
+
+Each backend section accepts:
+
+| Key | Type | Description |
+| --- | --- | --- |
+| `image` | string | For `container`, the base container image, such as `ghcr.io/acme/agent-base:2`. For `linux` and `macos`, the name of a prepared Tart template on the launcher. |
+| `cpus` | whole number | CPUs for the guest. |
+| `memory` | string with a unit | Memory for the guest, such as `512M`, `8G`, or `1T`. A bare number is rejected. |
+| `prebuild` | `true` or `false` | Whether to build and reuse a [project image](../project-images/). Set it to `false` when `.rox.sh` starts long-running services, so the hook runs at every boot. |
+
+`cpus` and `memory` work with every engine and backend. Containers get them as run limits. Tart VMs get them through `tart set` on each clone before it boots. If you leave them out, the guest gets the launcher config's values, or the engine or template default. Apple's container gives each container 4 CPUs and 1 GB by default, so most agents need a `memory` setting.
+
+## Choosing the backend
+
+`rox up` picks the backend in this order:
+
+1. The backend you name, as in `rox up linux`
+2. `backend` in the branch's `.rox.json`
+
+When it uses the file's choice, Rox prints `Using the container backend from .rox.json`. If neither gives a backend, the launch stops and asks you to choose one.
+
+## How settings combine
+
+Each setting comes from the last place that sets it:
+
+1. Built-in defaults
+2. The launcher's [rox config](../../reference/configuration/)
+3. The branch's `.rox.json`
+4. Command-line options: `--image`, `--cpus`, `--memory`, and `--no-prebuild`
+
+Settings merge one key at a time, so `.rox.json` only replaces the keys it sets. For example, suppose the launcher config has:
+
+```json title="~/.config/rox/config.json"
+{ "container": { "engine": "podman", "cpus": 2, "memory": "2G" } }
+```
+
+and the branch's `.rox.json` has:
+
+```json title=".rox.json"
+{ "container": { "memory": "8G" } }
+```
+
+Then `rox up container` starts a Podman container with 2 CPUs and 8 GB, and `rox up container --memory 16G` gives that one launch 16 GB.
+
+## One-off guests
+
+To give a single launch a non-standard guest, such as a bigger VM for one heavy task, pass options instead of changing `.rox.json`:
+
+```sh
+rox up linux --image rox-ubuntu-cuda --cpus 8 --memory 16G
+rox up container --image ghcr.io/acme/agent-base:3 --memory 8G
+```
+
+These apply to that launch only. The [rox skill](../agents/) uses the same options when a task calls for a different guest.
+
+## What `.rox.json` can't set
+
+Some settings describe the launch machine rather than the project, so they belong only in the launcher's own config:
+
+| Key | Why it stays on the launcher |
+| --- | --- |
+| `engine` | Which container tool is installed varies by machine. |
+| `user`, `identity`, `host_key` | They're the launcher's SSH login and the pinned host key for its Tart templates. |
+| `git_keys`, `git_known_hosts` | They're the launcher's private keys and trusted Git servers. |
+
+Rox stops with an error if `.rox.json` sets any of these, or any key it doesn't recognize, so a typo can't be silently ignored. The file can't point Rox at files on your machine or change which keys it uses.
+
+## Things to know
+
+- **VM images must match the launcher's login.** A `linux` or `macos` `image` in `.rox.json` must be a Tart template that exists on the launcher and accepts that backend's `user`, `identity`, and `host_key` from the launcher config.
+- **Changing `image` rebuilds the project image.** When the branch has a `.rox.sh`, the project image is built on top of the base `image`, and Rox rebuilds it when the base changes. Branches that set different images share one project image name, so switching between them rebuilds it each time.
+- **An unreadable branch means no `.rox.json`.** If the launcher can't fetch the branch, Rox prints a warning, ignores `.rox.json`, and runs `.rox.sh` at boot. Name the backend on the command line in that case.
+- **`rox add` ignores it.** Adding a project to a running guest doesn't change that guest, so its settings don't apply.

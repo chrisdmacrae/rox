@@ -1,9 +1,9 @@
 ---
 title: Installation
-description: Install rox and prepare a container engine on the machine that runs guests.
+description: Install rox from a release on the machine that runs guests.
 ---
 
-import { Aside, Steps, Tabs, TabItem } from '@astrojs/starlight/components';
+import { Aside, Steps } from '@astrojs/starlight/components';
 
 Install rox on the machine that runs the guests. That machine is called the **launcher**. Your agent runner goes inside the guests, not on the launcher.
 
@@ -21,18 +21,16 @@ Install rox on the machine that runs the guests. That machine is called the **la
 
 <Steps>
 
-1. Clone the toolkit somewhere permanent.
+1. Download the latest release into `~/.local/share/rox` and link `rox` into `~/.local/bin`.
 
    ```sh
-   git clone <rox repository URL> ~/Developer/tools/rox
+   curl -fsSL https://github.com/chrisdmacrae/rox/releases/latest/download/rox.tar.gz -o /tmp/rox.tar.gz \
+     && rm -rf ~/.local/share/rox && mkdir -p ~/.local/share/rox ~/.local/bin \
+     && tar -xzf /tmp/rox.tar.gz -C ~/.local/share/rox --strip-components=1 \
+     && ln -sf ~/.local/share/rox/rox ~/.local/bin/rox && rm /tmp/rox.tar.gz
    ```
 
-2. Link `rox` onto your PATH. Rox finds the guest scripts and Containerfile next to the real file, so link it rather than copying it.
-
-   ```sh
-   mkdir -p ~/.local/bin
-   ln -s ~/Developer/tools/rox/rox ~/.local/bin/rox
-   ```
+2. Make sure `~/.local/bin` is on your `PATH`.
 
 3. Check that it runs.
 
@@ -42,37 +40,23 @@ Install rox on the machine that runs the guests. That machine is called the **la
 
 </Steps>
 
+Rox finds its guest scripts and Containerfile next to the real file in `~/.local/share/rox`, which is why the command links `rox` instead of copying it.
+
+### Upgrade or pin a version
+
+Run the same command again to upgrade. The installed version is in `~/.local/share/rox/VERSION`. To install a specific version, replace `latest/download` with `download/vX.Y.Z`. See [releases](https://github.com/chrisdmacrae/rox/releases) for the available versions.
+
+Each release also includes `rox.tar.gz.sha256`. To check a download, keep the archive and run `shasum -a 256 -c rox.tar.gz.sha256` in the folder that holds both files.
+
 ## The base container image
 
-Rox builds the default `rox:linux` image the first time you launch a container and reuses it after that. It also rebuilds it when the `io.rox.toolkit` label in the Containerfile changes, which happens when the image's SSH setup changes. An image you build yourself from the current Containerfile carries that label, so Rox keeps it. The build installs Rex from the Rex Linux preview channel.
+You don't need to build anything. The first `rox up container` builds the `rox:linux` image with your container engine, which takes a few minutes, and later launches reuse it. When a new rox release changes the image, Rox rebuilds it on the next launch.
 
-To prebuild the image with an official Linux `rex` executable that matches your build architecture, run this from the toolkit's directory:
+On an Apple Silicon Mac, Rox uses Apple's container tool. Elsewhere it uses Docker. To choose an engine, set `"engine"` to `container`, `docker`, or `podman` under `container` in the [config](../../reference/configuration/), or pass `--engine` when you launch.
 
-<Tabs syncKey="engine">
-	<TabItem label="Apple container">
-		```sh
-		container build -f Containerfile -t rox:linux .
-		```
+Apple's container gives each container 1 GB of memory by default. For heavier agents, set `"memory": "4G"` under `container` in the config, or pass `--memory` at launch.
 
-		This is the default engine on Apple Silicon Macs. The build installs Rex from the preview channel.
-	</TabItem>
-	<TabItem label="Docker">
-		```sh
-		docker build -f Containerfile -t rox:linux \
-		  --secret id=rex_binary,src=/absolute/path/to/linux/rex .
-		```
-	</TabItem>
-	<TabItem label="Podman">
-		```sh
-		podman build -f Containerfile -t rox:linux \
-		  --secret id=rex_binary,src=/absolute/path/to/linux/rex .
-		```
-
-		Then set `"engine": "podman"` under `container` in the [config](../../reference/configuration/), or pass `--engine podman` when you launch.
-	</TabItem>
-</Tabs>
-
-You can extend this image to install system packages your project needs. For per-project setup, a [setup hook](../../guides/setup-hook/) is usually simpler.
+For project dependencies, use a [setup hook](../../guides/setup-hook/) rather than changing the base image.
 
 <Aside>
 	Rex.app builds that keep their own host list don't pick up `rex hosts add`. When a Rex app is connected on the same machine, `rox up` and `rox reconnect` offer to copy the guest's socket address and open **Add Remote Host**. Pass `--no-app-host` to skip that prompt.

@@ -52,6 +52,10 @@ import { Aside, Steps } from '@astrojs/starlight/components';
 Every `rox up` starts a new guest, so run it again whenever you want another isolated copy of the same project.
 
 <Aside type="tip">
+	Commit a [`.rox.json`](../../guides/project-settings/) to set the project's backend, image, CPUs, and memory, so plain `rox up` starts the right guest.
+</Aside>
+
+<Aside type="tip">
 	If the project has a `.rox.sh` setup hook, the first launch builds a [project image](../../guides/project-images/). Later launches skip the clone and the hook, so they start much faster.
 </Aside>
 

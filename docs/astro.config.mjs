@@ -29,6 +29,7 @@ export default defineConfig({
 					label: 'Guides',
 					items: [
 						{ label: 'Project setup hook', slug: 'guides/setup-hook' },
+						{ label: 'Project settings', slug: 'guides/project-settings' },
 						{ label: 'Project images', slug: 'guides/project-images' },
 						{ label: 'Private repositories', slug: 'guides/private-repositories' },
 						{ label: 'Tart VMs', slug: 'guides/tart-vms' },

@@ -10,12 +10,12 @@ Rox registers each guest with Rex as soon as its server answers. If cloning or s
 
 The [rox skill](skills/rox/SKILL.md) teaches a controller agent to launch guests, delegate tasks through Rex, track worker output and exit status, and collect results before teardown.
 
-From this toolkit's directory, install the skill for Codex.
+After you [install rox](#install), copy the skill for Codex.
 
 ```sh
 skill_dir="${CODEX_HOME:-$HOME/.codex}/skills"
 mkdir -p "$skill_dir"
-cp -R skills/rox "$skill_dir/"
+cp -R ~/.local/share/rox/skills/rox "$skill_dir/"
 ```
 
 Start a new Codex session and invoke `$rox`. Install the toolkit itself on the machine that will run the guests, and make your chosen agent runner available inside those guests.
@@ -41,16 +41,7 @@ git tag v0.1.0 && git push origin v0.1.0
 
 ## Start a container
 
-The host needs Python 3.9+, Git, OpenSSH 8.2+, Rex, and a container engine. On an Apple Silicon Mac, Rox uses Apple's [container](https://github.com/apple/container) tool by default, which runs each container in its own lightweight VM. Start its services with `container system start`. On Linux and Windows hosts it uses Docker or Podman. Make `rox` available on your PATH, or use its absolute path from your project.
-
-Rox builds the default `rox:linux` image on first use and reuses it on later launches. It also rebuilds it when the `io.rox.toolkit` label in the Containerfile changes, which happens when the image's SSH setup changes. An image you build yourself from the current Containerfile carries that label, so Rox keeps it. The build uses the Rex Linux preview channel. To prebuild the image with an official Linux `rex` executable for your build architecture, run this from the toolkit's directory.
-
-```sh
-docker build -f Containerfile -t rox:linux \
-  --secret id=rex_binary,src=/absolute/path/to/linux/rex .
-```
-
-Use `podman build` with the same arguments if you use Podman, and set `"engine": "podman"` in the config or pass `--engine podman` at launch. With Apple's container tool, run `container build -f Containerfile -t rox:linux .`. To use Docker or Podman on a Mac instead, set `"engine"` or pass `--engine`. Apple's container gives each container 1 GB of memory by default, so set `"memory": "4G"` (and optionally `"cpus"`) under `container` in the config for heavier agents. You can extend the supplied image to install system packages required by your project. [Rex for Linux](https://www.superlogical.com/rex/docs/linux/installation)
+The host needs Python 3.9+, Git, OpenSSH 8.2+, Rex, and a container engine. On an Apple Silicon Mac, Rox uses Apple's [container](https://github.com/apple/container) tool by default, which runs each container in its own lightweight VM. Start its services with `container system start`. On Linux and Windows hosts it uses Docker or Podman. There's nothing to build by hand. The first `rox up container` builds the `rox:linux` base image with your container engine, and later launches reuse it. When a new rox release changes the image, Rox rebuilds it on the next launch. To choose an engine, set `"engine"` to `container`, `docker`, or `podman` under `container` in the config, or pass `--engine` at launch. Apple's container gives each container 1 GB of memory by default, so set `"memory": "4G"` (and optionally `"cpus"`) under `container` in the config for heavier agents. For project dependencies, use a [project startup hook](#project-startup-hook).
 
 Run either command from a Git checkout or any subdirectory within it. Each run starts a new, separate guest, so run it again for another isolated copy of the same project.
 
@@ -205,7 +196,7 @@ Commit a `.rox.json` at the root of the branch to set the project's backend and 
 }
 ```
 
-With a `backend` there, plain `rox up` picks it. Each backend section accepts `image`, `cpus`, `memory`, and `prebuild`. Machine-specific settings, such as `engine`, the VM `user`, `identity` and `host_key`, and Git keys, stay in the launcher's config, and Rox rejects them in `.rox.json`.
+With a `backend` there, plain `rox up` picks it. The [Project settings guide](docs/src/content/docs/guides/project-settings.mdx) covers the full format. Each backend section accepts `image`, `cpus`, `memory`, and `prebuild`. Machine-specific settings, such as `engine`, the VM `user`, `identity` and `host_key`, and Git keys, stay in the launcher's config, and Rox rejects them in `.rox.json`.
 
 For a one-off guest, override any of these at launch. Command-line options win over `.rox.json`, which wins over the launcher config.
 
