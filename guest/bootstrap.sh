@@ -11,12 +11,9 @@ case "$stage" in
         command -v git >/dev/null || { echo 'Install Git in the guest.' >&2; exit 1; }
         base="$HOME/.rox/$1"
         mkdir -p -m 700 "$base"
-        # A project image carries a prepared checkout at a fixed path.
-        workspace="$base/project"
-        if [[ -d $HOME/.rox/image/project/.git ]]; then
-            workspace="$HOME/.rox/image/project"
-        fi
-        printf '%s\n' "$workspace" "$base/r.sock"
+        # Projects are checked out under $base/projects, or at the project image's prepared
+        # checkout in $HOME/.rox/image/project. The launcher picks which.
+        printf '%s\n' "$base" "$base/r.sock"
         ;;
     bake-prepare)
         command -v git >/dev/null || { echo 'Install Git in the guest.' >&2; exit 1; }

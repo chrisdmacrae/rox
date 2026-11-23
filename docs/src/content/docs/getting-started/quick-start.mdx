@@ -15,11 +15,12 @@ import { Aside, Steps } from '@astrojs/starlight/components';
    rox up container
    ```
 
-   Rox prints the workspace name, the guest checkout path, and the Rex session ID:
+   Rox prints the workspace name, the project's ID in the guest, the guest checkout path, and the Rex session ID:
 
    ```txt
    Workspace  rv-my-project-3f9a1c2b7d40
-   Checkout   /home/workspace/.rox/rv-my-project-3f9a1c2b7d40/project
+   Project    my-project
+   Checkout   /home/workspace/.rox/rv-my-project-3f9a1c2b7d40/projects/my-project
    Session    session:01a2...
    Inspect    rex -S rv-my-project-3f9a1c2b7d40 session inspect session:01a2...
    ```
@@ -44,16 +45,30 @@ import { Aside, Steps } from '@astrojs/starlight/components';
    rox down rv-my-project-3f9a1c2b7d40
    ```
 
-   Run `rox down` with no name from the project checkout to pick from that project's workspaces.
+   Run `rox down` with no name from the project checkout to pick from the guests that have that project.
 
 </Steps>
+
+Every `rox up` starts a new guest, so run it again whenever you want another isolated copy of the same project.
 
 <Aside type="tip">
 	If the project has a `.rox.sh` setup hook, the first launch builds a [project image](../../guides/project-images/). Later launches skip the clone and the hook, so they start much faster.
 </Aside>
 
+## Share a guest between projects
+
+Start a guest with no project by running `rox up` outside a Git checkout, or by passing `--no-project`. Its Rex session opens in the guest user's home directory. Then add projects to it with `rox add`, from each project's checkout or with `--repo` and `--branch`:
+
+```sh
+rox up container --no-project
+cd ~/src/web && rox add rv-host-3f9a1c2b7d40
+rox add rv-host-3f9a1c2b7d40 --repo git@github.com:organization/api.git --branch main
+```
+
+Each project gets its own checkout and Rex session in the guest. `rox ls` lists the projects in each guest, and `rox shell NAME PROJECT` opens a shell in one of them. Projects added this way always run `.rox.sh` at boot, because the guest's image is already fixed. See [`rox add`](../../reference/cli/#rox-add-name).
+
 ## When a launch fails
 
-Rox registers the guest with Rex as soon as its server answers. If cloning or setup fails later, the guest is kept and you can still reach it with `rex -S NAME ls`. The error message prints the workspace name. Use `rox reconnect NAME` to restore access, or `rox down NAME` to remove it.
+Rox registers the guest with Rex as soon as its server answers. If cloning or setup fails later, the guest is kept and the project is marked failed in `rox ls`. You can still reach the guest with `rex -S NAME ls`, and add other projects to it. The error message prints the workspace name. Use `rox reconnect NAME` to restore access, or `rox down NAME` to remove it.
 
 Logs live under `${XDG_STATE_HOME:-$HOME/.local/state}/rox/NAME`. See [How it works](../../reference/how-it-works/).

@@ -5,7 +5,9 @@ description: Every rox command and option.
 
 ## `rox up BACKEND`
 
-Start and provision a new guest. `BACKEND` is `container`, `linux`, or `macos`. Arguments after `--` run in the guest's first Rex terminal.
+Start and provision a new guest. `BACKEND` is `container`, `linux`, or `macos`. Arguments after `--` run in the guest's first Rex terminal. Each run starts a new guest, even for a project that already has one.
+
+Rox clones the project from the current checkout. Outside a checkout, with no `--repo`, or with `--no-project`, it starts a guest with no project, whose Rex session opens in the guest user's home directory.
 
 ```sh
 rox up container [options] [-- COMMAND [ARG ...]]
@@ -16,7 +18,8 @@ rox up container [options] [-- COMMAND [ARG ...]]
 | `-S`, `--host HOST` | Launch on this [Rex remote host](../../guides/remote-hosts/). |
 | `--config PATH` | Config file on the machine that runs the guest. |
 | `--cwd DIR` | A directory inside the source project. Defaults to the current directory. |
-| `--project NAME` | Project name for a launch without a checkout. Requires `--repo` and `--branch`. |
+| `--project NAME` | Project name for a launch without a checkout. Requires `--repo` and `--branch`. Outside a checkout, the name defaults to the repository name. |
+| `--no-project` | Start a guest without a project, even from inside a checkout. |
 | `--image IMAGE` | Container image or prepared Tart template. Overrides the config. |
 | `--engine docker\|podman` | Container engine. Defaults to `docker`. |
 | `--remote NAME` | Git remote to clone from. Can't be combined with `--repo`. |
@@ -31,13 +34,23 @@ rox up container [options] [-- COMMAND [ARG ...]]
 | `--open-shell` | Open a guest shell in the current Rex session. Requires a Rex terminal. |
 | `--no-app-host` | Don't offer to add the guest to a Rex app that keeps its own host list. |
 
+## `rox add NAME`
+
+Clone a project into the running guest `NAME`, run its `.rox.sh`, and create a Rex session rooted at the checkout. Arguments after `--` run in that session's first terminal. The checkout goes to `~/.rox/NAME/projects/ID` in the guest, where `ID` is the project name with a number added if the guest already has it.
+
+```sh
+rox add NAME [options] [-- COMMAND [ARG ...]]
+```
+
+It accepts `-S`/`--host`, `--config`, `--cwd`, `--project`, `--remote`, `--repo`, `--branch`, `--git-key`, `--git-known-hosts`, `--no-hook`, and `--open-shell`, which work as they do for `rox up`. A project is required. Project images don't apply, so `.rox.sh` always runs at boot. If cloning or the hook fails, the project is marked failed and the guest stays ready.
+
 ## `rox ls`
 
-List local workspace records with their backend, provisioning state, project, and branch.
+List local workspace records with their backend, provisioning state, and projects. Each project shows as `ID:BRANCH`, followed by its state if it isn't ready. A guest with no project shows `-`.
 
-## `rox shell NAME`
+## `rox shell NAME [PROJECT]`
 
-Open an interactive login shell at the guest checkout, with `REX_SERVER` pointing at the guest's server. The workspace must be ready.
+Open an interactive login shell with `REX_SERVER` pointing at the guest's server. `PROJECT` is a project ID or name from `rox ls`. Without it, the shell opens at the guest's only checkout, or in the guest home when it has no projects or several. The guest must be ready.
 
 ## `rox reconnect NAME`
 
@@ -49,7 +62,7 @@ Restore Rex access to a guest that's still running. This also works for a guest 
 
 ## `rox down [NAME]`
 
-Delete the guest, its filesystem, and its Rex host entry. If you leave out `NAME`, Rox picks the current project's workspace. When the project has several, it lists them and asks which one to remove.
+Delete the guest, its filesystem, all of its project checkouts, and its Rex host entry. If you leave out `NAME`, Rox picks the guest that has the current project. When several do, it lists them and asks which one to remove.
 
 | Option | Description |
 | --- | --- |

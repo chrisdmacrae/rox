@@ -19,7 +19,7 @@ import { Card, CardGrid } from '@astrojs/starlight/components';
 rox up container -- my-agent --model example
 ```
 
-`rox` clones your project's remote branch into a fresh guest and runs its `.rox.sh` setup hook, or starts from a project image that has already run it. It then creates a Rex session rooted at the checkout. The guest keeps running after the CLI exits, so you or an agent can reach it with `rex -S NAME`.
+`rox` clones your project's remote branch into a fresh guest and runs its `.rox.sh` setup hook, or starts from a project image that has already run it. It then creates a Rex session rooted at the checkout. The guest keeps running after the CLI exits, so you or an agent can reach it with `rex -S NAME`. You can also start a guest with no project and add several projects to it later with `rox add`.
 
 <CardGrid>
 	<Card title="Containers or VMs" icon="laptop">

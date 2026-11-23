@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Launch a project workspace in a Rex guest."""
+"""Launch Rex guests and the project workspaces inside them."""
 import argparse
 from contextlib import contextmanager
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 import fcntl
 import hashlib
 import ipaddress
@@ -74,25 +74,70 @@ def private_directory(path):
     return path
 
 
+def slugify(value, limit):
+    return re.sub(r"[^a-z0-9]+", "-", value.lower()).strip("-")[:limit].rstrip("-")
+
+
+@dataclass
+class Project:
+    """A checkout inside a guest, with the Rex session rooted at it."""
+    id: str
+    name: str
+    url: str
+    branch: str
+    workspace: str = ""
+    session_id: str = ""
+    phase: str = "cloning"
+
+
 @dataclass
 class Guest:
     name: str
     backend: str
     image: str
-    project: str
-    branch: str
     user: str
     engine: str = ""
     identity: str = ""
     address: str = ""
     port: int = 22
-    workspace: str = ""
     guest_socket: str = ""
+    # The guest's own session, used when it was started without a project.
     session_id: str = ""
     registered: bool = False
     phase: str = "starting"
     container_id: str = ""
+    # The image already holds a prepared checkout of the first project.
     prebuilt: bool = False
+    projects: list = field(default_factory=list)
+
+    @property
+    def base(self):
+        # The guest bootstrap keeps per-guest state in $HOME/.rox/NAME, with the Rex socket inside it.
+        return PurePosixPath(self.guest_socket).parent
+
+    @property
+    def home(self):
+        return self.base.parent.parent
+
+    def add_project(self, name, url, branch):
+        slug = slugify(name, 40) or "project"
+        taken = {project.id for project in self.projects}
+        project_id, number = slug, 1
+        while project_id in taken:
+            number += 1
+            project_id = f"{slug}-{number}"
+        project = Project(project_id, name, url, branch)
+        self.projects.append(project)
+        return project
+
+    def find_project(self, key):
+        matches = [project for project in self.projects if project.id == key]
+        matches = matches or [project for project in self.projects if project.name == key]
+        if len(matches) == 1:
+            return matches[0]
+        choices = ", ".join(project.id for project in self.projects) or "none"
+        problem = "matches several projects" if matches else "is not a project"
+        raise Error(f"{key!r} {problem} on {self.name}. Projects: {choices}")
 
     @property
     def directory(self):
@@ -131,6 +176,15 @@ class Guest:
         if data["name"] != name or data["backend"] not in BACKENDS:
             raise Error(f"Invalid workspace state for {name}")
         data.pop("register_host", None)  # Older launches could opt out of registration.
+        if "projects" not in data:
+            # Older records held exactly one project, and its session was the guest's.
+            project, branch = data.pop("project", ""), data.pop("branch", "")
+            workspace, session = data.pop("workspace", ""), data.pop("session_id", "")
+            data["projects"] = [{
+                "id": slugify(project, 40) or "project", "name": project, "url": "", "branch": branch,
+                "workspace": workspace, "session_id": session, "phase": data.get("phase", "starting"),
+            }] if project else []
+        data["projects"] = [Project(**project) for project in data["projects"]]
         return cls(**data)
 
 
@@ -180,13 +234,35 @@ def validate_clone(url, branch):
         raise Error("Use an SSH or HTTPS Git remote, optionally with --repo")
 
 
-def resolve_project(args):
-    if args.project is None:
+def in_checkout(cwd):
+    result = run(["git", "-C", str(cwd), "rev-parse", "--is-inside-work-tree"], capture=True, check=False)
+    return result.returncode == 0 and result.stdout.strip() == "true"
+
+
+def repo_name(url):
+    name = re.split(r"[/:]", url.rstrip("/"))[-1].removesuffix(".git")
+    return name or "project"
+
+
+def resolve_project(args, required=False):
+    """Return (name, url, branch) for the launch, or None for a guest without a project."""
+    if getattr(args, "no_project", False):
+        if args.project is not None or args.repo or args.remote or args.branch:
+            raise Error("--no-project can't be combined with --project, --repo, --remote or --branch")
+        return None
+    if args.project is not None:
+        if not args.project.strip() or not args.repo or not args.branch:
+            raise Error("--project needs a name, --repo and --branch")
+        validate_clone(args.repo, args.branch)
+        return args.project, args.repo, args.branch
+    if in_checkout(args.cwd):
         return project_from(args.cwd, args.remote, args.repo, args.branch)
-    if not args.project.strip() or not args.repo or not args.branch:
-        raise Error("--project needs a name, --repo and --branch")
-    validate_clone(args.repo, args.branch)
-    return args.project, args.repo, args.branch
+    if args.repo and args.branch:
+        validate_clone(args.repo, args.branch)
+        return repo_name(args.repo), args.repo, args.branch
+    if required or args.repo or args.remote or args.branch:
+        raise Error(f"{args.cwd} is not inside a Git checkout. Run from a checkout, or pass --repo and --branch")
+    return None
 
 
 def config_location(value):
@@ -530,16 +606,15 @@ def build_vm_image(backend, base, target, project, url, branch, hook, commit, se
             return
         reason = "--rebuild" if rebuild else ("first build" if not exists else ".rox.sh or base image changed")
         print(f"Building project image {target} from {base} ({reason})", flush=True)
-        bake_vm(backend, base, target, project, branch, url, settings)
+        bake_vm(backend, base, target, branch, url, settings)
         if exists:
             run(["tart", "delete", target])
         run(["tart", "rename", settings["name"], target])
         record.write_text(json.dumps({**wanted, "commit": commit, "branch": branch}, indent=2) + "\n")
 
 
-def bake_vm(backend, base, target, project, branch, url, settings):
-    guest = BuildGuest(settings["name"], backend, base, project, branch, settings["user"],
-                       identity=str(settings["identity"]))
+def bake_vm(backend, base, target, branch, url, settings):
+    guest = BuildGuest(settings["name"], backend, base, settings["user"], identity=str(settings["identity"]))
     guest.directory.mkdir(mode=0o700, parents=True)
     private_directory(guest.runtime.parent)
     private_directory(guest.runtime)
@@ -700,7 +775,7 @@ def open_relay(guest):
         raise Error(f"Could not reach Rex through the SSH relay. See {log_path}.\n{error}") from error
 
 
-def attach_guest(guest):
+def attach_guest(guest, session_id=""):
     try:
         if not guest.relay_socket.is_socket():
             open_tunnel(guest)
@@ -709,8 +784,16 @@ def attach_guest(guest):
         guest_stage(guest, "server", guest.guest_socket)
         close_tunnel(guest)
         open_relay(guest)
-    if guest.session_id:
-        output([*rex_on(guest), "session", "inspect", guest.session_id, "--json"], timeout=8)
+    if session_id:
+        output([*rex_on(guest), "session", "inspect", session_id, "--json"], timeout=8)
+
+
+def connect(guest):
+    """Find the running guest's SSH address, make sure its Rex server runs, and attach to it."""
+    guest.address, guest.port = container_address(guest) if guest.engine else vm_address(guest)
+    guest.save()
+    guest_stage(guest, "server", guest.guest_socket)
+    attach_guest(guest)
 
 
 def register_guest(guest):
@@ -762,38 +845,48 @@ def offer_app_host(guest):
     print(f"Copied {guest.endpoint}. Paste it into Add Remote Host in the Rex app.", flush=True)
 
 
-def describe_guest(guest):
+def describe_guest(guest, project=None):
     print(f"Workspace  {guest.name}")
-    print(f"Checkout   {guest.workspace}")
     target = guest.name if guest.registered else guest.endpoint
-    if guest.session_id:
-        print(f"Session    {guest.session_id}")
-        print(f"Inspect    rex -S {target} session inspect {guest.session_id}")
+    if project:
+        print(f"Project    {project.id}")
+        print(f"Checkout   {project.workspace}")
+    session = project.session_id if project else guest.session_id
+    if session:
+        print(f"Session    {session}")
+        print(f"Inspect    rex -S {target} session inspect {session}")
     else:
         print(f"Inspect    rex -S {target} ls")
 
 
-def up_on_host(args, command, project, url, branch):
+def project_options(project):
+    if not project:
+        return ["--no-project"]
+    name, url, branch = project
+    return [f"--project={name}", f"--repo={url}", f"--branch={branch}"]
+
+
+def dispatch(args, label, launch, command):
+    """Run a rox command on a Rex remote host in a Provision tab and wait for it."""
     rex = ["rex", "--autostart=false", "-S", args.host]
-    launch = ["rox", "up", args.backend, f"--project={project}", f"--repo={url}",
-              f"--branch={branch}", f"--boot-timeout={args.boot_timeout}", "--open-shell"]
+    launch = ["rox", *launch]
     for option in ("config", "image", "engine", "git_known_hosts"):
-        if (value := getattr(args, option)) is not None:
+        if (value := getattr(args, option, None)) is not None:
             launch.append(f"--{option.replace('_', '-')}={value}")
     launch.extend(f"--git-key={key}" for key in args.git_key or [])
     for flag in ("no_hook", "no_prebuild", "rebuild", "no_app_host"):
-        if getattr(args, flag):
+        if getattr(args, flag, False):
             launch.append(f"--{flag.replace('_', '-')}")
     if command:
         launch.extend(["--", *command])
 
     created = json.loads(output([
         *rex, "new", "--window", "Provision", "--keep-open", "--json",
-        f"rox {project}", "--", *launch,
+        f"rox {label}", "--", *launch,
     ]))
     session = created["session_id"]
     block = created["initial_windows"][0]["block_ids"][0]
-    print(f"Provisioning {project} on {args.host} in Rex session {session}", flush=True)
+    print(f"Provisioning {label} on {args.host} in Rex session {session}", flush=True)
     status = run([*rex, "wait", "-s", session, block], check=False)
     capture = run([*rex, "capture", "-s", session, "-b", block, "--trim", "--unwrap"],
                   check=False, capture=True)
@@ -803,25 +896,101 @@ def up_on_host(args, command, project, url, branch):
         raise Error(f"Provisioning exited with status {status.returncode}. See the Provision tab in {session} on {args.host}.")
 
 
-def open_app_shell(session, name):
+def open_app_shell(session, name, project_id=None):
     run(["rex", "--autostart=false", "window", "new", "-s", session, "--keep-open",
-         "Guest", "--", str(Path(__file__).resolve()), "shell", name])
+         "Guest", "--", str(Path(__file__).resolve()), "shell", name, *([project_id] if project_id else [])])
+
+
+def app_session_for(args):
+    if not args.open_shell:
+        return None
+    session = os.environ.get("REX_SESSION")
+    if not session:
+        raise Error("--open-shell requires a Rex terminal")
+    return session
+
+
+def load_config(args):
+    path = config_location(args.config)
+    if args.config:
+        configured_file(path)
+    return path, config_for(path)
+
+
+def require(tools):
+    for tool in tools:
+        if not shutil.which(tool):
+            raise Error(f"Install {tool} and make it available on PATH")
+
+
+def git_access(args, config, config_path, url):
+    """Return the launcher's Git SSH keys and pinned server keys for cloning url."""
+    keys = args.git_key if args.git_key is not None else config.get("git_keys", [])
+    keys = validate_git_keys(keys, config_path)
+    if urlsplit(url).scheme == "https":
+        return [], ""
+    keys = [configured_file(key) for key in keys]
+    known_hosts_option = args.git_known_hosts or config.get("git_known_hosts")
+    require((["ssh-agent", "ssh-add"] if keys else []) + ([] if known_hosts_option else ["ssh-keygen"]))
+    return keys, git_host_entries(url, known_hosts_option)
+
+
+def start_session(guest, label, cwd, command):
+    launch = ["rex", "--autostart=false", "-S", f"unix://{guest.guest_socket}",
+              "new", label, "-c", str(cwd), "--json"]
+    if command:
+        launch += ["--keep-open", "--", *command]
+    created = json.loads(guest_stage(guest, "session", *launch, capture=True))
+    if not created.get("session_id"):
+        raise Error("Rex did not return a session ID")
+    return created["session_id"]
+
+
+def provision_project(guest, source, command, keys, known_hosts, no_hook, image_checkout=False):
+    """Clone a project into a ready guest, run its hook and start a Rex session at the checkout."""
+    name, url, branch = source
+    project = guest.add_project(name, url, branch)
+    # A project image keeps its prepared checkout at a fixed path beside the per-guest state.
+    project.workspace = str(guest.base.parent / "image" / "project" if image_checkout
+                            else guest.base / "projects" / project.id)
+    guest.save()
+    print(f"Adding {name} ({branch}) to {guest.name} as {project.id}", flush=True)
+    try:
+        if known_hosts:
+            target = str(PurePosixPath(project.workspace).parent / "git_known_hosts")
+            upload = ["bash", "-c", 'umask 077; mkdir -p "${1%/*}" && cat > "$1"', "rox", target]
+            run(remote_command(guest, upload), input=known_hosts)
+        with git_agent(guest, keys) as agent:
+            guest_stage(guest, "clone", project.workspace, url, branch, "yes" if agent else "no", agent=agent)
+        guest_stage(guest, "setup", project.workspace, guest.name, guest.backend, guest.guest_socket,
+                    "prebuilt" if image_checkout else str(no_hook).lower())
+        project.session_id = start_session(guest, name, project.workspace, command)
+        guest.save()
+        attach_guest(guest, project.session_id)
+        project.phase = "ready"
+        guest.save()
+    except (Exception, KeyboardInterrupt):
+        project.phase = "failed"
+        guest.save()
+        print(f"Setting up {project.id} failed. Rex host {guest.name} is still available.", file=sys.stderr)
+        print(f"Workspace {guest.name} was retained. Run rox down {guest.name} to remove it.", file=sys.stderr)
+        raise
+    return project
 
 
 def up(args, command):
     if args.host is not None and not args.host.strip():
         raise Error("--host needs a Rex host label or address")
-    project, url, branch = resolve_project(args)
+    source = resolve_project(args)
     if args.host is not None:
-        up_on_host(args, command, project, url, branch)
+        dispatch(args, source[0] if source else "host",
+                 ["up", args.backend, *project_options(source), f"--boot-timeout={args.boot_timeout}",
+                  "--open-shell"], command)
         return
-    app_session = os.environ.get("REX_SESSION") if args.open_shell else None
-    if args.open_shell and not app_session:
-        raise Error("--open-shell requires a Rex terminal")
-    config_path = config_location(args.config)
-    if args.config:
-        configured_file(config_path)
-    config = config_for(config_path)
+    if not source:
+        print("Starting a guest without a project. Add one later with rox add NAME.", flush=True)
+    app_session = app_session_for(args)
+    config_path, config = load_config(args)
     settings = config.get(args.backend, {})
     if not isinstance(settings, dict):
         raise Error(f"Expected an object for {args.backend} in {config_path}")
@@ -835,11 +1004,6 @@ def up(args, command):
     image = args.image or settings.get("image") or (DEFAULT_CONTAINER_IMAGE if engine else "")
     if not isinstance(image, str) or not image or image.startswith("-"):
         raise Error(f"Choose a {args.backend} image with --image or in {config_path}")
-    keys = args.git_key if args.git_key is not None else config.get("git_keys", [])
-    keys = validate_git_keys(keys, config_path)
-    use_ssh = urlsplit(url).scheme != "https"
-    keys = [configured_file(key) for key in keys] if use_ssh else []
-    known_hosts_option = args.git_known_hosts or config.get("git_known_hosts")
     identity = None
     host_key = None
     user = "workspace"
@@ -852,41 +1016,36 @@ def up(args, command):
     prebuild = settings.get("prebuild", True)
     if not isinstance(prebuild, bool):
         raise Error(f"Expected true or false for {args.backend}.prebuild in {config_path}")
-    prebuild = prebuild and not args.no_prebuild and not args.no_hook
+    prebuild = prebuild and bool(source) and not args.no_prebuild and not args.no_hook
     if args.rebuild and not prebuild:
-        raise Error("--rebuild needs a project image, which --no-hook, --no-prebuild or prebuild: false disable")
+        raise Error("--rebuild needs a project image, which --no-project, --no-hook, --no-prebuild "
+                    "or prebuild: false disable")
 
     required = ["rex", "ssh", engine or "tart"]
     if prebuild:
         required.append("git")
-    if engine or (use_ssh and not known_hosts_option):
+    if engine:
         required.append("ssh-keygen")
-    if keys:
-        required += ["ssh-agent", "ssh-add"]
-    for tool in required:
-        if not shutil.which(tool):
-            raise Error(f"Install {tool} and make it available on PATH")
+    require(required)
     if engine:
         output([engine, "info"], timeout=20)
-    known_hosts = git_host_entries(url, known_hosts_option) if use_ssh else ""
+    keys, known_hosts = git_access(args, config, config_path, source[1]) if source else ([], "")
     private_directory(state_root())
     if engine:
         prepare_container_image(engine, image)
     prebuilt = ""
     if prebuild:
         vm = {"user": user, "identity": identity, "host_key": host_key, "boot_timeout": args.boot_timeout}
-        prebuilt = prepare_project_image(args.backend, engine, image, project, url, branch,
+        prebuilt = prepare_project_image(args.backend, engine, image, source[0], source[1], source[2],
                                          keys, known_hosts, vm, args.rebuild)
 
-    slug = re.sub(r"[^a-z0-9]+", "-", project.lower()).strip("-")[:24].rstrip("-") or "project"
-    name = f"rv-{slug}-{secrets.token_hex(6)}"
-    guest = Guest(name, args.backend, prebuilt or image, project, branch, user, engine,
-                  prebuilt=bool(prebuilt))
+    name = f"rv-{slugify(source[0] if source else 'host', 24) or 'project'}-{secrets.token_hex(6)}"
+    guest = Guest(name, args.backend, prebuilt or image, user, engine, prebuilt=bool(prebuilt))
     guest.directory.mkdir(mode=0o700)
     guest.identity = str(identity or guest.directory / "login")
     with guest_lock(guest.directory):
         guest.save()
-        print(f"Starting {guest.name} from {project} ({branch})", flush=True)
+        print(f"Starting {guest.name}" + (f" from {source[0]} ({source[2]})" if source else ""), flush=True)
         try:
             if host_key:
                 pin_host(guest, host_key.read_text())
@@ -897,33 +1056,18 @@ def up(args, command):
             check_guest_os(guest, args.boot_timeout)
             paths = guest_stage(guest, "prepare", guest.name, capture=True).splitlines()
             if len(paths) != 2 or any(not path.startswith("/") or ":" in path for path in paths):
-                raise Error("Guest preparation did not return valid workspace and socket paths")
-            guest.workspace, guest.guest_socket = paths
+                raise Error("Guest preparation did not return valid state and socket paths")
+            guest.guest_socket = paths[1]
             guest.save()
             guest_stage(guest, "server", guest.guest_socket)
             attach_guest(guest)
             register_guest(guest)
-            if known_hosts:
-                target = str(PurePosixPath(guest.workspace).parent / "git_known_hosts")
-                upload = ["bash", "-c", 'umask 077; cat > "$1"', "rox", target]
-                run(remote_command(guest, upload), input=known_hosts)
-            with git_agent(guest, keys) as agent:
-                guest_stage(guest, "clone", guest.workspace, url, branch, "yes" if agent else "no", agent=agent)
-            guest_stage(guest, "setup", guest.workspace, guest.name, guest.backend, guest.guest_socket,
-                        "prebuilt" if guest.prebuilt else str(args.no_hook).lower())
-            launch = ["rex", "--autostart=false", "-S", f"unix://{guest.guest_socket}",
-                      "new", guest.project, "-c", guest.workspace, "--json"]
-            if command:
-                launch += ["--keep-open", "--", *command]
-            created = json.loads(guest_stage(guest, "session", *launch, capture=True))
-            guest.session_id = created["session_id"]
-            if not guest.session_id:
-                raise Error("Rex did not return a session ID")
-            guest.save()
-            attach_guest(guest)
+            if not source:
+                guest.session_id = start_session(guest, guest.name, guest.home, command)
+                guest.save()
+                attach_guest(guest, guest.session_id)
             guest.phase = "ready"
             guest.save()
-            describe_guest(guest)
         except (Exception, KeyboardInterrupt):
             guest.phase = "failed"
             guest.save()
@@ -931,22 +1075,65 @@ def up(args, command):
                 print(f"Rex host {guest.name} is available even though setup failed.", file=sys.stderr)
             print(f"Workspace {guest.name} was retained. Run rox down {guest.name} to remove it.", file=sys.stderr)
             raise
+        project = None
+        if source:
+            project = provision_project(guest, source, command, keys, known_hosts, args.no_hook,
+                                        image_checkout=bool(prebuilt))
+        describe_guest(guest, project)
 
     if not args.no_app_host:
         offer_app_host(guest)
     if app_session:
         try:
-            open_app_shell(app_session, guest.name)
+            open_app_shell(app_session, guest.name, project.id if project else None)
         except subprocess.CalledProcessError as error:
             raise Error(f"{guest.name} is ready. Open it on this host with rox shell {guest.name}.") from error
 
 
-def shell(name):
+def add(args, command):
+    """Clone another project into a guest that is already running."""
+    if args.host is not None and not args.host.strip():
+        raise Error("--host needs a Rex host label or address")
+    if not re.fullmatch(NAME_PATTERN, args.name):
+        raise Error(f"Invalid workspace name {args.name!r}")
+    source = resolve_project(args, required=True)
+    if args.host is not None:
+        dispatch(args, source[0], ["add", args.name, *project_options(source), "--open-shell"], command)
+        return
+    app_session = app_session_for(args)
+    config_path, config = load_config(args)
+    require(["rex", "ssh"])
+    keys, known_hosts = git_access(args, config, config_path, source[1])
+    guest = Guest.load(args.name)
+    with guest_lock(guest.directory):
+        guest = Guest.load(args.name)
+        if guest.phase != "ready" or not guest.guest_socket:
+            raise Error(f"{guest.name} is {guest.phase}. Run rox reconnect {guest.name} before adding a project")
+        connect(guest)
+        register_guest(guest)
+        project = provision_project(guest, source, command, keys, known_hosts, args.no_hook)
+        describe_guest(guest, project)
+    if app_session:
+        try:
+            open_app_shell(app_session, guest.name, project.id)
+        except subprocess.CalledProcessError as error:
+            raise Error(f"{project.id} is ready. Open it with rox shell {guest.name} {project.id}.") from error
+
+
+def shell(name, key=None):
     guest = Guest.load(name)
     if guest.phase != "ready":
         raise Error(f"{name} is not ready")
+    project = guest.find_project(key) if key else None
+    if not key and len(guest.projects) == 1:
+        project = guest.projects[0]
+    elif not key and guest.projects:
+        choices = ", ".join(project.id for project in guest.projects)
+        print(f"{name} has several projects ({choices}). Opening the guest home; "
+              f"run rox shell {name} PROJECT to open a checkout.", file=sys.stderr)
+    directory = project.workspace if project else str(guest.home)
     command = ["env", f"REX_SERVER=unix://{guest.guest_socket}", "sh", "-c",
-               'cd "$1" && exec "${SHELL:-/bin/sh}" -l', "rox", guest.workspace]
+               'cd "$1" && exec "${SHELL:-/bin/sh}" -l', "rox", directory]
     argv = remote_command(guest, command, tty=True)
     os.execvpe(argv[0], argv, {**os.environ, "TERM": "xterm-256color"})
 
@@ -958,15 +1145,13 @@ def reconnect(name, app_host=True):
         if not guest.guest_socket or guest.phase == "removing":
             raise Error(f"{name} did not get far enough to start a Rex server")
         close_tunnel(guest)
-        guest.address, guest.port = container_address(guest) if guest.engine else vm_address(guest)
-        guest.save()
-        guest_stage(guest, "server", guest.guest_socket)
-        attach_guest(guest)
+        connect(guest)
         register_guest(guest)
-        if guest.session_id:
-            guest.phase = "ready"
-            guest.save()
+        guest.phase = "ready"
+        guest.save()
         describe_guest(guest)
+        for project in guest.projects:
+            print(f"Project    {project.id}  {project.phase}  {project.workspace}")
     if app_host:
         offer_app_host(guest)
 
@@ -1027,12 +1212,12 @@ def current_project(cwd):
 def choose_project_guest(cwd):
     project = current_project(cwd)
     guests = [Guest.load(path.parent.name) for path in sorted(state_root().glob("*/guest.json"))]
-    guests = [guest for guest in guests if guest.project == project]
+    guests = [guest for guest in guests if any(entry.name == project for entry in guest.projects)]
     if not guests:
         raise Error(f"No workspaces for {project}. Run rox ls to see all workspaces.")
     if len(guests) == 1:
         return guests[0].name
-    listing = "\n".join(f"  {index}) {guest.name}  {guest.backend}  {guest.phase}  {guest.branch}"
+    listing = "\n".join(f"  {index}) {guest.name}  {guest.backend}  {guest.phase}  {project_summary(guest)}"
                         for index, guest in enumerate(guests, 1))
     if not sys.stdin.isatty():
         raise Error(f"{project} has {len(guests)} workspaces. Choose one with rox down NAME:\n{listing}")
@@ -1046,10 +1231,16 @@ def choose_project_guest(cwd):
     return guests[int(answer) - 1].name
 
 
+def project_summary(guest):
+    entries = [f"{project.id}:{project.branch}" + ("" if project.phase == "ready" else f" ({project.phase})")
+               for project in guest.projects]
+    return ", ".join(entries) or "-"
+
+
 def list_guests():
     for path in sorted(state_root().glob("*/guest.json")):
         guest = Guest.load(path.parent.name)
-        print(f"{guest.name}\t{guest.backend}\t{guest.phase}\t{guest.project}:{guest.branch}")
+        print(f"{guest.name}\t{guest.backend}\t{guest.phase}\t{project_summary(guest)}")
 
 
 APP_HOST_HELP = "don't offer to add the guest to a Rex app that keeps its own host list"
@@ -1063,31 +1254,42 @@ def positive_int(value):
 
 
 def main(argv):
-    parser = argparse.ArgumentParser(description=__doc__, epilog="Pass -- COMMAND [ARG ...] to up to start a command in Rex.")
+    parser = argparse.ArgumentParser(description=__doc__, epilog="Pass -- COMMAND [ARG ...] to up or add to start a command in Rex.")
     commands = parser.add_subparsers(dest="command", required=True)
     start = commands.add_parser("up", help="start and provision a new guest")
     start.add_argument("backend", choices=BACKENDS)
-    start.add_argument("-S", "--host", help="launch on this Rex remote host")
-    start.add_argument("--config", help="config file on the machine that runs the guest")
-    start.add_argument("--cwd", type=Path, default=Path.cwd(), help="directory within the source project")
-    start.add_argument("--project", help="project name for a launch from --repo and --branch without a checkout")
+    attach = commands.add_parser("add", help="clone a project into a running guest")
+    attach.add_argument("name", help="workspace to add the project to")
+
+    def project_arguments(parser):
+        parser.add_argument("-S", "--host", help="run on this Rex remote host")
+        parser.add_argument("--config", help="config file on the machine that runs the guest")
+        parser.add_argument("--cwd", type=Path, default=Path.cwd(), help="directory within the source project")
+        parser.add_argument("--project", help="project name for a launch from --repo and --branch without a checkout")
+        remotes = parser.add_mutually_exclusive_group()
+        remotes.add_argument("--remote", help="Git remote name")
+        remotes.add_argument("--repo", help="override the repository URL")
+        parser.add_argument("--branch", help="remote branch to clone")
+        parser.add_argument("--git-key", action="append", help="Git SSH identity (repeatable)")
+        parser.add_argument("--git-known-hosts", help="known_hosts file for Git SSH servers")
+        parser.add_argument("--no-hook", action="store_true", help="skip the project's .rox.sh")
+        parser.add_argument("--open-shell", action="store_true", help="open a guest shell in the current Rex session")
+
+    project_arguments(start)
+    project_arguments(attach)
+    start.add_argument("--no-project", action="store_true",
+                       help="start a guest without a project, even from inside a checkout")
     start.add_argument("--image", help="container image or prepared Tart template")
     start.add_argument("--engine", choices=("docker", "podman"))
-    remotes = start.add_mutually_exclusive_group()
-    remotes.add_argument("--remote", help="Git remote name")
-    remotes.add_argument("--repo", help="override the repository URL")
-    start.add_argument("--branch", help="remote branch to clone")
-    start.add_argument("--git-key", action="append", help="Git SSH identity (repeatable)")
-    start.add_argument("--git-known-hosts", help="known_hosts file for Git SSH servers")
     start.add_argument("--boot-timeout", type=positive_int, default=120, help="seconds per guest readiness check")
-    start.add_argument("--no-hook", action="store_true", help="skip the project's .rox.sh")
     start.add_argument("--no-prebuild", action="store_true",
                        help="clone and run .rox.sh at boot instead of using a project image")
     start.add_argument("--rebuild", action="store_true", help="rebuild the project image before launching")
-    start.add_argument("--open-shell", action="store_true", help="open a guest shell in the current Rex session")
     start.add_argument("--no-app-host", action="store_true", help=APP_HOST_HELP)
     commands.add_parser("ls", help="list managed workspaces")
-    commands.add_parser("shell", help="open an interactive guest shell").add_argument("name")
+    shell_parser = commands.add_parser("shell", help="open an interactive guest shell")
+    shell_parser.add_argument("name")
+    shell_parser.add_argument("project", nargs="?", help="project checkout to open; omit for the only one or the guest home")
     reconnect_parser = commands.add_parser("reconnect", help="restore access to a running workspace")
     reconnect_parser.add_argument("name")
     reconnect_parser.add_argument("--no-app-host", action="store_true", help=APP_HOST_HELP)
@@ -1110,12 +1312,14 @@ def main(argv):
     args = parser.parse_args(argv)
     if args.command == "up":
         up(args, command)
+    elif args.command == "add":
+        add(args, command)
     elif command:
-        parser.error("only up accepts a command after --")
+        parser.error("only up and add accept a command after --")
     elif args.command == "ls":
         list_guests()
     elif args.command == "shell":
-        shell(args.name)
+        shell(args.name, args.project)
     elif args.command == "reconnect":
         reconnect(args.name, app_host=not args.no_app_host)
     elif args.command == "key":

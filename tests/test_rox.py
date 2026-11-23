@@ -137,12 +137,14 @@ class WorkspaceTests(unittest.TestCase):
         self.assertFalse(rox.state_root().exists())
 
     def test_explicit_project_can_launch_without_a_checkout(self):
-        with patch.object(rox, "up_on_host") as launch:
+        with patch.object(rox, "dispatch") as launch:
             rox.main([
                 "up", "linux", "-S", "buildbox", "--cwd", str(self.root / "missing"),
                 "--project", "fixture", "--repo", "https://git.example.test/repo.git", "--branch", "main",
             ])
-        self.assertEqual(launch.call_args.args[2:], ("fixture", "https://git.example.test/repo.git", "main"))
+        self.assertEqual(launch.call_args.args[1], "fixture")
+        self.assertEqual(launch.call_args.args[2][2:5], [
+            "--project=fixture", "--repo=https://git.example.test/repo.git", "--branch=main"])
 
     def test_empty_remote_host_never_falls_back_to_local_launch(self):
         with patch.object(rox, "resolve_project") as resolve:
@@ -172,9 +174,11 @@ class WorkspaceTests(unittest.TestCase):
         self.assertIn("rox: command not found", captured.getvalue())
 
     def test_shell_attaches_to_guest_checkout_without_agent_forwarding(self):
-        guest = rox.Guest("rv-fixture-000011112222", "container", "image", "fixture", "main", "workspace",
-                              address="127.0.0.1", port=44000, phase="ready",
-                              workspace="/home/workspace/project with spaces", guest_socket="/home/workspace/rex.sock")
+        guest = rox.Guest("rv-fixture-000011112222", "container", "image", "workspace",
+                          address="127.0.0.1", port=44000, phase="ready",
+                          guest_socket="/home/workspace/.rox/rv-fixture-000011112222/r.sock",
+                          projects=[rox.Project("fixture", "fixture", "", "main",
+                                                workspace="/home/workspace/project with spaces")])
         with patch.object(rox.Guest, "load", return_value=guest), patch.object(rox.os, "execvpe") as exec_run:
             rox.main(["shell", guest.name])
         executable, argv, env = exec_run.call_args.args
@@ -182,7 +186,7 @@ class WorkspaceTests(unittest.TestCase):
         self.assertIn("-t", argv)
         self.assertIn("ForwardAgent=no", argv)
         self.assertEqual(argv[-3:-1], ["--", "127.0.0.1"])
-        self.assertEqual(shlex.split(argv[-1])[-1], guest.workspace)
+        self.assertEqual(shlex.split(argv[-1])[-1], guest.projects[0].workspace)
         self.assertEqual(env["TERM"], "xterm-256color")
 
     def test_first_container_launch_builds_the_default_image_before_provisioning(self):
@@ -226,9 +230,8 @@ class WorkspaceTests(unittest.TestCase):
         ])
 
     def test_default_container_image_run_uses_local_storage(self):
-        guest = rox.Guest("rv-fixture-000011112222", "container", "rox:linux",
-                              "fixture", "main", "workspace", engine="docker",
-                              identity=str(self.root / "login"))
+        guest = rox.Guest("rv-fixture-000011112222", "container", "rox:linux", "workspace", engine="docker",
+                          identity=str(self.root / "login"))
         (self.root / "login.pub").write_text("ssh-ed25519 AAAA fixture\n")
         with (
             patch.object(rox, "run"),
@@ -293,8 +296,8 @@ class WorkspaceTests(unittest.TestCase):
 
     def test_reconnect_registers_a_retained_guest_that_never_created_a_session(self):
         name = "rv-retained-000011112222"
-        guest = rox.Guest(name, "container", "image", "fixture", "main", "workspace",
-                              engine="docker", guest_socket="/home/workspace/r.sock", phase="failed")
+        guest = rox.Guest(name, "container", "image", "workspace",
+                          engine="docker", guest_socket="/home/workspace/r.sock", phase="failed")
         guest.directory.mkdir(parents=True)
         guest.save()
         state_file = guest.directory / "guest.json"
@@ -312,12 +315,11 @@ class WorkspaceTests(unittest.TestCase):
         self.assertEqual(command.call_args.args[0], ["rex", "hosts", "add", name, guest.endpoint])
         reopened = rox.Guest.load(name)
         self.assertTrue(reopened.registered)
-        self.assertEqual(reopened.phase, "failed")
+        self.assertEqual(reopened.phase, "ready")
 
     def test_tunnel_eof_checks_guest_and_falls_back_to_ssh_stdio(self):
-        guest = rox.Guest("rv-fixture-000011112222", "container", "image",
-                              "fixture", "main", "workspace", guest_socket="/home/workspace/r.sock",
-                              session_id="session:fixture")
+        guest = rox.Guest("rv-fixture-000011112222", "container", "image", "workspace",
+                          guest_socket="/home/workspace/r.sock")
         calls = []
 
         def probe(argv, **kwargs):
@@ -333,14 +335,14 @@ class WorkspaceTests(unittest.TestCase):
             patch.object(rox, "close_tunnel", side_effect=lambda guest: calls.append("close")),
             patch.object(rox, "open_relay", side_effect=lambda guest: calls.append("relay")),
         ):
-            rox.attach_guest(guest)
+            rox.attach_guest(guest, "session:fixture")
         self.assertEqual(calls, [
             "tunnel",
             [*rox.rex_on(guest), "ls", "--json"],
             ("server", guest.guest_socket),
             "close",
             "relay",
-            [*rox.rex_on(guest), "session", "inspect", guest.session_id, "--json"],
+            [*rox.rex_on(guest), "session", "inspect", "session:fixture", "--json"],
         ])
 
     def provision(self, backend, fail_stage=None, open_shell=False, prebuilt=""):
@@ -374,7 +376,7 @@ class WorkspaceTests(unittest.TestCase):
         def stage(guest, name, *args, agent=None, capture=False):
             stages.append(name)
             if name == "prepare":
-                return "/home/guest/project\n/home/guest/r.sock"
+                return f"/home/guest/.rox/{guest.name}\n/home/guest/.rox/{guest.name}/r.sock"
             if name == "clone":
                 self.assertIsNotNone(agent)
                 self.assertEqual(agent, active_agent)
@@ -386,7 +388,7 @@ class WorkspaceTests(unittest.TestCase):
             if name == "setup":
                 self.assertEqual(args[-1], "prebuilt" if prebuilt else "false")
             if name == "session":
-                self.assertIn("unix:///home/guest/r.sock", args)
+                self.assertIn(f"unix:///home/guest/.rox/{guest.name}/r.sock", args)
                 self.assertEqual(args[-3:], ("--", "agent", "an argument with spaces"))
                 return '{"session_id":"session:fixture"}'
             return None
@@ -432,15 +434,24 @@ class WorkspaceTests(unittest.TestCase):
                 rox.main(argv)
             name = next(rox.state_root().glob("*/guest.json")).parent.name
             state = rox.Guest.load(name)
-            self.assertEqual(state.phase, "failed" if fail_stage else "ready")
+            # A failed clone or hook leaves the guest itself usable.
+            self.assertEqual(state.phase, "ready")
             self.assertEqual((state.image, state.prebuilt), (prebuilt or "fixture", bool(prebuilt)))
             self.assertTrue(state.registered)
             self.assertEqual(commands.count(["rex", "hosts", "add", name, state.endpoint]), 1)
+            [project] = state.projects
+            self.assertEqual((project.id, project.name, project.branch),
+                             ("sample-project", "sample project", "published-feature"))
+            self.assertEqual(project.workspace, f"/home/guest/.rox/image/project" if prebuilt
+                             else f"/home/guest/.rox/{name}/projects/sample-project")
+            self.assertEqual(project.phase, "failed" if fail_stage else "ready")
             if not fail_stage:
-                self.assertEqual(state.session_id, "session:fixture")
+                self.assertEqual(project.session_id, "session:fixture")
+                self.assertEqual(state.session_id, "")
                 if open_shell:
                     self.assertIn(["rex", "--autostart=false", "window", "new", "-s", "session:launcher",
-                                   "--keep-open", "Guest", "--", str(ROOT / "rox"), "shell", name], commands)
+                                   "--keep-open", "Guest", "--", str(ROOT / "rox"), "shell", name,
+                                   "sample-project"], commands)
             rox.main(["down", name])
             self.assertFalse(state.directory.exists())
             self.assertIn(["rex", "hosts", "remove", name], commands)
@@ -494,7 +505,13 @@ class WorkspaceTests(unittest.TestCase):
     def test_bootstrap_bakes_then_boots_from_the_image_checkout(self):
         origin, git = self.make_origin('printf "%s %s %s" "$ROX_PHASE" "$ROX_NAME" "${REX_SERVER:-none}" > baked\n')
         home = self.guest_home()
-        env = {**os.environ, "HOME": str(home), "REX_SERVER": "unix:///leak"}
+        # prepare only checks that the guest has Rex, so a stub keeps the test off the host's install.
+        tools = self.root / "guest-tools"
+        tools.mkdir()
+        (tools / "rex").write_text("#!/bin/sh\nexit 0\n")
+        (tools / "rex").chmod(0o755)
+        env = {**os.environ, "HOME": str(home), "REX_SERVER": "unix:///leak",
+               "PATH": f"{tools}{os.pathsep}{os.environ['PATH']}"}
         bootstrap = ["bash", str(ROOT / "guest/bootstrap.sh")]
         workspace = subprocess.run([*bootstrap, "bake-prepare"], env=env, check=True,
                                    capture_output=True, text=True).stdout.strip()
@@ -510,7 +527,8 @@ class WorkspaceTests(unittest.TestCase):
         subprocess.run([*git, "commit", "--quiet", "-am", "two"], check=True)
         paths = subprocess.run([*bootstrap, "prepare", "rv-fixture-000011112222"], env=env, check=True,
                                capture_output=True, text=True).stdout.splitlines()
-        self.assertEqual(paths, [workspace, str(home / ".rox/rv-fixture-000011112222/r.sock")])
+        self.assertEqual(paths, [str(home / ".rox/rv-fixture-000011112222"),
+                                 str(home / ".rox/rv-fixture-000011112222/r.sock")])
         subprocess.run([*bootstrap, "clone", workspace, str(origin), "main", "no"], env=env, check=True,
                        capture_output=True)
         self.assertEqual((Path(workspace) / "README").read_text(), "two\n")
@@ -604,8 +622,8 @@ class WorkspaceTests(unittest.TestCase):
                       "--repo", "https://git.example.test/repo.git", "--branch", "main"])
 
     def app_host_fixture(self, transport="unix", answer="\n"):
-        guest = rox.Guest("rv-app-000011112222", "container", "image", "fixture", "main",
-                              "workspace", guest_socket="/home/workspace/r.sock", registered=True)
+        guest = rox.Guest("rv-app-000011112222", "container", "image", "workspace",
+                          guest_socket="/home/workspace/r.sock", registered=True)
         clients = {"clients": [
             {"client_id": "client:cli", "info": {"kind": "cli"}, "connection_state": "connected",
              "principal": {"transport": "unix"}},
@@ -652,17 +670,16 @@ class WorkspaceTests(unittest.TestCase):
         self.assertNotIn("host list?", printed)
 
     def test_app_host_is_skipped_without_a_terminal(self):
-        guest = rox.Guest("rv-app-000011112222", "container", "image", "fixture", "main",
-                              "workspace", guest_socket="/home/workspace/r.sock", registered=True)
+        guest = rox.Guest("rv-app-000011112222", "container", "image", "workspace",
+                          guest_socket="/home/workspace/r.sock", registered=True)
         with patch.object(rox, "run") as command:
             rox.offer_app_host(guest)
         command.assert_not_called()
 
     def test_reconnect_offers_the_app_host_unless_disabled(self):
         name = "rv-retained-000011112222"
-        guest = rox.Guest(name, "container", "image", "fixture", "main", "workspace",
-                              engine="docker", guest_socket="/home/workspace/r.sock",
-                              session_id="session:fixture")
+        guest = rox.Guest(name, "container", "image", "workspace",
+                          engine="docker", guest_socket="/home/workspace/r.sock")
         guest.directory.mkdir(parents=True)
         guest.save()
         for argv, offered in ((["reconnect", name], True), (["reconnect", name, "--no-app-host"], False)):
@@ -703,7 +720,8 @@ class WorkspaceTests(unittest.TestCase):
         self.assertIn("--no-app-host", requests[0])
 
     def save_guest(self, name, project):
-        guest = rox.Guest(name, "container", "image", project, "main", "workspace", engine="docker")
+        guest = rox.Guest(name, "container", "image", "workspace", engine="docker")
+        guest.add_project(project, "https://git.example.test/repo.git", "main")
         guest.directory.mkdir(parents=True)
         guest.save()
         return guest
@@ -750,6 +768,213 @@ class WorkspaceTests(unittest.TestCase):
         self.save_guest("rv-other-000011112222", "other project")
         with self.assertRaisesRegex(rox.Error, "No workspaces for sample project"):
             self.down_without_name()
+
+    @contextlib.contextmanager
+    def fake_guests(self):
+        """Stand in for the guest runtime, recording guest stages and host commands."""
+        record = {"stages": [], "commands": [], "sessions": iter(f"session:{n}" for n in range(1, 99))}
+
+        def stage(guest, name, *args, agent=None, capture=False):
+            record["stages"].append((name, *args))
+            if name == "prepare":
+                return f"/home/guest/.rox/{guest.name}\n/home/guest/.rox/{guest.name}/r.sock"
+            if name == "session":
+                return json.dumps({"session_id": next(record["sessions"])})
+            return None
+
+        real_run = rox.run
+        real_output = rox.output
+
+        def command(argv, capture=False, check=True, **kwargs):
+            if argv[0] == "git":
+                return real_run(argv, capture=capture, check=check, **kwargs)
+            record["commands"].append(argv)
+            return subprocess.CompletedProcess(argv, 0, "", "")
+
+        def probe(argv, **kwargs):
+            return real_output(argv, **kwargs) if argv[0] == "git" else "{}"
+
+        with (
+            patch.object(rox.Guest, "runtime", property(lambda guest: self.root / "runtime" / guest.name)),
+            patch.object(rox, "run", side_effect=command),
+            patch.object(rox, "prepare_project_image", return_value="") as prepare,
+            patch.object(rox, "guest_stage", side_effect=stage),
+            patch.object(rox, "check_guest_os"),
+            patch.object(rox, "launch_guest", return_value=("127.0.0.1", 22)),
+            patch.object(rox, "container_address", return_value=("127.0.0.1", 22)),
+            patch.object(rox, "open_tunnel"),
+            patch.object(rox, "output", side_effect=probe),
+            patch.object(rox, "git_host_entries", return_value=""),
+            patch.dict(os.environ, {"XDG_CONFIG_HOME": str(self.root / "no-config")}),
+            patch.object(rox.shutil, "which", return_value="/fixture"),
+            contextlib.redirect_stderr(io.StringIO()),
+        ):
+            record["prepare"] = prepare
+            yield record
+
+    def guests(self):
+        return [rox.Guest.load(path.parent.name) for path in sorted(rox.state_root().glob("*/guest.json"))]
+
+    def test_up_outside_a_checkout_starts_a_guest_without_a_project(self):
+        outside = self.root / "not a checkout"
+        outside.mkdir()
+        printed = io.StringIO()
+        with self.fake_guests() as record, contextlib.redirect_stdout(printed):
+            rox.main(["up", "container", "--cwd", str(outside), "--", "agent"])
+        [guest] = self.guests()
+        self.assertRegex(guest.name, r"^rv-host-[a-f0-9]{12}$")
+        self.assertEqual((guest.phase, guest.projects, guest.session_id), ("ready", [], "session:1"))
+        record["prepare"].assert_not_called()
+        self.assertEqual([stage[0] for stage in record["stages"]], ["prepare", "server", "session"])
+        session = record["stages"][-1]
+        self.assertEqual(session[session.index("-c") + 1], "/home/guest")
+        self.assertEqual(session[-3:], ("--keep-open", "--", "agent"))
+        self.assertIn("without a project", printed.getvalue())
+
+    def test_no_project_starts_an_empty_guest_from_inside_a_checkout(self):
+        with self.fake_guests(), contextlib.redirect_stdout(io.StringIO()):
+            rox.main(["up", "container", "--no-project", "--cwd", str(self.make_repo())])
+        [guest] = self.guests()
+        self.assertEqual(guest.projects, [])
+        with self.assertRaisesRegex(rox.Error, "--no-project can't be combined"):
+            rox.main(["up", "container", "--no-project", "--branch", "main"])
+        with self.assertRaisesRegex(rox.Error, "--rebuild needs a project image"):
+            rox.main(["up", "container", "--no-project", "--rebuild"])
+
+    def test_outside_a_checkout_a_repo_and_branch_name_the_project(self):
+        args = rox.argparse.Namespace(no_project=False, project=None, remote=None, cwd=self.root / "missing",
+                                      repo="git@git.example.test:team/web-app.git", branch="main")
+        self.assertEqual(rox.resolve_project(args), ("web-app", args.repo, "main"))
+        args.branch = None
+        with self.assertRaisesRegex(rox.Error, "not inside a Git checkout"):
+            rox.resolve_project(args)
+
+    def test_add_clones_projects_into_a_running_guest(self):
+        repo = self.make_repo()
+        with self.fake_guests() as record, contextlib.redirect_stdout(io.StringIO()):
+            rox.main(["up", "container", "--no-project", "--cwd", str(self.root)])
+            [guest] = self.guests()
+            record["stages"].clear()
+            rox.main(["add", guest.name, "--cwd", str(repo), "--no-hook", "--", "agent"])
+            rox.main(["add", guest.name, "--project", "other", "--repo", "https://git.example.test/other.git",
+                      "--branch", "main"])
+            rox.main(["add", guest.name, "--cwd", str(repo)])
+        guest = rox.Guest.load(guest.name)
+        base = f"/home/guest/.rox/{guest.name}"
+        self.assertEqual([(p.id, p.name, p.branch, p.workspace, p.session_id, p.phase) for p in guest.projects], [
+            ("sample-project", "sample project", "published-feature", f"{base}/projects/sample-project",
+             "session:2", "ready"),
+            ("other", "other", "main", f"{base}/projects/other", "session:3", "ready"),
+            ("sample-project-2", "sample project", "published-feature", f"{base}/projects/sample-project-2",
+             "session:4", "ready"),
+        ])
+        clones = [stage for stage in record["stages"] if stage[0] == "clone"]
+        self.assertEqual([clone[1:4] for clone in clones], [
+            (f"{base}/projects/sample-project", "git@git.example.test:fork/repo.git", "published-feature"),
+            (f"{base}/projects/other", "https://git.example.test/other.git", "main"),
+            (f"{base}/projects/sample-project-2", "git@git.example.test:fork/repo.git", "published-feature"),
+        ])
+        setups = [stage[-1] for stage in record["stages"] if stage[0] == "setup"]
+        self.assertEqual(setups, ["true", "false", "false"])
+        # Adding reuses the guest's Rex server and keeps its single host registration.
+        self.assertEqual(sum(argv[:3] == ["rex", "hosts", "add"] for argv in record["commands"]), 1)
+        self.assertEqual(guest.session_id, "session:1")
+
+        listed = io.StringIO()
+        with contextlib.redirect_stdout(listed):
+            rox.main(["ls"])
+        self.assertIn("sample-project:published-feature, other:main, sample-project-2:published-feature",
+                      listed.getvalue())
+        self.assertEqual(self.down_without_name()[0], guest.name)
+
+    def test_add_marks_a_failed_project_and_keeps_the_guest_ready(self):
+        with self.fake_guests() as record, contextlib.redirect_stdout(io.StringIO()):
+            rox.main(["up", "container", "--no-project", "--cwd", str(self.root)])
+            [guest] = self.guests()
+            with patch.object(rox, "git_agent", side_effect=rox.Error("clone fixture")):
+                with self.assertRaisesRegex(rox.Error, "clone fixture"):
+                    rox.main(["add", guest.name, "--cwd", str(self.make_repo())])
+        guest = rox.Guest.load(guest.name)
+        self.assertEqual(guest.phase, "ready")
+        self.assertEqual([(p.id, p.phase) for p in guest.projects], [("sample-project", "failed")])
+
+    def test_add_needs_a_ready_guest_and_a_project(self):
+        guest = self.save_guest("rv-host-000011112222", "unused")
+        guest.projects = []
+        guest.save()
+        with self.assertRaisesRegex(rox.Error, "not inside a Git checkout"):
+            rox.main(["add", guest.name, "--cwd", str(self.root)])
+        with patch.object(rox.shutil, "which", return_value="/fixture"):
+            with self.assertRaisesRegex(rox.Error, "is starting. Run rox reconnect"):
+                rox.main(["add", guest.name, "--cwd", str(self.make_repo())])
+        with self.assertRaisesRegex(rox.Error, "Invalid workspace name"):
+            rox.main(["add", "../escape", "--cwd", str(self.make_repo())])
+
+    def test_remote_add_dispatches_with_the_resolved_project(self):
+        real_run = rox.run
+        requests = []
+
+        def command(argv, **kwargs):
+            if argv[0] == "git":
+                return real_run(argv, **kwargs)
+            requests.append(argv)
+            if argv[4] == "new":
+                return subprocess.CompletedProcess(argv, 0, json.dumps({
+                    "session_id": "session:launch",
+                    "initial_windows": [{"block_ids": ["block:provision"]}],
+                }), "")
+            return subprocess.CompletedProcess(argv, 0, "", "")
+
+        with patch.object(rox, "run", side_effect=command), contextlib.redirect_stdout(io.StringIO()):
+            rox.main(["add", "rv-host-000011112222", "-S", "buildbox", "--cwd", str(self.make_repo()),
+                      "--git-key", "~/.ssh/deploy", "--", "agent"])
+            rox.main(["up", "linux", "-S", "buildbox", "--cwd", str(self.root)])
+        launch = requests[0]
+        self.assertEqual(launch[launch.index("rox sample project"):], [
+            "rox sample project", "--", "rox", "add", "rv-host-000011112222", "--project=sample project",
+            "--repo=git@git.example.test:fork/repo.git", "--branch=published-feature", "--open-shell",
+            "--git-key=~/.ssh/deploy", "--", "agent",
+        ])
+        self.assertEqual(requests[3][requests[3].index("--") + 1:][:5],
+                         ["rox", "up", "linux", "--no-project", "--boot-timeout=120"])
+
+    def test_shell_opens_the_only_project_a_named_one_or_the_guest_home(self):
+        guest = rox.Guest("rv-host-000011112222", "container", "image", "workspace", phase="ready",
+                          address="127.0.0.1", guest_socket="/home/workspace/.rox/rv-host-000011112222/r.sock")
+        first = guest.add_project("web", "https://git.example.test/web.git", "main")
+        first.workspace = "/checkouts/web"
+
+        def directory(*argv):
+            with patch.object(rox.Guest, "load", return_value=guest), \
+                    patch.object(rox.os, "execvpe") as exec_run, contextlib.redirect_stderr(io.StringIO()):
+                rox.main(["shell", guest.name, *argv])
+            return shlex.split(exec_run.call_args.args[1][-1])[-1]
+
+        self.assertEqual(directory(), "/checkouts/web")
+        guest.add_project("api", "https://git.example.test/api.git", "main").workspace = "/checkouts/api"
+        self.assertEqual(directory(), "/home/workspace")
+        self.assertEqual(directory("api"), "/checkouts/api")
+        with self.assertRaisesRegex(rox.Error, "'cli' is not a project.*web, api"):
+            directory("cli")
+
+    def test_records_from_single_project_launches_still_load(self):
+        name = "rv-legacy-000011112222"
+        directory = rox.state_root() / name
+        directory.mkdir(parents=True)
+        (directory / "guest.json").write_text(json.dumps({
+            "name": name, "backend": "linux", "image": "rox-ubuntu", "project": "My App", "branch": "main",
+            "user": "admin", "workspace": "/Users/admin/.rox/rv-legacy-000011112222/project",
+            "guest_socket": "/Users/admin/.rox/rv-legacy-000011112222/r.sock",
+            "session_id": "session:old", "phase": "ready", "registered": True,
+        }))
+        guest = rox.Guest.load(name)
+        self.assertEqual(guest.session_id, "")
+        self.assertEqual(guest.projects, [rox.Project(
+            "my-app", "My App", "", "main", "/Users/admin/.rox/rv-legacy-000011112222/project",
+            "session:old", "ready")])
+        self.assertEqual(str(guest.home), "/Users/admin")
+        guest.save()
+        self.assertEqual(rox.Guest.load(name), guest)
 
 
 if __name__ == "__main__":

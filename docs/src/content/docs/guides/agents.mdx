@@ -23,7 +23,7 @@ For Claude Code, copy it to `~/.claude/skills/` instead. Start a new session and
 
 <Steps>
 
-1. **Launch.** The controller runs `rox up` from the project checkout and saves the `Workspace`, `Checkout`, and `Session` values it prints. With a [project image](../project-images/), extra workers start quickly.
+1. **Launch.** The controller runs `rox up` from the project checkout and saves the `Workspace`, `Checkout`, and `Session` values it prints. With a [project image](../project-images/), extra workers start quickly. To run work for several projects in one guest, it starts the guest with `rox up BACKEND --no-project` and adds each project with `rox add NAME`, which prints the same values.
 
    ```sh
    rox up container --no-app-host --cwd "$project_dir"

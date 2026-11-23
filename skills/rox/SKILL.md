@@ -9,8 +9,9 @@ The launcher is the machine running `rox`. Each workspace is a guest with its ow
 
 ## Choose and launch a workspace
 
-- Follow the requested launcher, backend, repository, branch, and runner. Use a Linux container for ordinary Linux work when a container engine is available. Use Tart when the work requires macOS or a Linux VM. Use separate guests when workers need isolated filesystems.
-- Start from the project checkout or pass `--cwd`. Rox clones the published branch, using its upstream when configured. If the task depends on local-only changes, arrange an authorized handoff before dispatch. An explicit launch outside a checkout needs `--project NAME --repo URL --branch BRANCH`.
+- Follow the requested launcher, backend, repository, branch, and runner. Use a Linux container for ordinary Linux work when a container engine is available. Use Tart when the work requires macOS or a Linux VM. Use separate guests when workers need isolated filesystems. Each `rox up` starts a new guest, even for the same project.
+- To share one guest between projects, start it with `rox up BACKEND --no-project`, then run `rox add NAME` from each project checkout, or with `--repo URL --branch BRANCH`. Each project gets its own checkout and Rex session. Save the `Project`, `Checkout`, and `Session` values printed by each `rox add`.
+- Start from the project checkout or pass `--cwd`. Rox clones the published branch, using its upstream when configured. If the task depends on local-only changes, arrange an authorized handoff before dispatch. Outside a checkout, pass `--repo URL --branch BRANCH`, and optionally `--project NAME`. Without them, `rox up` starts a guest with no project.
 - Check that the launcher has `rox`, Rex, and the backend runtime. The runner and its authentication belong in the guest. The project can prepare the runner with `.rox.sh` on the selected branch. The first launch for a repository builds a project image that runs `.rox.sh` once. Later launches start from it and skip the hook, so starting several workers is fast. Pass `--rebuild` after dependency changes, or `--no-prebuild` when the hook starts long-running services. Git keys configured on the launcher are available during cloning.
 - When the user selects a Rex remote host, pass `--host LABEL` to `rox up`. Read [remote launcher commands](references/remote-launcher.md) before controlling those workers. The guest host label and socket belong to the launcher.
 
@@ -42,10 +43,10 @@ If the runner must start at boot, pass its command after `rox up ... --`. It run
 
 ## Recover and hand back results
 
-- If the tunnel fails, run `rox reconnect NAME` on the launcher. Reconnect restores Rex access to a booted guest. A clone or hook that failed still needs to be addressed before the checkout is ready.
+- If the tunnel fails, run `rox reconnect NAME` on the launcher. Reconnect restores Rex access to a booted guest. A clone or hook that failed still needs to be addressed before the checkout is ready. `rox ls` shows each project's state.
 - For Git SSH failures, distinguish a missing trusted server key from rejected client credentials. Use a verified `--git-known-hosts` file or an authorized `--git-key` on the launcher as appropriate. For backend or tunnel failures, check the workspace record, `tart.log`, or `ssh-tunnel.log` under `${XDG_STATE_HOME:-$HOME/.local/state}/rox` on that machine.
 - Collect the worker's summary and verification results. Review its changes in the guest and transfer needed artifacts through an authorized channel. Keep worker changes and their test results associated with the correct guest. Terminal capture is useful for review. Use a file or Git transport when exact artifact bytes matter.
-- `rox down NAME` deletes the guest, its files, and its Rex host entry. Run it on the launcher after collecting the results when cleanup is authorized. Keep the guest name available when work remains there. Always pass NAME. Without it, `rox down` picks the current project's workspace, and when there are several it asks which one to remove.
+- `rox down NAME` deletes the guest, its files, and its Rex host entry. Run it on the launcher after collecting the results when cleanup is authorized. Keep the guest name available when work remains there. Always pass NAME. Without it, `rox down` picks the guest that has the current project, and when several do it asks which one to remove. It removes the whole guest, including every project added to it.
 
 Rex CLI access works independently of the Rex.app sidebar. Use the CLI and the saved IDs to supervise workers.
 

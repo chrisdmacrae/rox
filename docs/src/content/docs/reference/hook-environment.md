@@ -19,6 +19,6 @@ Rox runs `.rox.sh` with Bash from the root of the checkout, as the guest's works
 | Situation | Checkout |
 | --- | --- |
 | From a project image | `~/.rox/image/project` |
-| Without a project image | `~/.rox/WORKSPACE/project` |
+| Without a project image, or added with `rox add` | `~/.rox/WORKSPACE/projects/ID` |
 
-The project image's checkout stays at the same path at build time and at boot, so absolute paths the hook writes (virtualenvs, for example) keep working.
+`ID` is the project's ID in the guest, as `rox ls` shows it. The project image's checkout stays at the same path at build time and at boot, so absolute paths the hook writes (virtualenvs, for example) keep working.
