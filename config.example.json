@@ -2,8 +2,9 @@
   "git_keys": ["~/.ssh/project_readonly"],
   "git_known_hosts": "~/.ssh/rox_git_known_hosts",
   "container": {
-    "engine": "docker",
-    "image": "rox:linux"
+    "engine": "container",
+    "image": "rox:linux",
+    "memory": "4G"
   },
   "linux": {
     "image": "rox-ubuntu",

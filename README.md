@@ -41,16 +41,16 @@ git tag v0.1.0 && git push origin v0.1.0
 
 ## Start a container
 
-The host needs Python 3.9+, Git, OpenSSH 8.2+, Rex, and a running local Docker or Podman engine. Make `rox` available on your PATH, or use its absolute path from your project.
+The host needs Python 3.9+, Git, OpenSSH 8.2+, Rex, and a container engine. On an Apple Silicon Mac, Rox uses Apple's [container](https://github.com/apple/container) tool by default, which runs each container in its own lightweight VM. Start its services with `container system start`. On Linux and Windows hosts it uses Docker or Podman. Make `rox` available on your PATH, or use its absolute path from your project.
 
-Rox builds the default `rox:linux` image on first use and reuses it on later launches. The build uses the Rex Linux preview channel. To prebuild the image with an official Linux `rex` executable for your build architecture, run this from the toolkit's directory.
+Rox builds the default `rox:linux` image on first use and reuses it on later launches. It also rebuilds it when the `io.rox.toolkit` label in the Containerfile changes, which happens when the image's SSH setup changes. An image you build yourself from the current Containerfile carries that label, so Rox keeps it. The build uses the Rex Linux preview channel. To prebuild the image with an official Linux `rex` executable for your build architecture, run this from the toolkit's directory.
 
 ```sh
 docker build -f Containerfile -t rox:linux \
   --secret id=rex_binary,src=/absolute/path/to/linux/rex .
 ```
 
-Use `podman build` with the same arguments if you use Podman, and set `"engine": "podman"` in the config or pass `--engine podman` at launch. On macOS the engine needs a running Docker Desktop or Podman machine. You can extend the supplied image to install system packages required by your project. [Rex for Linux](https://www.superlogical.com/rex/docs/linux/installation)
+Use `podman build` with the same arguments if you use Podman, and set `"engine": "podman"` in the config or pass `--engine podman` at launch. With Apple's container tool, run `container build -f Containerfile -t rox:linux .`. To use Docker or Podman on a Mac instead, set `"engine"` or pass `--engine`. Apple's container gives each container 1 GB of memory by default, so set `"memory": "4G"` (and optionally `"cpus"`) under `container` in the config for heavier agents. You can extend the supplied image to install system packages required by your project. [Rex for Linux](https://www.superlogical.com/rex/docs/linux/installation)
 
 Run either command from a Git checkout or any subdirectory within it. Each run starts a new, separate guest, so run it again for another isolated copy of the same project.
 
@@ -192,18 +192,19 @@ While the image builds, `ROX_PHASE` is `build`, `ROX_NAME` is the image name, th
 | `--no-prebuild` | Clone and run `.rox.sh` at boot, as before. Set `"prebuild": false` under a backend in the config to make this the default. |
 | `--no-hook` | Skip the hook and project image and start from the base image. |
 
-If the launch machine cannot read the branch, Rox prints a warning and runs the hook at boot. If the hook fails during a build, the launch stops. Remove a project image with `docker rmi rox:REPO`, `podman rmi rox:REPO`, or `tart delete rox-REPO-BACKEND`.
+If the launch machine cannot read the branch, Rox prints a warning and runs the hook at boot. If the hook fails during a build, the launch stops. Remove a project image with `container image delete rox:REPO`, `docker rmi rox:REPO`, `podman rmi rox:REPO`, or `tart delete rox-REPO-BACKEND`.
 
 ## Workspace commands
 
 | Command | Effect |
 | --- | --- |
-| `rox ls` | List local workspace records, their provisioning state, and each guest's projects. |
+| `rox ls` | List local workspace records, their provisioning state, IP address (Tart VMs and Apple containers), and each guest's projects. |
 | `rox add NAME` | Clone a project into a running guest and start a Rex session at its checkout. |
 | `rox shell NAME [PROJECT]` | Open an interactive shell at a project checkout. Without `PROJECT`, it opens the guest's only checkout, or the guest home when there are none or several. |
+| `rox forward NAME PORT...` | Forward `localhost` ports on the launcher to servers on the guest's `localhost`, for example dev servers. Use `LOCAL:GUEST` to pick a different local port. Runs until Ctrl-C. |
 | `rex -S NAME ls` | List the guest's Rex sessions after a local launch with host registration. |
 | `rox reconnect NAME` | Restore Rex access to a booted guest, including one retained after clone or setup failure. Offers to add it to the local Rex app's host list unless you pass `--no-app-host`. |
 | `rox down NAME` | Delete the guest, its filesystem, and its Rex host entry. |
 | `rox down` | From a project checkout, remove the guest that has that project. If several do, Rox lists them and asks which one to remove. |
 
-Rex connects over a private Unix socket forwarded through SSH. If socket forwarding fails, Rox relays connections over authenticated SSH sessions. Containers publish only their SSH port to loopback. Workspace state, Tart boot logs, and SSH tunnel diagnostics live under `${XDG_STATE_HOME:-$HOME/.local/state}/rox`. A failed launch prints the workspace name so you can find its records or remove it.
+Rex connects over a private Unix socket forwarded through SSH. If socket forwarding fails, Rox relays connections over authenticated SSH sessions. Docker and Podman containers publish only their SSH port to loopback. Apple's containers publish no ports, and Rox reaches them at their own address on the Mac's container network. Workspace state, Tart boot logs, and SSH tunnel diagnostics live under `${XDG_STATE_HOME:-$HOME/.local/state}/rox`. A failed launch prints the workspace name so you can find its records or remove it.

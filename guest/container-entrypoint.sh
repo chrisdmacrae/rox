@@ -16,5 +16,5 @@ exec /usr/sbin/sshd -D -e -f /dev/null \
     -h /etc/ssh/ssh_host_ed25519_key \
     -o AuthenticationMethods=publickey -o PermitRootLogin=no \
     -o PasswordAuthentication=no -o KbdInteractiveAuthentication=no \
-    -o AllowUsers=workspace -o AllowTcpForwarding=no \
+    -o AllowUsers=workspace -o AllowTcpForwarding=local \
     -o AllowStreamLocalForwarding=local -o X11Forwarding=no

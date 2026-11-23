@@ -20,6 +20,13 @@ SPEC = importlib.util.spec_from_loader("rox", LOADER)
 rox = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = rox
 LOADER.exec_module(rox)
+REAL_DEFAULT_ENGINE = rox.default_engine
+
+
+def base_image(version=None, image_id="sha256:base"):
+    """`image inspect` output for a rox:linux image built from the given toolkit version."""
+    labels = {"io.rox.toolkit": rox.toolkit_version() if version is None else version}
+    return json.dumps([{"Id": image_id, "Config": {"Labels": labels}}])
 
 
 class WorkspaceTests(unittest.TestCase):
@@ -34,6 +41,10 @@ class WorkspaceTests(unittest.TestCase):
         stdin = patch.object(rox.sys, "stdin", io.StringIO())
         stdin.start()
         self.addCleanup(stdin.stop)
+        # The default container engine depends on the platform, so pin it for repeatable tests.
+        engine = patch.object(rox, "default_engine", return_value="docker")
+        engine.start()
+        self.addCleanup(engine.stop)
 
     def make_repo(self):
         repo = self.root / "sample project"
@@ -199,8 +210,10 @@ class WorkspaceTests(unittest.TestCase):
             if argv[0] == "git":
                 return real_run(argv, **kwargs)
             calls.append(argv)
-            if argv[1:3] == ["image", "inspect"] and not built:
-                return subprocess.CompletedProcess(argv, 1, "", "image not found")
+            if argv[1:3] == ["image", "inspect"]:
+                if not built:
+                    return subprocess.CompletedProcess(argv, 1, "", "image not found")
+                return subprocess.CompletedProcess(argv, 0, base_image(), "")
             if argv[1] == "build":
                 self.assertFalse(list(rox.state_root().glob("*/guest.json")))
                 built = True
@@ -228,6 +241,60 @@ class WorkspaceTests(unittest.TestCase):
             ["podman", "build", "--file", str(ROOT / "Containerfile"), "--tag", "rox:linux", str(ROOT)],
             ["podman", "image", "inspect", "rox:linux"],
         ])
+
+    def test_base_image_is_rebuilt_when_its_toolkit_version_changes(self):
+        rox.private_directory(rox.state_root())
+        self.assertTrue(rox.toolkit_version())
+        for inspect, builds in ((base_image(), 0), (base_image("1"), 1),
+                                (json.dumps([{"Id": "sha256:old", "Config": {"Labels": None}}]), 1)):
+            calls = []
+
+            def command(argv, **kwargs):
+                calls.append(argv)
+                return subprocess.CompletedProcess(argv, 0, inspect if argv[1] == "image" else "", "")
+
+            with self.subTest(inspect=inspect), patch.object(rox, "run", side_effect=command), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                rox.prepare_container_image("container", "rox:linux")
+            self.assertEqual(sum(argv[1] == "build" for argv in calls), builds)
+
+    def test_container_sshd_allows_only_local_forwarding(self):
+        entrypoint = (ROOT / "guest" / "container-entrypoint.sh").read_text()
+        self.assertIn("AllowTcpForwarding=local", entrypoint)
+        self.assertNotIn("GatewayPorts", entrypoint)
+
+    def test_forward_tunnels_launcher_localhost_to_guest_localhost(self):
+        rox.private_directory(rox.state_root())
+        guest = rox.Guest("rv-fixture-000011112222", "container", "rox:linux", "workspace", engine="container",
+                          identity=str(self.root / "login"), address="192.168.64.9", phase="ready")
+        guest.directory.mkdir(mode=0o700)
+        guest.save()
+        with (
+            patch.object(rox.shutil, "which", return_value="/fixture"),
+            patch.object(rox, "apple_container_address", return_value=("192.168.64.10", 22)),
+            patch.object(rox.os, "execvp") as execvp,
+            contextlib.redirect_stdout(io.StringIO()) as printed,
+        ):
+            rox.main(["forward", guest.name, "5173", "8080:3000"])
+        argv = execvp.call_args.args[1]
+        self.assertEqual(argv[-2:], ["--", "192.168.64.10"])
+        tunnels = [argv[index + 1] for index, arg in enumerate(argv) if arg == "-L"]
+        self.assertEqual(tunnels, ["127.0.0.1:5173:127.0.0.1:5173", "127.0.0.1:8080:127.0.0.1:3000"])
+        self.assertIn("-N", argv)
+        self.assertIn("ExitOnForwardFailure=yes", argv)
+        self.assertIn("http://localhost:8080 to port 3000", printed.getvalue())
+
+    def test_forward_rejects_invalid_ports_and_guests_that_are_not_ready(self):
+        for spec in ("0", "70000", "web", "1:2:3"):
+            with self.subTest(spec=spec), self.assertRaises(SystemExit), \
+                    contextlib.redirect_stderr(io.StringIO()):
+                rox.main(["forward", "rv-fixture-000011112222", spec])
+        rox.private_directory(rox.state_root())
+        guest = rox.Guest("rv-fixture-000011112222", "linux", "image", "admin", phase="failed")
+        guest.directory.mkdir(mode=0o700)
+        guest.save()
+        with self.assertRaisesRegex(rox.Error, "not ready"):
+            rox.main(["forward", guest.name, "3000"])
 
     def test_default_container_image_run_uses_local_storage(self):
         guest = rox.Guest("rv-fixture-000011112222", "container", "rox:linux", "workspace", engine="docker",
@@ -345,7 +412,7 @@ class WorkspaceTests(unittest.TestCase):
             [*rox.rex_on(guest), "session", "inspect", "session:fixture", "--json"],
         ])
 
-    def provision(self, backend, fail_stage=None, open_shell=False, prebuilt=""):
+    def provision(self, backend, fail_stage=None, open_shell=False, prebuilt="", engine=None):
         nested = self.make_repo()
         key = self.root / "git_key"
         key.touch()
@@ -356,7 +423,8 @@ class WorkspaceTests(unittest.TestCase):
         config = self.root / "config.json"
         config.write_text(json.dumps({
             "git_keys": [str(key)],
-            backend: {"image": "fixture", "identity": str(identity), "host_key": str(host_key)},
+            backend: {"image": "fixture", "identity": str(identity), "host_key": str(host_key),
+                      **({"engine": engine} if engine else {})},
         }))
 
         commands = []
@@ -455,7 +523,10 @@ class WorkspaceTests(unittest.TestCase):
             rox.main(["down", name])
             self.assertFalse(state.directory.exists())
             self.assertIn(["rex", "hosts", "remove", name], commands)
-            if backend == "container":
+            if engine == "container":
+                self.assertIn(["container", "delete", "--force", name], commands)
+                self.assertIn(["container", "system", "status"], commands)
+            elif backend == "container":
                 self.assertIn(["docker", "rm", "-f", "-v", "managed-container"], commands)
             else:
                 self.assertIn(["tart", "stop", name], commands)
@@ -466,6 +537,68 @@ class WorkspaceTests(unittest.TestCase):
         for backend in ("container", "linux", "macos"):
             with self.subTest(backend=backend):
                 self.assertEqual(self.provision(backend), ["prepare", "server", "clone", "setup", "session"])
+
+    def test_apple_container_engine_provisions_and_removes_its_container(self):
+        self.assertEqual(self.provision("container", engine="container"),
+                         ["prepare", "server", "clone", "setup", "session"])
+
+    def test_default_engine_is_apple_container_only_on_apple_silicon_macs(self):
+        for platform_name, machine, expected in (
+            ("darwin", "arm64", "container"), ("darwin", "x86_64", "docker"), ("linux", "aarch64", "docker"),
+        ):
+            with (
+                patch.object(rox.sys, "platform", platform_name),
+                patch.object(rox.platform, "machine", return_value=machine),
+                patch.object(rox, "default_engine", REAL_DEFAULT_ENGINE),
+            ):
+                self.assertEqual(rox.default_engine(), expected)
+
+    def test_apple_container_launch_connects_to_the_container_ip(self):
+        guest = rox.Guest("rv-fixture-000011112222", "container", "rox:linux", "workspace", engine="container",
+                          identity=str(self.root / "login"), cpus=2, memory="4G")
+        (self.root / "login.pub").write_text("ssh-ed25519 AAAA fixture\n")
+        inspect = json.dumps([{"status": "running", "networks": [
+            {"network": "default", "address": "192.168.64.7/24", "gateway": "192.168.64.1"}]}])
+        with (
+            patch.object(rox, "run"),
+            patch.object(rox, "output", side_effect=[
+                "rv-fixture-000011112222", "ssh-ed25519 AAAA host", inspect,
+            ]) as output,
+            patch.object(rox, "pin_host") as pin,
+            patch.object(rox.Guest, "save"),
+        ):
+            self.assertEqual(rox.launch_guest(guest, 5), ("192.168.64.7", 22))
+        launch = output.call_args_list[0].args[0]
+        self.assertEqual(launch[:5], ["container", "run", "--detach", "--name", guest.name])
+        self.assertIn("--cpus=2", launch)
+        self.assertIn("--memory=4G", launch)
+        self.assertNotIn("--publish", launch)
+        self.assertEqual(launch[-1], "rox:linux")
+        self.assertEqual(output.call_args_list[1].args[0],
+                         ["container", "exec", guest.name, "cat", "/etc/ssh/ssh_host_ed25519_key.pub"])
+        pin.assert_called_once_with(guest, "ssh-ed25519 AAAA host")
+
+    def test_image_info_reads_apple_container_labels(self):
+        shape = [{"name": "rox:fixture", "index": {"digest": "sha256:index"}, "variants": [
+            {"platform": {"os": "linux", "architecture": "arm64"},
+             "config": {"config": {"Labels": {"io.rox.hook": "abc"}}}}]}]
+        with patch.object(rox, "run", return_value=subprocess.CompletedProcess([], 0, json.dumps(shape), "")):
+            self.assertEqual(rox.image_info("container", "rox:fixture"), ("sha256:index", {"io.rox.hook": "abc"}))
+
+    def test_container_resource_settings_are_validated(self):
+        cwd = self.make_repo()
+        for settings, message in (
+            ({"memory": "lots"}, "size such as 4G"),
+            ({"cpus": -1}, "whole number of CPUs"),
+        ):
+            config = self.root / "config.json"
+            config.write_text(json.dumps({"container": settings}))
+            with self.subTest(settings=settings), patch.object(rox.shutil, "which", return_value="/fixture"):
+                with self.assertRaisesRegex(rox.Error, message):
+                    rox.main(["up", "container", "--cwd", str(cwd), "--config", str(config)])
+        config.write_text(json.dumps({"linux": {"memory": "4G"}}))
+        with self.assertRaisesRegex(rox.Error, "apply to the container backend"):
+            rox.main(["up", "linux", "--cwd", str(cwd), "--config", str(config)])
 
     def test_failed_clone_or_hook_keeps_the_rex_host_registered(self):
         self.assertEqual(self.provision("linux", fail_stage="clone"), ["prepare", "server", "clone"])
@@ -789,7 +922,8 @@ class WorkspaceTests(unittest.TestCase):
             if argv[0] == "git":
                 return real_run(argv, capture=capture, check=check, **kwargs)
             record["commands"].append(argv)
-            return subprocess.CompletedProcess(argv, 0, "", "")
+            stdout = base_image() if argv[1:3] == ["image", "inspect"] else ""
+            return subprocess.CompletedProcess(argv, 0, stdout, "")
 
         def probe(argv, **kwargs):
             return real_output(argv, **kwargs) if argv[0] == "git" else "{}"
@@ -956,6 +1090,26 @@ class WorkspaceTests(unittest.TestCase):
         self.assertEqual(directory("api"), "/checkouts/api")
         with self.assertRaisesRegex(rox.Error, "'cli' is not a project.*web, api"):
             directory("cli")
+
+    def test_ls_lists_the_ip_of_guests_that_have_their_own_address(self):
+        rox.private_directory(rox.state_root())
+        for name, backend, engine, address in (
+            ("rv-apple-000000000001", "container", "container", "192.168.64.7"),
+            ("rv-docker-000000000002", "container", "docker", "127.0.0.1"),
+            ("rv-tart-000000000003", "linux", "", "192.168.65.4"),
+            ("rv-booting-000000000004", "linux", "", ""),
+        ):
+            guest = rox.Guest(name, backend, "image", "workspace", engine, address=address, phase="ready")
+            guest.directory.mkdir(mode=0o700)
+            guest.save()
+        listed = io.StringIO()
+        with contextlib.redirect_stdout(listed):
+            rox.main(["ls"])
+        rows = {line.split("\t")[0]: line.split("\t")[3] for line in listed.getvalue().splitlines()}
+        self.assertEqual(rows, {
+            "rv-apple-000000000001": "192.168.64.7", "rv-docker-000000000002": "-",
+            "rv-tart-000000000003": "192.168.65.4", "rv-booting-000000000004": "-",
+        })
 
     def test_records_from_single_project_launches_still_load(self):
         name = "rv-legacy-000011112222"

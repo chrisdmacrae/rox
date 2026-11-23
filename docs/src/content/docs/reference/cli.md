@@ -21,7 +21,7 @@ rox up container [options] [-- COMMAND [ARG ...]]
 | `--project NAME` | Project name for a launch without a checkout. Requires `--repo` and `--branch`. Outside a checkout, the name defaults to the repository name. |
 | `--no-project` | Start a guest without a project, even from inside a checkout. |
 | `--image IMAGE` | Container image or prepared Tart template. Overrides the config. |
-| `--engine docker\|podman` | Container engine. Defaults to `docker`. |
+| `--engine container\|docker\|podman` | Container engine. Defaults to `container` (Apple's container tool) on Apple Silicon Macs and `docker` elsewhere. |
 | `--remote NAME` | Git remote to clone from. Can't be combined with `--repo`. |
 | `--repo URL` | Repository URL to clone. Must be SSH or HTTPS. |
 | `--branch NAME` | Remote branch to clone. |
@@ -46,11 +46,19 @@ It accepts `-S`/`--host`, `--config`, `--cwd`, `--project`, `--remote`, `--repo`
 
 ## `rox ls`
 
-List local workspace records with their backend, provisioning state, and projects. Each project shows as `ID:BRANCH`, followed by its state if it isn't ready. A guest with no project shows `-`.
+List local workspace records with their backend, provisioning state, IP address, and projects. The IP address is where the launcher can reach servers in a Tart VM or an Apple container, such as `http://IP:5173` for a dev server listening on `0.0.0.0`. Docker and Podman containers show `-`, because they're reached only through a loopback SSH port. The address is the one recorded at launch or the last `rox reconnect`. Each project shows as `ID:BRANCH`, followed by its state if it isn't ready. A guest with no project shows `-`.
 
 ## `rox shell NAME [PROJECT]`
 
 Open an interactive login shell with `REX_SERVER` pointing at the guest's server. `PROJECT` is a project ID or name from `rox ls`. Without it, the shell opens at the guest's only checkout, or in the guest home when it has no projects or several. The guest must be ready.
+
+## `rox forward NAME PORT...`
+
+Forward ports on the launcher's `localhost` to servers listening on the guest's own `localhost`, over the guest's SSH connection. It works with every backend and engine, including Docker and Podman containers, which have no address of their own. The dev server can keep listening on `localhost`, and you open it at `http://localhost:PORT`.
+
+Give each port as `PORT` to use the same number on both sides, or `LOCAL:GUEST` to choose the launcher's port. For example, `rox forward rv-app-1a2b3c4d5e6f 5173 8080:3000` opens `http://localhost:5173` and `http://localhost:8080`. The forward runs in the foreground until you press Ctrl-C, and it exits if a local port is already taken. Forwarded ports bind only to `127.0.0.1` on the launcher, and the guest can't open tunnels back to it. The guest must be ready.
+
+Containers started from a `rox:linux` image built before `rox forward` existed refuse the tunnel. Rox rebuilds `rox:linux` on the next `rox up container`, so start a new guest to use it.
 
 ## `rox reconnect NAME`
 

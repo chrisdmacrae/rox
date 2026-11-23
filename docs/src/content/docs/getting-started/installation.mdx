@@ -13,7 +13,8 @@ Install rox on the machine that runs the guests. That machine is called the **la
 - Git
 - OpenSSH 8.2 or later
 - [Rex](https://www.superlogical.com/rex/docs/installation)
-- For containers, a running Docker or Podman engine. On macOS this means Docker Desktop or a running Podman machine.
+- For containers on an Apple Silicon Mac, Apple's [container](https://github.com/apple/container) tool with its services running (`container system start`). Rox uses it by default there, because it gives every container its own lightweight VM instead of sharing one Linux VM.
+- For containers on Linux or Windows hosts, or on a Mac if you choose it, a running Docker or Podman engine.
 - For VMs, [Tart](https://tart.run) on an Apple Silicon Mac. See [Tart VMs](../../guides/tart-vms/).
 
 ## Install the CLI
@@ -43,11 +44,18 @@ Install rox on the machine that runs the guests. That machine is called the **la
 
 ## The base container image
 
-Rox builds the default `rox:linux` image the first time you launch a container and reuses it after that. The build installs Rex from the Rex Linux preview channel.
+Rox builds the default `rox:linux` image the first time you launch a container and reuses it after that. It also rebuilds it when the `io.rox.toolkit` label in the Containerfile changes, which happens when the image's SSH setup changes. An image you build yourself from the current Containerfile carries that label, so Rox keeps it. The build installs Rex from the Rex Linux preview channel.
 
 To prebuild the image with an official Linux `rex` executable that matches your build architecture, run this from the toolkit's directory:
 
 <Tabs syncKey="engine">
+	<TabItem label="Apple container">
+		```sh
+		container build -f Containerfile -t rox:linux .
+		```
+
+		This is the default engine on Apple Silicon Macs. The build installs Rex from the preview channel.
+	</TabItem>
 	<TabItem label="Docker">
 		```sh
 		docker build -f Containerfile -t rox:linux \

@@ -1,5 +1,9 @@
 FROM docker.io/library/debian:bookworm-slim
 
+# Rox rebuilds rox:linux when this differs from the image's label.
+# Bump it whenever this file or guest/container-entrypoint.sh changes.
+LABEL io.rox.toolkit="2"
+
 ARG REX_CHANNEL=preview
 RUN apt-get update \
     && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \

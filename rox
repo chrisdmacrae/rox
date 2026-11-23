@@ -8,6 +8,7 @@ import hashlib
 import ipaddress
 import json
 import os
+import platform
 from pathlib import Path, PurePosixPath
 import re
 import secrets
@@ -24,6 +25,8 @@ from urllib.parse import urlsplit
 HERE = Path(__file__).resolve().parent
 BACKENDS = ("container", "linux", "macos")
 DEFAULT_CONTAINER_IMAGE = "rox:linux"
+# "container" is Apple's container CLI, which runs each container in its own lightweight VM.
+ENGINES = ("container", "docker", "podman")
 NAME_PATTERN = r"rv-[a-z0-9-]{1,24}-[a-f0-9]{12}"
 
 
@@ -106,6 +109,9 @@ class Guest:
     registered: bool = False
     phase: str = "starting"
     container_id: str = ""
+    # Resource limits for Apple's container, which gives each VM 4 CPUs and 1 GB by default.
+    cpus: int = 0
+    memory: str = ""
     # The image already holds a prepared checkout of the first project.
     prebuilt: bool = False
     projects: list = field(default_factory=list)
@@ -422,11 +428,38 @@ def ssh_agent(sock, keys):
 
 
 def container_address(guest):
+    if guest.engine == "container":
+        return apple_container_address(guest)
     mapping = output([guest.engine, "port", guest.container_id, "22/tcp"], timeout=8)
     match = re.search(r"^127\.0\.0\.1:(\d+)$", mapping, re.MULTILINE)
     if not match:
         raise Error(f"No loopback SSH port found in {mapping!r}")
     return "127.0.0.1", int(match[1])
+
+
+def apple_container_address(guest):
+    """Apple's containers each get their own IP address, so SSH goes straight to port 22."""
+    records = json.loads(output(["container", "inspect", guest.name], timeout=8) or "[]")
+    for record in records if isinstance(records, list) else [records]:
+        for network in record.get("networks") or []:
+            for key in ("ipv4Address", "address"):
+                try:
+                    return str(ipaddress.IPv4Interface(network.get(key) or "").ip), 22
+                except ValueError:
+                    continue
+    raise Error(f"container did not report an IPv4 address for {guest.name}")
+
+
+def default_engine():
+    return "container" if sys.platform == "darwin" and platform.machine() == "arm64" else "docker"
+
+
+def check_engine(engine):
+    if engine == "container":
+        if run(["container", "system", "status"], capture=True, check=False, timeout=20).returncode:
+            raise Error("Apple's container services are not running. Start them with: container system start")
+    else:
+        output([engine, "info"], timeout=20)
 
 
 def vm_address(guest):
@@ -437,6 +470,11 @@ def vm_address(guest):
         raise Error(f"Tart did not return an IPv4 address for {guest.name}") from None
 
 
+def toolkit_version():
+    match = re.search(r'^LABEL io\.rox\.toolkit="([^"]+)"', (HERE / "Containerfile").read_text(), re.MULTILINE)
+    return match[1] if match else ""
+
+
 def prepare_container_image(engine, image):
     if image != DEFAULT_CONTAINER_IMAGE:
         return
@@ -444,10 +482,12 @@ def prepare_container_image(engine, image):
     # Recheck after taking the lock in case another launch built the image.
     with (state_root() / "container-image.lock").open("a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
-        local = run([engine, "image", "inspect", image], capture=True, check=False, timeout=20)
-        if local.returncode == 0:
+        info = image_info(engine, image)
+        wanted = toolkit_version()
+        if info and info[1].get("io.rox.toolkit") == wanted:
             return
-        print(f"Building {image} with {engine}", flush=True)
+        reason = "first build" if not info else "the Containerfile or container entrypoint changed"
+        print(f"Building {image} with {engine} ({reason})", flush=True)
         try:
             run([engine, "build", "--file", str(HERE / "Containerfile"), "--tag", image, str(HERE)])
         except subprocess.CalledProcessError as error:
@@ -545,16 +585,34 @@ def image_info(engine, image):
     result = run([engine, "image", "inspect", image], capture=True, check=False, timeout=20)
     if result.returncode:
         return None
-    data = json.loads(result.stdout)[0]
-    labels = (data.get("Config") or {}).get("Labels") or data.get("Labels") or {}
-    return data["Id"], labels
+    data = json.loads(result.stdout)
+    data = data[0] if isinstance(data, list) and data else data
+    if not isinstance(data, dict):
+        return None
+    labels = (data.get("Config") or {}).get("Labels") or data.get("Labels") or find_labels(data)
+    image_id = (data.get("Id") or (data.get("index") or {}).get("digest") or data.get("digest")
+                or "sha256:" + hashlib.sha256(result.stdout.encode()).hexdigest())
+    return image_id, labels
+
+
+def find_labels(data):
+    """Apple's container nests the OCI image config, and its labels, inside each platform variant."""
+    if isinstance(data, dict):
+        if isinstance(data.get("Labels"), dict):
+            return data["Labels"]
+        data = list(data.values())
+    if isinstance(data, list):
+        for item in data:
+            if labels := find_labels(item):
+                return labels
+    return {}
 
 
 def build_container_image(engine, base, target, mirror, url, branch, hook, rebuild):
     with file_lock(state_root() / f"image-{target.replace(':', '-')}.lock"):
         base_info = image_info(engine, base)
         if base_info is None:
-            run([engine, "pull", base])
+            run([engine, "image", "pull", base])
             base_info = image_info(engine, base)
         if base_info is None:
             raise Error(f"Base image {base} is not available to {engine}")
@@ -581,7 +639,7 @@ def build_container_image(engine, base, target, mirror, url, branch, hook, rebui
                 raise Error(f"Building {target} failed while running .rox.sh. See the build output above, "
                             "or launch with --no-prebuild to run it at boot.") from error
         built = image_info(engine, target)
-        if current and built and built[0] != current[0]:
+        if engine != "container" and current and built and built[0] != current[0]:
             # Drop the superseded image unless a workspace still uses it.
             run([engine, "rmi", current[0]], capture=True, check=False)
 
@@ -675,6 +733,8 @@ def launch_guest(guest, boot_timeout):
         run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", guest.identity],
             stdin=subprocess.DEVNULL)
         public_key = Path(f"{guest.identity}.pub").read_text().strip()
+        if guest.engine == "container":
+            return launch_apple_container(guest, public_key, boot_timeout)
         local_image = guest.prebuilt or guest.image == DEFAULT_CONTAINER_IMAGE
         pull_policy = ["--pull=never"] if local_image else []
         guest.container_id = output([
@@ -714,6 +774,21 @@ def launch_guest(guest, boot_timeout):
             return found
         time.sleep(1)
     raise Error(f"No Tart IP address found for {guest.name}. See {log_path}")
+
+
+def launch_apple_container(guest, public_key, boot_timeout):
+    resources = [f"--{option}={value}" for option, value in
+                 (("cpus", guest.cpus), ("memory", guest.memory)) if value]
+    output(["container", "run", "--detach", "--name", guest.name, *resources,
+            "--env", f"ROX_SSH_PUBLIC_KEY={public_key}", guest.image])
+    guest.container_id = guest.name
+    guest.save()
+    key = wait_for(
+        lambda: output(["container", "exec", guest.name, "cat", "/etc/ssh/ssh_host_ed25519_key.pub"], timeout=8),
+        boot_timeout, "the container SSH host key",
+    )
+    pin_host(guest, key)
+    return wait_for(lambda: apple_container_address(guest), boot_timeout, "the container IP address")
 
 
 def check_guest_os(guest, timeout):
@@ -998,9 +1073,16 @@ def up(args, command):
         raise Error("--engine applies to the container backend")
     engine = ""
     if args.backend == "container":
-        engine = args.engine or settings.get("engine", "docker")
-        if engine not in ("docker", "podman"):
-            raise Error("Choose docker or podman as the container engine")
+        engine = args.engine or settings.get("engine") or default_engine()
+        if engine not in ENGINES:
+            raise Error("Choose container, docker or podman as the container engine")
+    cpus, memory = settings.get("cpus", 0), settings.get("memory", "")
+    if not engine and (cpus or memory):
+        raise Error(f"cpus and memory apply to the container backend in {config_path}")
+    if not isinstance(cpus, int) or isinstance(cpus, bool) or cpus < 0:
+        raise Error(f"Expected a whole number of CPUs for container.cpus in {config_path}")
+    if not isinstance(memory, str) or (memory and not re.fullmatch(r"[0-9]+[KMGT]?", memory, re.IGNORECASE)):
+        raise Error(f"Expected a size such as 4G for container.memory in {config_path}")
     image = args.image or settings.get("image") or (DEFAULT_CONTAINER_IMAGE if engine else "")
     if not isinstance(image, str) or not image or image.startswith("-"):
         raise Error(f"Choose a {args.backend} image with --image or in {config_path}")
@@ -1026,9 +1108,12 @@ def up(args, command):
         required.append("git")
     if engine:
         required.append("ssh-keygen")
+    if engine == "container" and not shutil.which("container"):
+        raise Error("Install Apple's container tool (https://github.com/apple/container), "
+                    "or choose --engine docker or --engine podman")
     require(required)
     if engine:
-        output([engine, "info"], timeout=20)
+        check_engine(engine)
     keys, known_hosts = git_access(args, config, config_path, source[1]) if source else ([], "")
     private_directory(state_root())
     if engine:
@@ -1040,7 +1125,8 @@ def up(args, command):
                                          keys, known_hosts, vm, args.rebuild)
 
     name = f"rv-{slugify(source[0] if source else 'host', 24) or 'project'}-{secrets.token_hex(6)}"
-    guest = Guest(name, args.backend, prebuilt or image, user, engine, prebuilt=bool(prebuilt))
+    guest = Guest(name, args.backend, prebuilt or image, user, engine, prebuilt=bool(prebuilt),
+                  cpus=cpus, memory=memory)
     guest.directory.mkdir(mode=0o700)
     guest.identity = str(identity or guest.directory / "login")
     with guest_lock(guest.directory):
@@ -1156,6 +1242,34 @@ def reconnect(name, app_host=True):
         offer_app_host(guest)
 
 
+def forward_spec(value):
+    """Parse PORT or LOCAL:GUEST into (local, guest) port numbers."""
+    try:
+        ports = [int(part) for part in value.split(":")]
+    except ValueError:
+        ports = []
+    if len(ports) not in (1, 2) or any(not 1 <= port <= 65535 for port in ports):
+        raise argparse.ArgumentTypeError(f"expected PORT or LOCAL:GUEST, got {value!r}")
+    return ports[0], ports[-1]
+
+
+def forward(name, ports):
+    """Tunnel localhost ports on the launcher to servers on the guest's own localhost."""
+    guest = Guest.load(name)
+    if guest.phase != "ready":
+        raise Error(f"{name} is not ready")
+    require(["ssh"])
+    # Look the address up again, since a restarted container or VM can come back on a new one.
+    guest.address, guest.port = container_address(guest) if guest.engine else vm_address(guest)
+    tunnels = [option for local, port in ports for option in ("-L", f"127.0.0.1:{local}:127.0.0.1:{port}")]
+    argv = ssh_command(guest, "-N", "-T", "-S", "none", "-o", "ForwardAgent=no",
+                       "-o", "ExitOnForwardFailure=yes", *tunnels)
+    for local, port in ports:
+        print(f"Forwarding http://localhost:{local} to port {port} on {name}", flush=True)
+    print("Press Ctrl-C to stop.", flush=True)
+    os.execvp(argv[0], argv)
+
+
 def close_relay(guest):
     if guest.relay_socket.is_socket():
         with socket.socket(socket.AF_UNIX) as control:
@@ -1180,7 +1294,11 @@ def down(name):
         guest.phase = "removing"
         guest.save()
         close_tunnel(guest)
-        if guest.engine:
+        if guest.engine == "container":
+            result = run(["container", "delete", "--force", name], capture=True, check=False)
+            if result.returncode and "not found" not in (result.stderr + result.stdout).lower():
+                raise Error(result.stderr.strip() or f"Could not delete container {name}")
+        elif guest.engine:
             ids = output([guest.engine, "ps", "-aq", "--no-trunc", "--filter",
                           f"label=io.rox.workspace={name}"]).splitlines()
             for container_id in ids:
@@ -1237,10 +1355,19 @@ def project_summary(guest):
     return ", ".join(entries) or "-"
 
 
+def guest_ip(guest):
+    """The address the launch machine can reach the guest's servers at.
+
+    Tart VMs and Apple's containers have their own address. Docker and Podman
+    containers are reached through a loopback SSH port instead, so they have none.
+    """
+    return guest.address if guest.address and guest.engine in ("", "container") else "-"
+
+
 def list_guests():
     for path in sorted(state_root().glob("*/guest.json")):
         guest = Guest.load(path.parent.name)
-        print(f"{guest.name}\t{guest.backend}\t{guest.phase}\t{project_summary(guest)}")
+        print(f"{guest.name}\t{guest.backend}\t{guest.phase}\t{guest_ip(guest)}\t{project_summary(guest)}")
 
 
 APP_HOST_HELP = "don't offer to add the guest to a Rex app that keeps its own host list"
@@ -1280,7 +1407,8 @@ def main(argv):
     start.add_argument("--no-project", action="store_true",
                        help="start a guest without a project, even from inside a checkout")
     start.add_argument("--image", help="container image or prepared Tart template")
-    start.add_argument("--engine", choices=("docker", "podman"))
+    start.add_argument("--engine", choices=ENGINES,
+                       help="container engine; defaults to container on Apple Silicon Macs, otherwise docker")
     start.add_argument("--boot-timeout", type=positive_int, default=120, help="seconds per guest readiness check")
     start.add_argument("--no-prebuild", action="store_true",
                        help="clone and run .rox.sh at boot instead of using a project image")
@@ -1290,6 +1418,10 @@ def main(argv):
     shell_parser = commands.add_parser("shell", help="open an interactive guest shell")
     shell_parser.add_argument("name")
     shell_parser.add_argument("project", nargs="?", help="project checkout to open; omit for the only one or the guest home")
+    forward_parser = commands.add_parser("forward", help="forward localhost ports to servers in a guest")
+    forward_parser.add_argument("name")
+    forward_parser.add_argument("ports", nargs="+", type=forward_spec, metavar="PORT|LOCAL:GUEST",
+                                help="guest port to reach at the same localhost port, or LOCAL:GUEST")
     reconnect_parser = commands.add_parser("reconnect", help="restore access to a running workspace")
     reconnect_parser.add_argument("name")
     reconnect_parser.add_argument("--no-app-host", action="store_true", help=APP_HOST_HELP)
@@ -1320,6 +1452,8 @@ def main(argv):
         list_guests()
     elif args.command == "shell":
         shell(args.name, args.project)
+    elif args.command == "forward":
+        forward(args.name, args.ports)
     elif args.command == "reconnect":
         reconnect(args.name, app_host=not args.no_app_host)
     elif args.command == "key":
