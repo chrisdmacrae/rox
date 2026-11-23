@@ -783,6 +783,21 @@ class WorkspaceTests(unittest.TestCase):
             self.addCleanup(item.stop)
         return commands
 
+    def test_tailscale_runs_as_the_cli_and_explains_output_that_isnt_json(self):
+        seen = []
+
+        def fake_run(argv, **kwargs):
+            seen.append((argv, kwargs.get("env", {}).get("TAILSCALE_BE_CLI")))
+            text = "The Tailscale GUI failed to start" if argv[1] == "status" else '{"Self": {}}'
+            return subprocess.CompletedProcess(argv, 0, text, "")
+
+        with patch.object(rox, "tailscale_cli", return_value="/Applications/Tailscale.app/Contents/MacOS/Tailscale"), \
+                patch.object(rox, "run", side_effect=fake_run):
+            self.assertEqual(rox.tailscale_json("funnel", "status"), {"Self": {}})
+            with self.assertRaisesRegex(rox.Error, "tailscale status didn't print JSON: The Tailscale GUI failed"):
+                rox.tailscale_json("status")
+        self.assertEqual({flag for _, flag in seen}, {"1"})
+
     def test_funnel_handlers_read_what_tailscale_serves_and_whether_its_public(self):
         with patch.object(rox, "tailscale_json", return_value=self.FUNNEL_STATUS):
             self.assertEqual(rox.funnel_handlers(), {(10000, "/"): ("http://127.0.0.1:51460", True)})

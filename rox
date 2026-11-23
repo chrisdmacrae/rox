@@ -691,8 +691,23 @@ def tailscale_cli():
     raise Error("Install Tailscale on this machine to funnel guest ports. Rex's own tailnet node can't funnel")
 
 
+# The binary inside Tailscale.app starts the GUI instead of acting as the CLI when it has no
+# terminal, as under the rox service, unless this is set. Other installs ignore it.
+TAILSCALE_ENV = {"TAILSCALE_BE_CLI": "1"}
+
+
+def tailscale_run(args, **kwargs):
+    return run([tailscale_cli(), *args], env={**os.environ, **TAILSCALE_ENV}, **kwargs)
+
+
 def tailscale_json(*args):
-    return json.loads(output([tailscale_cli(), *args, "--json"], timeout=20) or "{}")
+    result = tailscale_run([*args, "--json"], capture=True, check=False, timeout=20, stdin=subprocess.DEVNULL)
+    if result.returncode:
+        raise Error(f"tailscale {' '.join(args)} failed: {(result.stderr or result.stdout).strip()}")
+    try:
+        return json.loads(result.stdout or "{}")
+    except ValueError:
+        raise Error(f"tailscale {' '.join(args)} didn't print JSON: {result.stdout.strip()[:200]}") from None
 
 
 def funnel_target(funnel):
@@ -754,10 +769,9 @@ def close_funnel_tunnel(guest, funnel):
 
 
 def funnel_on(funnel):
-    argv = [tailscale_cli(), "funnel", "--bg", "--yes", f"--https={funnel['https']}", *funnel_path_args(funnel),
-            funnel_target(funnel)]
+    args = ["funnel", "--bg", "--yes", f"--https={funnel['https']}", *funnel_path_args(funnel), funnel_target(funnel)]
     try:
-        result = run(argv, capture=True, check=False, timeout=30, stdin=subprocess.DEVNULL)
+        result = tailscale_run(args, capture=True, check=False, timeout=30, stdin=subprocess.DEVNULL)
     except subprocess.TimeoutExpired as error:
         text = error.stdout or ""
         text = text.decode() if isinstance(text, bytes) else text
@@ -767,8 +781,8 @@ def funnel_on(funnel):
 
 
 def funnel_off(funnel):
-    run([tailscale_cli(), "funnel", "--yes", f"--https={funnel['https']}", *funnel_path_args(funnel), "off"],
-        capture=True, check=False, timeout=30, stdin=subprocess.DEVNULL)
+    tailscale_run(["funnel", "--yes", f"--https={funnel['https']}", *funnel_path_args(funnel), "off"],
+                  capture=True, check=False, timeout=30, stdin=subprocess.DEVNULL)
 
 
 def restore_funnels(guest):
@@ -835,7 +849,7 @@ def funnel(name, port=None, https=443, path="/", off=False):
             raise Error(f"{name} is stopped. Start it with rox start {name}")
         if guest.phase != "ready":
             raise Error(f"{name} is not ready")
-        cli = tailscale_cli()
+        tailscale_cli()
         resume(guest, saved_tailnet(guest))
         if not path.startswith("/"):
             path = f"/{path}"
@@ -855,7 +869,7 @@ def funnel(name, port=None, https=443, path="/", off=False):
             guest.funnels.remove(previous)
         dns = tailscale_json("status").get("Self", {}).get("DNSName", "").rstrip(".")
         if not dns:
-            raise Error(f"{cli} status didn't report this machine's tailnet name. Is Tailscale signed in?")
+            raise Error("tailscale status didn't report this machine's tailnet name. Is Tailscale signed in?")
         url = f"https://{dns}{'' if https == 443 else f':{https}'}{path}"
         entry = {"port": port, "https": https, "path": path, "local": free_port(), "url": url}
         open_funnel_tunnel(guest, entry)
