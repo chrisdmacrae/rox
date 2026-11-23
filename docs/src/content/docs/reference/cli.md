@@ -35,6 +35,7 @@ rox up container [options] [-- COMMAND [ARG ...]]
 | `--rebuild` | Rebuild the project image before launching. |
 | `--open-shell` | Open the guest's own Rex session in the Rex app on this machine, like `rox open`. Without a Rex app here, open a Guest tab running `rox shell` in the current Rex session instead. Requires a Rex terminal. |
 | `--no-tailscale` | Keep this guest off the tailnet even when `tailscale` is configured. See [Reaching guests from other devices](../../guides/tailnet/). |
+| `--no-git-agent` | Give the guest Git keys only while it clones, not for its whole life. See [Private repositories](../../guides/private-repositories/). |
 | `--no-agents` | Don't install the configured [agent CLIs](../../guides/agent-clis/) or their credentials in this guest. |
 
 ## `rox add NAME`

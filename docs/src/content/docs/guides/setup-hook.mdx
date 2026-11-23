@@ -21,7 +21,7 @@ Use it to install dependencies, write config, or install and sign in to your age
 
 - A nonzero exit marks the workspace as failed, and the initial Rex session doesn't start.
 - Changes made with `export` inside the hook only affect the hook and its child processes.
-- Git credentials aren't available. The temporary Git agent stops before the hook runs.
+- Git credentials aren't available. The clone's temporary Git agent stops before the hook runs, and the guest's own agent is forwarded only after it.
 - Pass `--no-hook` to skip the hook for one launch.
 
 ## When the hook runs

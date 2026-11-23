@@ -26,6 +26,7 @@ REAL_GUEST_STATE = rox.guest_state
 REAL_REACHABLE = rox.reachable
 REAL_SUGGEST_APP_HOST = rox.suggest_app_host
 REAL_LOCAL_APP = rox.local_app
+REAL_RESTORE_GIT_AGENT = rox.restore_git_agent
 
 
 def base_image(version=None, image_id="sha256:base"):
@@ -57,7 +58,7 @@ class WorkspaceTests(unittest.TestCase):
         # Treat guests as running and reachable, so commands don't ask a real engine or tunnel.
         # Tests of those checks call the REAL_ copies.
         for name, value in (("guest_state", "running"), ("reachable", True), ("suggest_app_host", None),
-                            ("local_app", None)):
+                            ("local_app", None), ("restore_git_agent", False)):
             runtime = patch.object(rox, name, return_value=value)
             runtime.start()
             self.addCleanup(runtime.stop)
@@ -2498,6 +2499,114 @@ class WorkspaceTests(unittest.TestCase):
                               ([], "Name the agent to set up")):
             with self.subTest(argv=argv), self.assertRaisesRegex(rox.Error, message):
                 configure(*argv)
+
+    def test_guest_git_keys_default_to_the_ssh_keys_and_can_be_turned_off(self):
+        ssh = self.root / "home" / ".ssh"
+        ssh.mkdir(parents=True)
+        (ssh / "id_ed25519").write_text("key")
+        deploy = self.root / "deploy"
+        deploy.write_text("key")
+        args = rox.argparse.Namespace(git_key=None, no_git_agent=False)
+        self.assertEqual(rox.guest_git_keys(args, {}, "c"), [str(ssh / "id_ed25519")])
+        self.assertEqual(rox.guest_git_keys(args, {"git_keys": [str(deploy)]}, "c"), [str(deploy)])
+        self.assertEqual(rox.guest_git_keys(args, {"git_agent": False}, "c"), [])
+        self.assertEqual(rox.guest_git_keys(rox.argparse.Namespace(git_key=None, no_git_agent=True), {}, "c"), [])
+        with self.assertRaisesRegex(rox.Error, "true or false for git_agent"):
+            rox.guest_git_keys(args, {"git_agent": "yes"}, "c")
+
+    def test_git_agent_holds_the_keys_on_the_launcher_and_forwards_them(self):
+        key = self.root / "id_ed25519"
+        key.write_text("key")
+        guest = self.saved_guest(git_keys=[str(key)])
+        runtime = self.root / "runtime"
+        statuses = [2]
+        commands, started = [], []
+
+        class Process:
+            pid = 4242
+
+            def poll(self):
+                return None
+
+        def fake_run(argv, **kwargs):
+            commands.append((argv, kwargs.get("env", {}).get("SSH_AUTH_SOCK")))
+            return subprocess.CompletedProcess(argv, statuses.pop(0) if argv[1:] == ["-l"] else 0, "", "")
+
+        def fake_popen(argv, **kwargs):
+            started.append(argv)
+            if argv[0] == "ssh-agent":
+                (runtime / "git-agent.sock").touch()
+            return Process()
+
+        with (
+            patch.object(rox.Guest, "runtime", property(lambda guest: runtime)),
+            patch.object(rox, "run", side_effect=fake_run),
+            patch.object(rox.subprocess, "Popen", side_effect=fake_popen),
+            patch.object(rox.Path, "is_socket", lambda path: path.exists()),
+            patch.object(rox, "pid_alive", return_value=False),
+        ):
+            rox.start_git_agent(guest)
+        sock = str(runtime / "git-agent.sock")
+        self.assertEqual(commands, [(["ssh-add", "-l"], sock), (["ssh-add", str(key)], sock)])
+        self.assertEqual(started[0], ["ssh-agent", "-D", "-a", sock])
+        forward = started[1]
+        self.assertIn(f"ForwardAgent={sock}", forward)
+        self.assertEqual(forward[-1], shlex.join(["sh", "-c", rox.GIT_AGENT_SCRIPT, "rox",
+                                                  "/home/workspace/.rox/x/git-agent.sock"]))
+        self.assertEqual((runtime / "git-forward.pid").read_text(), "4242\n")
+        self.assertNotIn(str(key), forward)
+
+    def test_git_agent_comes_back_with_the_guest_and_stops_with_it(self):
+        guest = self.saved_guest(git_keys=["/keys/id"])
+        calls = []
+        with (
+            patch.object(rox, "restore_git_agent", side_effect=lambda guest: calls.append("restore") or True),
+            patch.object(rox, "close_git_forward", side_effect=lambda guest: calls.append("close")),
+            patch.object(rox, "restore_funnels", return_value=False),
+            patch.object(rox, "ensure_runtime"),
+            patch.object(rox, "connect"),
+            patch.object(rox, "register_guest"),
+            patch.object(rox, "close_tunnel"),
+        ):
+            self.assertTrue(rox.resume(guest))
+            self.assertEqual(calls, ["restore"])
+            calls.clear()
+            rox.resume(guest, force=True)
+            self.assertEqual(calls, ["close", "restore"])
+        with patch.object(rox, "pid_alive", return_value=True), patch.object(rox, "start_git_agent") as start:
+            self.assertFalse(REAL_RESTORE_GIT_AGENT(guest))
+            start.assert_not_called()
+        with patch.object(rox, "pid_alive", return_value=False), \
+                patch.object(rox, "start_git_agent", side_effect=rox.Error("passphrase")), \
+                contextlib.redirect_stderr(io.StringIO()) as warned:
+            self.assertFalse(REAL_RESTORE_GIT_AGENT(guest))
+        self.assertIn("can't use your SSH keys until this works: passphrase", warned.getvalue())
+        with patch.object(rox, "stop_git_agent") as stopped, patch.object(rox, "close_tunnel"), \
+                patch.object(rox, "stop_guest"), contextlib.redirect_stdout(io.StringIO()):
+            rox.main(["stop", guest.name])
+        stopped.assert_called_once()
+
+    def test_guest_shells_and_rex_server_find_the_forwarded_git_agent(self):
+        argv = rox.shell_command("/home/workspace/.rox/rv-x/r.sock", "/home/workspace")
+        self.assertIn("SSH_AUTH_SOCK=/home/workspace/.rox/rv-x/git-agent.sock", argv)
+        script = (ROOT / "guest/bootstrap.sh").read_text()
+        server = script[script.index("    server)"):script.index("    session)")]
+        self.assertIn('export SSH_AUTH_SOCK="$base/git-agent.sock"', server)
+
+    def test_clone_keeps_the_pinned_git_host_keys_for_later_fetches(self):
+        home = self.root / "home"
+        workspace = self.root / "guest" / "projects" / "app"
+        workspace.parent.mkdir(parents=True)
+        pins = workspace.parent / "git_known_hosts"
+        pins.write_text("github.com ssh-ed25519 AAAA\n")
+        (home / ".ssh").mkdir(parents=True)
+        (home / ".ssh" / "known_hosts").write_text("other ssh-ed25519 BBBB\n")
+        env = {"HOME": str(home), "PATH": os.environ["PATH"]}
+        for _ in range(2):
+            subprocess.run(["bash", str(ROOT / "guest/bootstrap.sh"), "clone", str(workspace),
+                            "git@127.0.0.1:none.git", "main", "no"], env=env, capture_output=True)
+        self.assertEqual((home / ".ssh" / "known_hosts").read_text(),
+                         "other ssh-ed25519 BBBB\ngithub.com ssh-ed25519 AAAA\n")
 
 
 if __name__ == "__main__":

@@ -64,6 +64,14 @@ case "$stage" in
             printf -v known_hosts_option '%q' "UserKnownHostsFile=\"$known_hosts\""
             GIT_SSH_COMMAND+=" -o $known_hosts_option"
         fi
+        if [[ -f $known_hosts ]]; then
+            # Keep the pinned Git server keys, so later fetches and pushes in the guest trust them too.
+            mkdir -p -m 700 "$HOME/.ssh"
+            touch "$HOME/.ssh/known_hosts"
+            while IFS= read -r line; do
+                grep -qxF -- "$line" "$HOME/.ssh/known_hosts" || printf '%s\n' "$line" >>"$HOME/.ssh/known_hosts"
+            done <"$known_hosts"
+        fi
         if [[ ! -d $workspace/.git ]]; then
             git -c credential.helper= clone --branch "$branch" -- "$url" "$workspace" </dev/null
             exit 0
@@ -101,8 +109,9 @@ case "$stage" in
         bash .rox.sh </dev/null
         ;;
     server)
-        unset SSH_AUTH_SOCK
         base="${1%/*}"
+        # Rox forwards the launcher's Git keys to this path, when the guest has them.
+        export SSH_AUTH_SOCK="$base/git-agent.sock"
         endpoint="unix://$1"
         rex_ready() {
             [[ -S $1 ]] && rex --autostart=false --timeout 1s -S "$endpoint" ls >/dev/null 2>&1

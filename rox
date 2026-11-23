@@ -36,7 +36,8 @@ NAME_PATTERN = r"rv-[a-z0-9-]{1,24}-[a-f0-9]{12}"
 PROJECT_CONFIG = ".rox.json"
 PROJECT_KEYS = {backend: {"image", "cpus", "memory", "prebuild"} for backend in BACKENDS}
 # These describe the launch machine, so only its own rox config may set them.
-LAUNCHER_KEYS = {"engine", "user", "identity", "host_key", "git_keys", "git_known_hosts", "tailscale", "agents"}
+LAUNCHER_KEYS = {"engine", "user", "identity", "host_key", "git_keys", "git_known_hosts", "tailscale", "agents",
+                 "git_agent"}
 
 
 class Error(Exception):
@@ -143,6 +144,8 @@ class Guest:
     shell_windows: list = field(default_factory=list)
     # The agent CLIs rox installed, as {agent: version}.
     agents: dict = field(default_factory=dict)
+    # Launcher SSH keys that a per-guest agent keeps forwarded into the guest, so Git works after the clone.
+    git_keys: list = field(default_factory=list)
 
     @property
     def base(self):
@@ -669,14 +672,17 @@ def resume(guest, tailnet=None, boot_timeout=120, force=False):
         close_tunnel(guest)
         start_guest(guest, boot_timeout)
     elif not force and reachable(guest):
-        return restore_funnels(guest)
+        restored = restore_funnels(guest)
+        return restore_git_agent(guest) or restored
     close_tunnel(guest)
     # A tunnel to the old address can pass its check until SSH notices the guest went away.
     for entry in guest.funnels:
         close_funnel_tunnel(guest, entry)
+    close_git_forward(guest)
     connect(guest, tailnet)
     register_guest(guest)
     restore_funnels(guest)
+    restore_git_agent(guest)
     return True
 
 
@@ -1312,6 +1318,102 @@ def check_guest_os(guest, timeout):
     expected = "Darwin" if guest.backend == "macos" else "Linux"
     if system != expected:
         raise Error(f"{guest.backend} expects {expected}, but the image runs {system}")
+
+
+# Run by the forwarding SSH session in the guest: point a fixed path at the forwarded agent, then wait.
+GIT_AGENT_SCRIPT = 'ln -sfn "$SSH_AUTH_SOCK" "$1" && exec tail -f /dev/null'
+
+
+def guest_git_socket(base):
+    """Where the guest's Rex server and shells find the forwarded Git agent."""
+    return str(PurePosixPath(base) / "git-agent.sock")
+
+
+def pid_alive(path):
+    try:
+        os.kill(int(path.read_text()), 0)
+    except (FileNotFoundError, ValueError, ProcessLookupError):
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def kill_pid(path):
+    try:
+        os.kill(int(path.read_text()), 15)
+    except (FileNotFoundError, ValueError, ProcessLookupError, PermissionError):
+        pass
+    path.unlink(missing_ok=True)
+
+
+def detached(argv, guest, pid_path):
+    with (guest.directory / "git-agent.log").open("a") as log:
+        process = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=log, stderr=log, start_new_session=True)
+    pid_path.write_text(f"{process.pid}\n")
+    return process
+
+
+def start_git_agent(guest):
+    """Keep the guest's Git keys in an agent on the launcher, forwarded into the guest over SSH.
+
+    The private keys never leave the launcher. Programs in the guest can use them while the forward runs.
+    """
+    if not guest.git_keys or not guest.guest_socket:
+        return
+    private_directory(guest.runtime.parent)
+    private_directory(guest.runtime)
+    sock = guest.runtime / "git-agent.sock"
+    env = {**os.environ, "SSH_AUTH_SOCK": str(sock)}
+    # ssh-add -l exits 1 when the agent has no keys and 2 when there's no agent.
+    status = run(["ssh-add", "-l"], env=env, capture=True, check=False).returncode
+    if status == 2:
+        kill_pid(guest.runtime / "git-agent.pid")
+        sock.unlink(missing_ok=True)
+        agent = detached(["ssh-agent", "-D", "-a", str(sock)], guest, guest.runtime / "git-agent.pid")
+
+        def agent_ready():
+            if agent.poll() is not None:
+                raise Error("Could not start the guest's Git SSH agent")
+            return sock.is_socket()
+
+        wait_for(agent_ready, 5, "the guest's Git SSH agent")
+        status = 1
+    if status == 1:
+        result = run(["ssh-add", *guest.git_keys], env=env, capture=True, check=False,
+                     stdin=None if sys.stdin.isatty() else subprocess.DEVNULL)
+        if result.returncode:
+            raise Error(f"Could not load the Git keys for {guest.name}: {result.stderr.strip()}. "
+                        f"Encrypted keys need their passphrase, so run rox reconnect {guest.name} in a terminal")
+    forward = guest.runtime / "git-forward.pid"
+    if pid_alive(forward):
+        return
+    script = shlex.join(["sh", "-c", GIT_AGENT_SCRIPT, "rox", guest_git_socket(guest.base)])
+    detached([*ssh_command(guest, "-T", "-S", "none", "-o", f"ForwardAgent={sock}"), script], guest, forward)
+
+
+def restore_git_agent(guest):
+    """Start the guest's Git agent or its forward again if either stopped. Return whether it did."""
+    if not guest.git_keys or (pid_alive(guest.runtime / "git-forward.pid")
+                              and pid_alive(guest.runtime / "git-agent.pid")):
+        return False
+    try:
+        start_git_agent(guest)
+    except (Error, OSError, subprocess.SubprocessError) as error:
+        print(f"rox: Git in {guest.name} can't use your SSH keys until this works: {error}",
+              file=sys.stderr, flush=True)
+        return False
+    return True
+
+
+def close_git_forward(guest):
+    kill_pid(guest.runtime / "git-forward.pid")
+
+
+def stop_git_agent(guest):
+    close_git_forward(guest)
+    kill_pid(guest.runtime / "git-agent.pid")
+    (guest.runtime / "git-agent.sock").unlink(missing_ok=True)
 
 
 def open_tunnel(guest):
@@ -2007,6 +2109,8 @@ def describe_guest(guest, project=None):
         print(f"Tailnet    {guest.tailnet_name}")
     if guest.agents:
         print(f"Agents     {describe_agents(guest.agents)}")
+    if guest.git_keys:
+        print(f"Git keys   {', '.join(Path(key).name for key in guest.git_keys)} (forwarded, never copied)")
     target = guest.name if guest.registered else guest.endpoint
     if project:
         print(f"Project    {project.id}")
@@ -2041,7 +2145,8 @@ def dispatch(args, label, launch, command):
         if (value := getattr(args, option, None)) is not None:
             launch.append(f"--{option.replace('_', '-')}={value}")
     launch.extend(f"--git-key={key}" for key in getattr(args, "git_key", None) or [])
-    for flag in ("no_hook", "no_prebuild", "rebuild", "no_app_host", "no_tailscale", "no_agents"):
+    for flag in ("no_hook", "no_prebuild", "rebuild", "no_app_host", "no_tailscale", "no_agents",
+                 "no_git_agent"):
         if getattr(args, flag, False):
             launch.append(f"--{flag.replace('_', '-')}")
     if command:
@@ -2175,9 +2280,11 @@ def require(tools):
 DEFAULT_SSH_KEYS = ("id_rsa", "id_ecdsa", "id_ecdsa_sk", "id_ed25519", "id_ed25519_sk")
 
 
-def default_git_keys(url):
+def default_git_keys(url, quiet=False):
     """The launcher's default SSH identities, which git clone on the launcher would use too."""
     keys = [path for name in DEFAULT_SSH_KEYS if (path := Path.home() / ".ssh" / name).is_file()]
+    if quiet:
+        return keys
     if not keys:
         print(f"rox: No Git SSH key is configured and ~/.ssh has none of ssh's default keys, so the guest "
               f"probably can't clone {url}. Add a key with rox key add PATH, or clone over HTTPS with --repo",
@@ -2201,6 +2308,18 @@ def git_access(args, config, config_path, url):
     known_hosts_option = args.git_known_hosts or config.get("git_known_hosts")
     require((["ssh-agent", "ssh-add"] if keys else []) + ([] if known_hosts_option else ["ssh-keygen"]))
     return keys, git_host_entries(url, known_hosts_option)
+
+
+def guest_git_keys(args, config, config_path):
+    """The keys to keep forwarded into the guest: the configured Git keys, or the default ones."""
+    enabled = config.get("git_agent", True)
+    if not isinstance(enabled, bool):
+        raise Error(f"Expected true or false for git_agent in {config_path}")
+    if not enabled or getattr(args, "no_git_agent", False):
+        return []
+    keys = args.git_key if getattr(args, "git_key", None) is not None else config.get("git_keys")
+    keys = default_git_keys("", quiet=True) if keys is None else validate_git_keys(keys, config_path)
+    return [str(configured_file(key)) for key in keys]
 
 
 def start_session(guest, label, cwd, command):
@@ -2264,6 +2383,7 @@ def up(args, command):
     keys, known_hosts = git_access(args, config, config_path, source[1]) if source else ([], "")
     tailnet = tailscale_settings(config, config_path, args.no_tailscale)
     agents = {} if args.no_agents else agent_settings(config, config_path)
+    forwarded_keys = guest_git_keys(args, config, config_path)
     fetched = None
     if source:
         require(["git"])
@@ -2344,7 +2464,7 @@ def up(args, command):
 
     name = f"rv-{slugify(source[0] if source else 'host', 24) or 'project'}-{secrets.token_hex(6)}"
     guest = Guest(name, backend, launch_image, user, engine, prebuilt=bool(prebuilt),
-                  cpus=cpus, memory=memory)
+                  cpus=cpus, memory=memory, git_keys=forwarded_keys)
     guest.directory.mkdir(mode=0o700)
     guest.identity = str(identity or guest.directory / "login")
     with guest_lock(guest.directory):
@@ -2388,6 +2508,8 @@ def up(args, command):
         if source:
             project = provision_project(guest, source, command, keys, known_hosts, args.no_hook,
                                         image_checkout=bool(prebuilt))
+        # After the setup hook, which runs without Git keys, so only Git and agents in the guest get them.
+        restore_git_agent(guest)
         describe_guest(guest, project)
 
     suggest_app_host(guest.name)
@@ -2422,6 +2544,7 @@ def add(args, command):
             raise Error(f"{guest.name} is {guest.phase}. Run rox reconnect {guest.name} before adding a project")
         resume(guest, saved_tailnet(guest, args.config), force=True)
         project = provision_project(guest, source, command, keys, known_hosts, args.no_hook)
+        restore_git_agent(guest)
         describe_guest(guest, project)
     if app_session:
         try:
@@ -2450,7 +2573,8 @@ def shell_directory(name, checkouts, home, key=None):
 
 def shell_command(socket_path, directory, session=""):
     session_env = [f"REX_SESSION={session}"] if session else []
-    return ["env", f"REX_SERVER=unix://{socket_path}", *session_env, "sh", "-c",
+    git_agent = f"SSH_AUTH_SOCK={guest_git_socket(PurePosixPath(socket_path).parent)}"
+    return ["env", f"REX_SERVER=unix://{socket_path}", git_agent, *session_env, "sh", "-c",
             'cd "$1" && exec "${SHELL:-/bin/sh}" -l', "rox", directory]
 
 
@@ -2493,6 +2617,7 @@ def stop_workspace(name):
         guest.stopped = True
         guest.save()
         stop_funnels(guest)
+        stop_git_agent(guest)
         close_tunnel(guest)
         if guest_state(guest) == "running":
             stop_guest(guest)
@@ -2568,6 +2693,7 @@ def down(name):
         guest.save()
         stop_funnels(guest)
         leave_tailnet(guest)
+        stop_git_agent(guest)
         close_tunnel(guest)
         if guest.engine == "container":
             result = run(["container", "delete", "--force", name], capture=True, check=False)
@@ -3234,6 +3360,8 @@ def main(argv):
     start.add_argument("--no-app-host", action="store_true", help=APP_HOST_HELP)
     start.add_argument("--no-tailscale", action="store_true",
                        help="keep this guest off the tailnet even when tailscale is configured")
+    start.add_argument("--no-git-agent", action="store_true",
+                       help="give the guest Git keys only while cloning, not for its whole life")
     start.add_argument("--no-agents", action="store_true",
                        help="don't install the configured agent CLIs or their credentials in this guest")
     listing = commands.add_parser("ls", help="list managed workspaces")

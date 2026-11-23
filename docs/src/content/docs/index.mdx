@@ -29,7 +29,7 @@ rox up container -- my-agent --model example
 		[Project images](guides/project-images/) run `.rox.sh` once at build time, so launching several workers takes seconds.
 	</Card>
 	<Card title="Private repos, private keys" icon="seti:lock">
-		Rox forwards Git keys through a temporary agent only while the guest clones. The [keys stay on the host](guides/private-repositories/).
+		Rox forwards Git keys into the guest through an SSH agent, so Git works there without copying a key. The [keys stay on the host](guides/private-repositories/).
 	</Card>
 	<Card title="Built for agents" icon="puzzle">
 		The bundled [rox skill](guides/agents/) teaches a controller agent to launch workers, delegate tasks through Rex, and collect results.

@@ -113,7 +113,7 @@ rox up container \
   --git-key ~/.ssh/project_readonly
 ```
 
-Only the selected keys are loaded into a temporary SSH agent. The agent is forwarded only while Git clones and is stopped before the project hook or Rex terminal starts. Git private keys stay on the host.
+Only the selected keys are loaded into an SSH agent on the host, one per guest. Rox forwards it into the guest after the project hook, so `git fetch`, `pull` and `push` work in every guest terminal for the guest's whole life. The guest can use the keys but never reads them: Git private keys stay on the host. Anything in the guest can use them while the forward runs, so prefer deploy keys. Pass `--no-git-agent`, or set `"git_agent": false`, to forward them only while cloning. After a host restart, an encrypted key needs `rox reconnect NAME` in a terminal to load its passphrase again.
 
 ## Tart VMs
 

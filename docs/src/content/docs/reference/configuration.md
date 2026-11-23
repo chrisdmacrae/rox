@@ -35,7 +35,8 @@ Rox reads `${XDG_CONFIG_HOME:-$HOME/.config}/rox/config.json` on the machine tha
 
 | Key | Type | Description |
 | --- | --- | --- |
-| `git_keys` | list of paths | SSH private keys loaded into the temporary Git agent. Manage them with `rox key`. `--git-key` overrides this list. Without it, Rox uses your default SSH keys in `~/.ssh`. |
+| `git_keys` | list of paths | SSH private keys that guests use for Git, through an agent forwarded from the launcher. Manage them with `rox key`. `--git-key` overrides this list. Without it, Rox uses your default SSH keys in `~/.ssh`. |
+| `git_agent` | boolean | `true`, the default, keeps the Git keys forwarded into each guest for its whole life, so Git works there after the clone. `false` forwards them only while the guest clones. See [Private repositories](../../guides/private-repositories/). |
 | `git_known_hosts` | path | Verified host keys for your Git servers. If you leave it out, Rox copies the matching entries from `~/.ssh/known_hosts`. |
 | `tailscale` | object | Put each guest's Rex server on your tailnet so other devices can reach it. See [Reaching guests from other devices](../../guides/tailnet/). |
 | `agents` | object | Install Claude Code (`claude`) and Codex (`codex`) in new guests, with their credentials. Set it up with `rox config agents`. See [Agent CLIs in guests](../../guides/agent-clis/). |
@@ -77,7 +78,7 @@ Put these under `container`, `linux`, or `macos`.
 
 ## Per-project settings: `.rox.json`
 
-A branch can commit a `.rox.json` to set its default `backend` and, for each backend, `image`, `cpus`, `memory`, and `prebuild`. Its values override this config, and command-line options override both. It can't set `engine`, `user`, `identity`, `host_key`, `git_keys`, `git_known_hosts`, `tailscale`, or `agents`. See [Project settings](../../guides/project-settings/) for the format and how settings combine.
+A branch can commit a `.rox.json` to set its default `backend` and, for each backend, `image`, `cpus`, `memory`, and `prebuild`. Its values override this config, and command-line options override both. It can't set `engine`, `user`, `identity`, `host_key`, `git_keys`, `git_known_hosts`, `tailscale`, `agents`, or `git_agent`. See [Project settings](../../guides/project-settings/) for the format and how settings combine.
 
 ```json title=".rox.json"
 {
