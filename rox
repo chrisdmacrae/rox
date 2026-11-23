@@ -2727,16 +2727,34 @@ def current_project(cwd):
         raise Error("Run rox down from a project checkout or name a workspace: rox down NAME") from None
 
 
+def remote_project_guests(project):
+    """(host, name, backend, phase, projects) for the project's guests on other Rex hosts."""
+    try:
+        found, problems = gather_records("all")
+    except (Error, OSError, ValueError, KeyError, subprocess.SubprocessError) as error:
+        print(f"rox: Could not check other Rex hosts for workspaces. ({error})", file=sys.stderr, flush=True)
+        return []
+    for host, problem in problems.items():
+        print(f"rox: Could not check {host} for workspaces. ({problem})", file=sys.stderr, flush=True)
+    return [(host, record["name"], record.get("backend") or "-", record.get("phase") or "-",
+             record.get("projects") or "-")
+            for host, records in found.items() if host != "this machine" for record in records
+            if any(checkout.get("name") == project for checkout in record.get("checkouts") or [])]
+
+
 def choose_project_guest(cwd):
+    """Pick the guest that has the current project, here or on another Rex host. Return (name, host)."""
     project = current_project(cwd)
-    guests = [Guest.load(path.parent.name) for path in sorted(state_root().glob("*/guest.json"))]
-    guests = [guest for guest in guests if any(entry.name == project for entry in guest.projects)]
+    local = [Guest.load(path.parent.name) for path in sorted(state_root().glob("*/guest.json"))]
+    guests = [(None, guest.name, guest.backend, guest.phase, project_summary(guest))
+              for guest in local if any(entry.name == project for entry in guest.projects)]
+    guests += remote_project_guests(project)
     if not guests:
-        raise Error(f"No workspaces for {project}. Run rox ls to see all workspaces.")
+        raise Error(f"No workspaces for {project}. Run rox ls --all to see all workspaces.")
     if len(guests) == 1:
-        return guests[0].name
-    listing = "\n".join(f"  {index}) {guest.name}  {guest.backend}  {guest.phase}  {project_summary(guest)}"
-                        for index, guest in enumerate(guests, 1))
+        return guests[0][1], guests[0][0]
+    listing = "\n".join(f"  {index}) {name}  {f'on {host}  ' if host else ''}{backend}  {phase}  {projects}"
+                        for index, (host, name, backend, phase, projects) in enumerate(guests, 1))
     if not sys.stdin.isatty():
         raise Error(f"{project} has {len(guests)} workspaces. Choose one with rox down NAME:\n{listing}")
     print(f"{project} has {len(guests)} workspaces:\n{listing}")
@@ -2746,7 +2764,8 @@ def choose_project_guest(cwd):
         answer = ""
     if not answer.isdigit() or not 1 <= int(answer) <= len(guests):
         raise Error("No workspace selected")
-    return guests[int(answer) - 1].name
+    host, name = guests[int(answer) - 1][:2]
+    return name, host
 
 
 def project_summary(guest):
@@ -2792,7 +2811,8 @@ def rex_host_labels():
     """Labels of the Rex hosts this machine knows, leaving out rox guests, which aren't launchers."""
     listing = json.loads(output(["rex", "hosts", "list", "--json"], timeout=15))
     labels = [entry["host"]["label"] for entry in listing.get("hosts", []) if entry.get("host", {}).get("label")]
-    return [label for label in labels if not re.fullmatch(NAME_PATTERN, label)]
+    # The Rex app may label a guest by its tailnet name, such as rv-web-0123456789ab.tail1234.ts.net.
+    return [label for label in labels if not re.fullmatch(NAME_PATTERN, label.split(".", 1)[0])]
 
 
 def server_id(server=None):
@@ -3515,10 +3535,12 @@ def main(argv):
             parser.error("choose --agent or --dir, not both")
         install_skill(args.agent, args.dir, args.force)
     else:
+        if args.host is None and not args.name:
+            args.name, args.host = choose_project_guest(args.cwd)
         if args.host is not None:
             down_remote(args)
         else:
-            down(args.name or choose_project_guest(args.cwd))
+            down(args.name)
 
 
 if __name__ == "__main__":

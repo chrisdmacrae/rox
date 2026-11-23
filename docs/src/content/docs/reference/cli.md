@@ -135,7 +135,7 @@ Add a guest to the Rex app on this machine. Rex.app builds that keep their own h
 
 ## `rox down [NAME]`
 
-Delete the guest, its filesystem, all of its project checkouts, and its Rex host entry. If you leave out `NAME`, Rox picks the guest that has the current project. When several do, it lists them and asks which one to remove. If this machine has no record of `NAME`, Rox finds the Rex host that runs it, removes the guest there, and removes this machine's Rex host entry for it.
+Delete the guest, its filesystem, all of its project checkouts, and its Rex host entry. If you leave out `NAME`, Rox picks the guest that has the current project, on this machine or on any Rex host it can reach. When several do, it lists them, with the host of each one that runs elsewhere, and asks which one to remove. If this machine has no record of `NAME`, Rox finds the Rex host that runs it, removes the guest there, and removes this machine's Rex host entry for it.
 
 | Option | Description |
 | --- | --- |

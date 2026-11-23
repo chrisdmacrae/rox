@@ -1618,10 +1618,34 @@ class WorkspaceTests(unittest.TestCase):
         with (
             patch.object(rox.sys, "stdin", stdin),
             patch.object(rox, "down") as down,
+            patch.object(rox, "rex_host_labels", return_value=[]),
             contextlib.redirect_stdout(captured),
         ):
             rox.main(["down", "--cwd", str(nested)])
         return down.call_args.args[0], captured.getvalue()
+
+    def test_down_without_a_name_finds_the_projects_guest_on_another_host(self):
+        nested = self.make_repo()
+        listing = {"this machine": [], "mini": [{
+            "name": "rv-sample-999988887777", "backend": "container", "phase": "ready",
+            "projects": "sample-project:main", "checkouts": [{"id": "sample-project", "name": "sample project"}]}]}
+        with patch.object(rox, "gather_records", return_value=(listing, {"offline": "timed out"})), \
+                patch.object(rox, "down_remote") as removed, contextlib.redirect_stderr(io.StringIO()) as warned:
+            rox.main(["down", "--cwd", str(nested)])
+        self.assertEqual((removed.call_args.args[0].name, removed.call_args.args[0].host),
+                         ("rv-sample-999988887777", "mini"))
+        self.assertIn("Could not check offline for workspaces", warned.getvalue())
+        self.save_guest("rv-sample-000011112222", "sample project")
+        with patch.object(rox, "gather_records", return_value=(listing, {})), \
+                patch.object(rox.sys, "stdin", io.StringIO()), \
+                self.assertRaisesRegex(rox.Error, r"(?s)rv-sample-000011112222  container.*rv-sample-999988887777  on mini"):
+            rox.main(["down", "--cwd", str(nested)])
+
+    def test_rex_host_labels_leave_out_guests_named_by_tailnet_name(self):
+        hosts = {"hosts": [{"host": {"label": label}} for label in (
+            "mini", "rv-web-0123456789ab", "rv-web-0123456789ab.tail1234.ts.net", "studio.tail1234.ts.net")]}
+        with patch.object(rox, "output", return_value=json.dumps(hosts)):
+            self.assertEqual(rox.rex_host_labels(), ["mini", "studio.tail1234.ts.net"])
 
     def test_down_without_a_name_removes_the_projects_only_workspace(self):
         self.save_guest("rv-other-000011112222", "other project")
