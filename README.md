@@ -219,7 +219,7 @@ Use a reusable, ephemeral auth key tagged `tag:rox-guest`, stored in a file only
 
 | Command | Effect |
 | --- | --- |
-| `rox ls` | List local workspace records, their provisioning state, IP address (Tart VMs and Apple containers), and each guest's projects. |
+| `rox ls` | List local workspace records, their provisioning state, IP address (Tart VMs and Apple containers), and each guest's projects. Add `--all` to include the guests on every Rex host you can reach, `--host HOST` for one host, or `--json`. |
 | `rox add NAME` | Clone a project into a running guest and start a Rex session at its checkout. |
 | `rox shell NAME [PROJECT]` | Open an interactive shell at a project checkout. Without `PROJECT`, it opens the guest's only checkout, or the guest home when there are none or several. |
 | `rox forward NAME PORT...` | Forward `localhost` ports on the launcher to servers on the guest's `localhost`, for example dev servers. Use `LOCAL:GUEST` to pick a different local port. Runs until Ctrl-C. |

@@ -51,6 +51,14 @@ It accepts `-S`/`--host`, `--config`, `--cwd`, `--project`, `--remote`, `--repo`
 
 List local workspace records with their backend, provisioning state, IP address, and projects. The IP address is where the launcher can reach servers in a Tart VM or an Apple container, such as `http://IP:5173` for a dev server listening on `0.0.0.0`. Docker and Podman containers show `-`, because they're reached only through a loopback SSH port. The address is the one recorded at launch or the last `rox reconnect`. Each project shows as `ID:BRANCH`, followed by its state if it isn't ready. A guest with no project shows `-`.
 
+Each launcher keeps its own workspace records, so plain `rox ls` shows only the guests launched on this machine.
+
+| Option | Description |
+| --- | --- |
+| `-a`, `--all` | Also list the guests on every Rex host this machine can reach. Rox runs `rox ls` on each host in a short-lived Rex session and adds a `HOST` column. It skips rox guests in your host list, other names for this machine's own server, and hosts it can't reach or that don't have rox, with a note on stderr for each. |
+| `-S`, `--host HOST` | List the guests on this Rex remote host instead. |
+| `--json` | Print the workspaces as JSON, with `name`, `backend`, `engine`, `phase`, `ip`, `tailnet`, and `projects`, plus `host` with `--all` or `--host`. |
+
 ## `rox shell NAME [PROJECT]`
 
 Open an interactive login shell with `REX_SERVER` pointing at the guest's server. `PROJECT` is a project ID or name from `rox ls`. Without it, the shell opens at the guest's only checkout, or in the guest home when it has no projects or several. The guest must be ready.

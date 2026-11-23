@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Launch Rex guests and the project workspaces inside them."""
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
 import fcntl
@@ -1618,10 +1619,119 @@ def guest_ip(guest):
     return guest.address if guest.address and guest.engine in ("", "container") else "-"
 
 
-def list_guests():
+def local_records():
+    records = []
     for path in sorted(state_root().glob("*/guest.json")):
         guest = Guest.load(path.parent.name)
-        print(f"{guest.name}\t{guest.backend}\t{guest.phase}\t{guest_ip(guest)}\t{project_summary(guest)}")
+        records.append({
+            "name": guest.name, "backend": guest.backend, "engine": guest.engine, "phase": guest.phase,
+            "ip": guest_ip(guest), "tailnet": guest.tailnet_name, "projects": project_summary(guest),
+        })
+    return records
+
+
+def record_row(record):
+    return "\t".join(record[key] or "-" for key in ("name", "backend", "phase", "ip", "projects"))
+
+
+def rex_host_labels():
+    """Labels of the Rex hosts this machine knows, leaving out rox guests, which aren't launchers."""
+    listing = json.loads(output(["rex", "hosts", "list", "--json"], timeout=15))
+    labels = [entry["host"]["label"] for entry in listing.get("hosts", []) if entry.get("host", {}).get("label")]
+    return [label for label in labels if not re.fullmatch(NAME_PATTERN, label)]
+
+
+def server_id(server=None):
+    target = ["-S", server] if server else []
+    status = json.loads(output(["rex", "--autostart=false", "--timeout", "5s", *target, "server", "status", "--json"],
+                               timeout=10))
+    return status.get("host_id", "")
+
+
+LIST_COMMAND = ["sh", "-c", 'PATH="$HOME/.local/bin:/usr/local/bin:/opt/homebrew/bin:$PATH"; '
+                'rox ls --json 2>/dev/null || { echo "#rox-plain"; rox ls; }']
+
+
+def remote_records(host):
+    """Run rox ls on a Rex host in a short-lived session and read its records."""
+    rex = ["rex", "--autostart=false", "--timeout", "10s", "-S", host]
+    # Keep the session after rox ls exits so its output can be read, then kill it.
+    created = json.loads(output([*rex, "new", "--json", "--keep-open", "rox ls", "--", *LIST_COMMAND],
+                                timeout=20))
+    session = created["session_id"]
+    block = created["initial_windows"][0]["block_ids"][0]
+    try:
+        status = run([*rex, "wait", "-s", session, block, "--for", "30s"], capture=True, check=False, timeout=40)
+        text = output([*rex, "capture", "-s", session, "-b", block, "--trim", "--unwrap"], timeout=20)
+    finally:
+        run([*rex, "kill", session], capture=True, check=False, timeout=20)
+    if status.returncode == 127 or "rox: not found" in text or "rox: command not found" in text:
+        raise Error("rox isn't installed there")
+    if status.returncode:
+        raise Error(f"rox ls exited with status {status.returncode}: {text.strip()[-200:]}")
+    if text.lstrip().startswith("#rox-plain"):
+        # An older rox without --json prints one guest per line.
+        rows = [line.split(None, 4) for line in text.splitlines()[1:] if re.match(NAME_PATTERN, line)]
+        return [dict(zip(("name", "backend", "phase", "ip", "projects"), row + ["-"] * (5 - len(row))))
+                for row in rows]
+    records = json.loads(text[text.index("["):text.rindex("]") + 1])
+    if not isinstance(records, list):
+        raise Error("rox ls returned something other than a list")
+    return records
+
+
+def list_guests(scope=None, as_json=False):
+    """List workspaces here, on one Rex host, or on every reachable Rex host."""
+    if scope is None:
+        records = local_records()
+        if as_json:
+            print(json.dumps(records, indent=2))
+        else:
+            for record in records:
+                print(record_row(record))
+        return
+
+    hosts = rex_host_labels() if scope == "all" else [scope]
+    here = server_id()
+    results = {"this machine": local_records()} if scope == "all" else {}
+    problems = {}
+
+    def ask(host):
+        if scope == "all" and server_id(host) == here:
+            return host, None, None  # Another label for this machine's own server.
+        return host, remote_records(host), None
+
+    def safely(host):
+        try:
+            return ask(host)
+        except (Error, ValueError, KeyError, subprocess.SubprocessError) as error:
+            return host, None, str(error) or type(error).__name__
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        for host, records, problem in pool.map(safely, hosts):
+            if problem:
+                problems[host] = problem
+            elif records is not None:
+                results[host] = records
+    # Two labels can name the same server, so keep each launcher's guests once.
+    unique, names = {}, set()
+    for host, records in results.items():
+        fresh = [record for record in records if record.get("name") not in names]
+        names.update(record.get("name") for record in fresh)
+        unique[host] = fresh
+
+    if scope != "all" and problems:
+        raise Error(f"Could not list workspaces on {scope}: {problems[scope]}")
+    if as_json:
+        print(json.dumps([{**record, "host": host} for host, records in unique.items() for record in records],
+                         indent=2))
+    else:
+        print("HOST\tNAME\tBACKEND\tPHASE\tIP\tPROJECTS")
+        for host, records in unique.items():
+            for record in records:
+                print(f"{host}\t{record_row(record)}")
+    for host, problem in problems.items():
+        print(f"rox: Skipped {host}: {problem}", file=sys.stderr)
 
 
 SKILL_AGENTS = {
@@ -1730,7 +1840,12 @@ def main(argv):
     start.add_argument("--no-app-host", action="store_true", help=APP_HOST_HELP)
     start.add_argument("--no-tailscale", action="store_true",
                        help="keep this guest off the tailnet even when tailscale is configured")
-    commands.add_parser("ls", help="list managed workspaces")
+    listing = commands.add_parser("ls", help="list managed workspaces")
+    where = listing.add_mutually_exclusive_group()
+    where.add_argument("-a", "--all", action="store_true",
+                       help="also list workspaces on every Rex host this machine can reach")
+    where.add_argument("-S", "--host", help="list workspaces on this Rex remote host instead")
+    listing.add_argument("--json", action="store_true", help="print the workspaces as JSON")
     shell_parser = commands.add_parser("shell", help="open an interactive guest shell")
     shell_parser.add_argument("name")
     shell_parser.add_argument("project", nargs="?", help="project checkout to open; omit for the only one or the guest home")
@@ -1773,7 +1888,7 @@ def main(argv):
     elif command:
         parser.error("only up and add accept a command after --")
     elif args.command == "ls":
-        list_guests()
+        list_guests("all" if args.all else args.host, args.json)
     elif args.command == "shell":
         shell(args.name, args.project)
     elif args.command == "forward":

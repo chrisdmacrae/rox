@@ -1438,6 +1438,92 @@ class WorkspaceTests(unittest.TestCase):
     def test_project_config_cannot_put_guests_on_the_tailnet(self):
         self.assertIn("tailscale", rox.LAUNCHER_KEYS)
 
+    def fake_rex_hosts(self, servers, listings, killed):
+        """Fake rex for rox ls --all: server IDs per host, and what rox ls prints there."""
+        hosts = {"hosts": [{"host": {"label": label}} for label in [*servers, "rv-guest-000011112222"]]}
+        sessions = {}
+
+        def fake_output(argv, **kwargs):
+            if argv[:3] == ["rex", "hosts", "list"]:
+                return json.dumps(hosts)
+            target = argv[argv.index("-S") + 1] if "-S" in argv else None
+            if argv[-3:] == ["server", "status", "--json"]:
+                if servers.get(target, "here") is None:
+                    raise rox.Error("connection refused")
+                return json.dumps({"host_id": servers.get(target, "here") if target else "here"})
+            if "new" in argv:
+                self.assertIn("--keep-open", argv)
+                sessions[target] = f"session:{target}"
+                return json.dumps({"session_id": f"session:{target}", "initial_windows": [{"block_ids": ["block:1"]}]})
+            if "capture" in argv:
+                return listings[target]
+            raise AssertionError(argv)
+
+        def fake_run(argv, **kwargs):
+            if "kill" in argv:
+                killed.append(argv[-1])
+            return subprocess.CompletedProcess(argv, 0, "", "")
+
+        return fake_output, fake_run
+
+    def test_ls_all_lists_guests_on_every_reachable_launcher_once(self):
+        rox.private_directory(rox.state_root())
+        local = rox.Guest("rv-local-000000000001", "container", "rox:linux", "workspace", "container",
+                          address="192.168.64.5", phase="ready")
+        local.directory.mkdir(mode=0o700)
+        local.save()
+        mini = [{"name": "rv-mini-000000000002", "backend": "container", "engine": "container", "phase": "ready",
+                 "ip": "192.168.64.8", "tailnet": "rv-mini-000000000002.tail.ts.net", "projects": "app:main"}]
+        listings = {
+            "mini": json.dumps(mini, indent=2),
+            "mini-alias": json.dumps(mini, indent=2),
+            # An older rox without --json falls back to its plain listing.
+            "studio": "#rox-plain\nrv-old-000000000003    linux    failed    -    api:dev (failed)\n",
+        }
+        servers = {"air": "here", "mini": "mini-id", "mini-alias": "mini-id-2", "studio": "studio-id", "gone": None}
+        killed = []
+        fake_output, fake_run = self.fake_rex_hosts(servers, listings, killed)
+        with (
+            patch.object(rox, "output", side_effect=fake_output),
+            patch.object(rox, "run", side_effect=fake_run),
+            contextlib.redirect_stdout(io.StringIO()) as printed,
+            contextlib.redirect_stderr(io.StringIO()) as errors,
+        ):
+            rox.main(["ls", "--all"])
+        rows = [line.split("\t") for line in printed.getvalue().splitlines()]
+        self.assertEqual(rows[0], ["HOST", "NAME", "BACKEND", "PHASE", "IP", "PROJECTS"])
+        self.assertEqual([(row[0], row[1]) for row in rows[1:]], [
+            ("this machine", "rv-local-000000000001"),
+            ("mini", "rv-mini-000000000002"),
+            ("studio", "rv-old-000000000003"),
+        ])
+        self.assertEqual(rows[3][3:], ["failed", "-", "api:dev (failed)"])
+        self.assertIn("Skipped gone: connection refused", errors.getvalue())
+        # Guests aren't launchers, and this machine's own server isn't asked twice.
+        self.assertEqual(sorted(killed), ["session:mini", "session:mini-alias", "session:studio"])
+
+    def test_ls_on_one_host_reports_a_missing_rox_and_prints_json(self):
+        listings = {"mini": json.dumps([{"name": "rv-mini-000000000002", "backend": "container",
+                                         "phase": "ready", "ip": "-", "projects": "-"}])}
+        killed = []
+        fake_output, fake_run = self.fake_rex_hosts({"mini": "mini-id"}, listings, killed)
+        with (
+            patch.object(rox, "output", side_effect=fake_output),
+            patch.object(rox, "run", side_effect=fake_run),
+            contextlib.redirect_stdout(io.StringIO()) as printed,
+        ):
+            rox.main(["ls", "--host", "mini", "--json"])
+        self.assertEqual([(entry["host"], entry["name"]) for entry in json.loads(printed.getvalue())],
+                         [("mini", "rv-mini-000000000002")])
+        listings["mini"] = "sh: rox: not found\n"
+        with (
+            patch.object(rox, "output", side_effect=fake_output),
+            patch.object(rox, "run", side_effect=lambda argv, **kwargs: subprocess.CompletedProcess(argv, 127, "", "")),
+            contextlib.redirect_stderr(io.StringIO()),
+        ):
+            with self.assertRaisesRegex(rox.Error, "isn't installed there"):
+                rox.main(["ls", "--host", "mini"])
+
     def test_records_from_single_project_launches_still_load(self):
         name = "rv-legacy-000011112222"
         directory = rox.state_root() / name
