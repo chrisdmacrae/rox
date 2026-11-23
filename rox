@@ -1530,11 +1530,12 @@ def local_app_client():
     return app["client_id"] if app else None
 
 
-def open_in_app(name, server, session_id, timeout=180):
+def open_in_app(name, server, session_id, address=None, timeout=180):
     """Show the guest's own session in the Rex app here, so its splits and tabs run in the guest.
 
-    The app shows one host at a time, and its Switch Host picker takes no arguments, so open
-    the picker, wait for the app to connect to the guest's server, then select the session there.
+    The app stays connected to every host in its list. When the guest isn't one of them, open
+    Add Remote Host with the guest's address copied, wait for the app to connect to the guest's
+    server, then select the session through that connection.
     """
     app = local_app()
     if not app:
@@ -1550,11 +1551,9 @@ def open_in_app(name, server, session_id, timeout=180):
 
     client = guest_app()
     if not client:
-        run(["rex", "--autostart=false", "-C", app["client_id"], "do", "client.host.switch"],
-            check=False, capture=True, timeout=8)
-        print(f"Choose {name} in the Rex app's Switch Host picker. If it isn't listed, add it with "
-              f"rox add-remote-host {name}, then choose it.", flush=True)
-        client = wait_for(guest_app, timeout, f"the Rex app to switch to {name}")
+        add_app_host(name, address or server)
+        print(f"Waiting for the Rex app to connect to {name}...", flush=True)
+        client = wait_for(guest_app, timeout, f"the Rex app to connect to {name}")
     result = run(["rex", "--autostart=false", "-S", server, "-C", client, "do", "session.select",
                   f"session_id={session_id}"], check=False, capture=True, timeout=15)
     if result.returncode:
@@ -1577,7 +1576,7 @@ def open_guest(name, key=None, host=None):
     if host is None and is_local(name):
         guest = ready_guest(name)
         session = guest_session(guest, key)
-        server = guest.endpoint
+        server, address = guest.endpoint, guest.tailnet_name or guest.endpoint
     else:
         host, record = find_remote_guest(name, host)
         if not record.get("tailnet"):
@@ -1587,16 +1586,17 @@ def open_guest(name, key=None, host=None):
             raise Error(f"Upgrade rox on {host} to open its guests in the Rex app from here")
         sessions = record["sessions"]
         session = sessions.get(key) if key else (sessions.get("") or next(iter(sessions.values()), ""))
-        server = record["tailnet"]
+        server = address = record["tailnet"]
     if not session:
         raise Error(f"{name} has no Rex session for {key or 'the guest'} yet. Run rox reconnect {name}")
-    open_in_app(name, server, session)
+    open_in_app(name, server, session, address)
 
 
 def open_or_tab(app_session, guest, project=None):
     """For --open-shell: open the guest's own session in the Rex app, or a Guest tab without an app."""
     if local_app():
-        open_in_app(guest.name, guest.endpoint, project.session_id if project else guest.session_id)
+        open_in_app(guest.name, guest.endpoint, project.session_id if project else guest.session_id,
+                    guest.tailnet_name or guest.endpoint)
     else:
         open_app_shell(app_session, guest.name, project.id if project else None)
 

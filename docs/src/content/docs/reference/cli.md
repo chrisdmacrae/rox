@@ -107,7 +107,7 @@ Restore Rex access to a guest. This also works for a guest kept after a failed c
 
 ## `rox open NAME [PROJECT]`
 
-Show the guest's own Rex session in the Rex app on this machine, so new tabs and splits there run in the guest. Without `PROJECT`, Rox opens the session of the guest's only project, or the guest's own session. The app shows one host at a time, and its host picker can't be driven by a command. So when the app isn't on the guest's host, Rox opens **Switch Host** and waits up to three minutes for you to choose the guest, then selects the session. Add the guest to the app first with `rox add-remote-host NAME` if it isn't listed. A guest on another Rex host must be on the tailnet. See [Working in the guest's session](../../guides/remote-hosts/#working-in-the-guests-session).
+Show the guest's own Rex session in the Rex app on this machine, so new tabs and splits there run in the guest. Without `PROJECT`, Rox opens the session of the guest's only project, or the guest's own session. When the app doesn't have the guest as a host, Rox copies the guest's address and opens **Add Remote Host**, like `rox add-remote-host`, then waits up to three minutes for the app to connect to the guest before selecting the session. A guest on another Rex host must be on the tailnet. See [Working in the guest's session](../../guides/remote-hosts/#working-in-the-guests-session).
 
 | Option | Description |
 | --- | --- |

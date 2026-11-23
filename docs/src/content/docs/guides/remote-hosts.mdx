@@ -47,7 +47,7 @@ A Rex pane belongs to the server whose session it's in, and a new split or tab r
 rox open rv-my-project-3f9a1c2b7d40
 ```
 
-The Rex app shows one host at a time, and its host picker can't be driven by a command. So when the app isn't on the guest's host yet, `rox open` opens **Switch Host** and waits for you to choose the guest. If the guest isn't in the list, add it first with `rox add-remote-host NAME`. Once the app is on the guest, Rox selects the guest's project session. `rox up` and `rox add` with `--host` do this for you when they finish.
+The Rex app stays connected to every host in its list, but it ignores `rex hosts add`, and its **Add Remote Host** dialog can't be filled in by a command. So when the app doesn't have the guest yet, `rox open` copies the guest's address, opens **Add Remote Host**, and waits for you to paste it. Once the app connects to the guest, Rox selects the guest's project session. Next time, the app already has the guest, and `rox open` selects the session straight away. `rox up` and `rox add` with `--host` do this for you when they finish.
 
 Inside a guest shell, `REX_SESSION` points at the guest's session, so `rex split` and `rex run` there open in that session too.
 

@@ -906,14 +906,14 @@ class WorkspaceTests(unittest.TestCase):
                                      "do", "session.select", "session_id=session:guest"]])
         self.assertIn("Splits and new tabs there run in the guest", printed.getvalue())
 
-    def test_open_in_app_opens_switch_host_and_waits_for_the_app(self):
+    def test_open_in_app_adds_the_guest_to_the_app_and_waits_for_it_to_connect(self):
         commands = self.fake_app_servers(connected_after=2)
-        with contextlib.redirect_stdout(io.StringIO()) as printed:
+        with patch.object(rox, "add_app_host") as added, contextlib.redirect_stdout(io.StringIO()) as printed:
             rox.open_in_app("rv-x", "rv-x.tail.ts.net", "session:guest")
-        self.assertEqual(commands[0], ["rex", "--autostart=false", "-C", "client:here", "do", "client.host.switch"])
-        self.assertEqual(commands[-1][-3:], ["do", "session.select", "session_id=session:guest"])
-        self.assertIn("Choose rv-x in the Rex app's Switch Host picker", printed.getvalue())
-        self.assertIn("rox add-remote-host rv-x", printed.getvalue())
+        self.assertEqual(added.call_args.args, ("rv-x", "rv-x.tail.ts.net"))
+        self.assertEqual(commands, [["rex", "--autostart=false", "-S", "rv-x.tail.ts.net", "-C", "client:there",
+                                     "do", "session.select", "session_id=session:guest"]])
+        self.assertIn("Waiting for the Rex app to connect to rv-x", printed.getvalue())
 
     def test_open_needs_the_app_here(self):
         with self.assertRaisesRegex(rox.Error, "Open the Rex app on this machine"):
@@ -925,12 +925,13 @@ class WorkspaceTests(unittest.TestCase):
         guest.save()
         with patch.object(rox, "open_in_app") as opened:
             rox.main(["open", guest.name])
-        self.assertEqual(opened.call_args.args, (guest.name, guest.endpoint, "session:web"))
+        self.assertEqual(opened.call_args.args, (guest.name, guest.endpoint, "session:web", guest.endpoint))
         with self.remote_listing(sessions={"": "session:home", "web": "session:remote-web"}), \
                 patch.object(rox, "open_in_app") as opened:
             rox.main(["open", "rv-remote-000011112222", "web"])
         self.assertEqual(opened.call_args.args,
-                         ("rv-remote-000011112222", "rv-remote-000011112222.tail.ts.net", "session:remote-web"))
+                         ("rv-remote-000011112222", "rv-remote-000011112222.tail.ts.net", "session:remote-web",
+                          "rv-remote-000011112222.tail.ts.net"))
         with self.remote_listing(), self.assertRaisesRegex(rox.Error, "Upgrade rox on mini"):
             rox.main(["open", "rv-remote-000011112222"])
         with self.remote_listing(tailnet="", sessions={}), self.assertRaisesRegex(rox.Error, "isn't on the tailnet"):
@@ -941,7 +942,7 @@ class WorkspaceTests(unittest.TestCase):
         with patch.object(rox, "local_app", return_value={"client_id": "client:here"}), \
                 patch.object(rox, "open_in_app") as opened, patch.object(rox, "open_app_shell") as tab:
             rox.open_or_tab("session:mine", guest)
-        self.assertEqual(opened.call_args.args, (guest.name, guest.endpoint, "session:guest"))
+        self.assertEqual(opened.call_args.args, (guest.name, guest.endpoint, "session:guest", guest.endpoint))
         tab.assert_not_called()
         with patch.object(rox, "open_in_app") as opened, patch.object(rox, "open_app_shell") as tab:
             rox.open_or_tab("session:mine", guest)

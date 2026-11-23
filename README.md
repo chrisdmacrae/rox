@@ -236,7 +236,7 @@ It checks every 15 seconds, logs to `~/.local/state/rox/service.log`, and leaves
 | `rox funnel NAME PORT` | Put a server in the guest on the internet with Tailscale Funnel, through the launcher's Tailscale. `--https 8443` or `10000` and `--path` pick the public address, and `--off` stops it. See the [tailnet guide](docs/src/content/docs/guides/tailnet.mdx#sharing-a-guests-server-on-the-internet). |
 | `rex -S NAME ls` | List the guest's Rex sessions after a local launch with host registration. |
 | `rox reconnect NAME` | Restore Rex access to a guest, starting the container runtime and the guest first if they stopped. Also works for one retained after clone or setup failure. |
-| `rox open NAME [PROJECT]` | Show the guest's own Rex session in the Rex app on this machine, so splits and new tabs run in the guest. Opens the app's Switch Host picker if the app isn't on the guest yet. |
+| `rox open NAME [PROJECT]` | Show the guest's own Rex session in the Rex app on this machine, so splits and new tabs run in the guest. If the app doesn't have the guest as a host yet, it copies the guest's address and opens Add Remote Host for you to paste it. |
 | `rox add-remote-host NAME` | Add a guest to the Rex app on this machine, for app builds that keep their own host list. |
 | `rox stop NAME` / `rox start NAME` | Stop a guest without deleting it, and keep it stopped until `rox start`. |
 | `rox service install` | Keep guests running across reboots and container runtime restarts. See [Keeping guests running](#keeping-guests-running). |
