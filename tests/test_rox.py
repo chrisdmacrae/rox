@@ -158,6 +158,8 @@ class WorkspaceTests(unittest.TestCase):
              "--", "agent", "'an argument with spaces' $HOME"],
             [*rex, "wait", "-s", "session:launch", "block:provision"],
             [*rex, "capture", "-s", "session:launch", "-b", "block:provision", "--trim", "--unwrap"],
+            # The Provision tab closes once it succeeds, leaving the Guest tab.
+            [*rex, "block", "close", "-s", "session:launch", "block:provision"],
         ])
         self.assertIn("on buildbox in Rex session session:launch", captured.getvalue())
         self.assertIn("Workspace rv-sample-000011112222", captured.getvalue())
@@ -750,6 +752,106 @@ class WorkspaceTests(unittest.TestCase):
         self.assertEqual(record["user"], "workspace")
         self.assertEqual(record["checkouts"], [{"id": "web", "name": "web", "workspace": "/home/workspace/web"}])
 
+    FUNNEL_STATUS = {
+        "TCP": {"10000": {"HTTPS": True}},
+        "Web": {"box.tail.ts.net:10000": {"Handlers": {"/": {"Proxy": "http://127.0.0.1:51460"}}}},
+        "AllowFunnel": {"box.tail.ts.net:10000": True},
+    }
+
+    def fake_tailscale(self, funnel_status=None):
+        """Patch the Tailscale CLI, returning the commands it was asked to run."""
+        commands = []
+        status = funnel_status if funnel_status is not None else {}
+
+        def fake_json(*args):
+            return status if args == ("funnel", "status") else {"Self": {"DNSName": "box.tail.ts.net."}}
+
+        def fake_run(argv, **kwargs):
+            commands.append(argv)
+            return subprocess.CompletedProcess(argv, 0, "", "")
+
+        patches = [patch.object(rox, "tailscale_cli", return_value="tailscale"),
+                   patch.object(rox, "tailscale_json", side_effect=fake_json),
+                   patch.object(rox, "open_funnel_tunnel", return_value=False),
+                   patch.object(rox, "close_funnel_tunnel"),
+                   patch.object(rox, "free_port", return_value=51460),
+                   patch.object(rox, "run", side_effect=fake_run)]
+        for item in patches:
+            item.start()
+            self.addCleanup(item.stop)
+        return commands
+
+    def test_funnel_handlers_read_what_tailscale_serves_and_whether_its_public(self):
+        with patch.object(rox, "tailscale_json", return_value=self.FUNNEL_STATUS):
+            self.assertEqual(rox.funnel_handlers(), {(10000, "/"): ("http://127.0.0.1:51460", True)})
+
+    def test_funnel_tunnels_the_guest_port_and_publishes_it(self):
+        guest = self.saved_guest()
+        commands = self.fake_tailscale()
+        with contextlib.redirect_stdout(io.StringIO()) as printed:
+            rox.main(["funnel", guest.name, "5173", "--https", "10000", "--path", "app"])
+        self.assertEqual(commands[-1], ["tailscale", "funnel", "--bg", "--yes", "--https=10000", "--set-path=/app",
+                                        "http://127.0.0.1:51460"])
+        self.assertEqual(rox.Guest.load(guest.name).funnels, [
+            {"port": 5173, "https": 10000, "path": "/app", "local": 51460,
+             "url": "https://box.tail.ts.net:10000/app"}])
+        self.assertIn("Funneling https://box.tail.ts.net:10000/app to port 5173", printed.getvalue())
+        self.assertIn("Anyone on the internet can open it", printed.getvalue())
+        self.assertEqual(rox.local_records()[0]["funnels"], [{"url": "https://box.tail.ts.net:10000/app", "port": 5173}])
+        with contextlib.redirect_stdout(io.StringIO()) as printed:
+            rox.main(["funnel", guest.name])
+        self.assertIn("https://box.tail.ts.net:10000/app  ->  port 5173", printed.getvalue())
+        with contextlib.redirect_stdout(io.StringIO()) as printed:
+            rox.main(["funnel", guest.name, "--off"])
+        self.assertEqual(commands[-1], ["tailscale", "funnel", "--yes", "--https=10000", "--set-path=/app", "off"])
+        self.assertEqual(rox.Guest.load(guest.name).funnels, [])
+
+    def test_funnel_refuses_an_address_another_guest_or_tailscale_already_serves(self):
+        self.saved_guest("rv-other-000011112222", funnels=[
+            {"port": 3000, "https": 443, "path": "/", "local": 50000, "url": "https://box.tail.ts.net/"}])
+        guest = self.saved_guest()
+        self.fake_tailscale(self.FUNNEL_STATUS)
+        with self.assertRaisesRegex(rox.Error, "rv-other-000011112222 already funnels port 443 at /"):
+            rox.main(["funnel", guest.name, "5173"])
+        with self.assertRaisesRegex(rox.Error, "Tailscale already serves http://127.0.0.1:51460 on port 10000 at /"):
+            rox.main(["funnel", guest.name, "5173", "--https", "10000"])
+        for argv in (["0"], ["5173", "--https", "8080"]):
+            with self.subTest(argv=argv), contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                rox.main(["funnel", guest.name, *argv])
+
+    def test_resume_restores_funnels_tailscale_no_longer_serves(self):
+        entry = {"port": 8000, "https": 10000, "path": "/", "local": 51460, "url": "https://box.tail.ts.net:10000/"}
+        guest = self.saved_guest(funnels=[dict(entry)])
+        commands = self.fake_tailscale(self.FUNNEL_STATUS)
+        with patch.object(rox, "ensure_runtime"):
+            self.assertFalse(rox.resume(guest))
+            self.assertEqual(commands, [])
+            with patch.object(rox, "tailscale_json", return_value={}):
+                self.assertTrue(rox.resume(guest))
+        self.assertEqual(commands[-1][:2], ["tailscale", "funnel"])
+        # A funnel problem is reported without keeping the guest from coming back.
+        with patch.object(rox, "ensure_runtime"), patch.object(rox, "tailscale_json", side_effect=rox.Error("no cli")), \
+                contextlib.redirect_stderr(io.StringIO()) as problems:
+            self.assertFalse(rox.resume(guest))
+        self.assertIn("Could not restore the funnels", problems.getvalue())
+
+    def test_stop_takes_funnels_offline_and_keeps_them(self):
+        entry = {"port": 8000, "https": 443, "path": "/", "local": 51460, "url": "https://box.tail.ts.net/"}
+        guest = self.saved_guest(funnels=[entry])
+        commands = self.fake_tailscale()
+        with patch.object(rox, "output", return_value=""), patch.object(rox, "close_tunnel"), \
+                contextlib.redirect_stdout(io.StringIO()):
+            rox.main(["stop", guest.name])
+        self.assertIn(["tailscale", "funnel", "--yes", "--https=443", "off"], commands)
+        self.assertEqual(rox.Guest.load(guest.name).funnels, [entry])
+
+    def test_funnel_runs_on_the_host_that_has_the_guest(self):
+        with self.remote_listing(), patch.object(rox, "rex_output", return_value=(0, "")) as remote, \
+                contextlib.redirect_stdout(io.StringIO()):
+            rox.main(["funnel", "rv-remote-000011112222", "5173", "--https", "8443"])
+        self.assertEqual(remote.call_args.args[2], [*rox.REMOTE_ROX, "funnel", "rv-remote-000011112222", "5173",
+                                                    "--https=8443", "--path=/"])
+
     def test_reconnect_registers_a_retained_guest_that_never_created_a_session(self):
         name = "rv-retained-000011112222"
         guest = rox.Guest(name, "container", "image", "workspace",
@@ -862,6 +964,10 @@ class WorkspaceTests(unittest.TestCase):
             elif argv[1:2] == ["list"]:
                 guest = next(rox.state_root().glob("*/guest.json"))
                 stdout = json.dumps([{"Name": guest.parent.name, "Running": True}])
+            elif argv[2:4] == ["window", "new"]:
+                stdout = json.dumps({"window_id": "window:guest"})
+            elif argv[4:6] == ["window", "ls"]:
+                stdout = json.dumps({"windows": [{"window_id": "window:mine"}]})
             return subprocess.CompletedProcess(argv, 0, stdout, "")
 
         fake_runtime = property(lambda guest: self.root / "runtime" / guest.name)
@@ -907,9 +1013,16 @@ class WorkspaceTests(unittest.TestCase):
                 self.assertEqual(state.session_id, "")
                 if open_shell:
                     self.assertIn(["rex", "--autostart=false", "window", "new", "-s", "session:launcher",
-                                   "--keep-open", "Guest", "--", str(ROOT / "rox"), "shell", name,
+                                   "--keep-open", "--json", "Guest", "--", str(ROOT / "rox"), "shell", name,
                                    "sample-project"], commands)
+                    self.assertEqual(rox.Guest.load(name).shell_windows,
+                                     [{"session": "session:launcher", "window": "window:guest"}])
             rox.main(["down", name])
+            rex = ["rex", "--autostart=false", "--timeout", "5s"]
+            if open_shell and not fail_stage:
+                # The Guest tab closes, and the session stays because it has other tabs.
+                self.assertIn([*rex, "window", "close", "-s", "session:launcher", "window:guest"], commands)
+                self.assertNotIn([*rex, "kill", "session:launcher"], commands)
             self.assertFalse(state.directory.exists())
             self.assertIn(["rex", "hosts", "remove", name], commands)
             if engine == "container":
@@ -1580,7 +1693,9 @@ class WorkspaceTests(unittest.TestCase):
             "--repo=git@git.example.test:fork/repo.git", "--branch=published-feature", "--open-shell",
             "--git-key=~/.ssh/deploy", "--", "agent",
         ])
-        self.assertEqual(requests[3][requests[3].index("--") + 1:][:8],
+        # add's new, wait, capture and close come first.
+        self.assertEqual(requests[3][-5:], ["block", "close", "-s", "session:launch", "block:provision"])
+        self.assertEqual(requests[4][requests[4].index("--") + 1:][:8],
                          [*rox.REMOTE_ROX, "up", "linux", "--no-project", "--boot-timeout=120"])
 
     def test_shell_opens_the_only_project_a_named_one_or_the_guest_home(self):
@@ -1799,6 +1914,51 @@ class WorkspaceTests(unittest.TestCase):
         ):
             rox.main(["down", "rv-host-000011112222", "-S", "mini"])
         self.assertEqual(requests[0][requests[0].index("--") + 1:], [*rox.REMOTE_ROX, "down", "rv-host-000011112222"])
+
+    def test_down_closes_guest_tabs_and_a_session_left_empty(self):
+        guest = self.saved_guest(shell_windows=[{"session": "session:provision", "window": "window:guest"}])
+        commands = []
+
+        def fake_run(argv, **kwargs):
+            commands.append(argv)
+            stdout = json.dumps({"windows": []}) if "ls" in argv else ""
+            return subprocess.CompletedProcess(argv, 0, stdout, "")
+
+        with patch.object(rox, "run", side_effect=fake_run):
+            rox.close_shell_windows(guest)
+        rex = ["rex", "--autostart=false", "--timeout", "5s"]
+        self.assertEqual(commands, [[*rex, "window", "close", "-s", "session:provision", "window:guest"],
+                                    [*rex, "window", "ls", "-s", "session:provision", "--json"],
+                                    [*rex, "kill", "session:provision"]])
+
+    def test_removing_a_rex_host_that_is_already_gone_succeeds(self):
+        for code, stderr, removed in ((0, "", True), (3, "", True),
+                                      (1, 'Error: no host has that label: "rv-x"', True), (1, "permission denied", False)):
+            with self.subTest(code=code, stderr=stderr), patch.object(
+                    rox, "run", return_value=subprocess.CompletedProcess([], code, "", stderr)):
+                self.assertEqual(rox.remove_rex_host("rv-x"), removed)
+
+    def test_remote_provisioning_closes_its_tab_on_success_and_keeps_it_on_failure(self):
+        args = type("Args", (), {"host": "mini"})()
+        for status, keep, closing in ((0, True, ["block", "close", "-s", "session:p", "block:p"]),
+                                      (0, False, ["kill", "session:p"]), (1, True, None)):
+            commands = []
+
+            def fake_run(argv, **kwargs):
+                commands.append(argv)
+                code = status if "wait" in argv else 0
+                return subprocess.CompletedProcess(argv, code, "done\n", "")
+
+            created = json.dumps({"session_id": "session:p", "initial_windows": [{"block_ids": ["block:p"]}]})
+            with self.subTest(status=status, keep=keep), patch.object(rox, "output", return_value=created), \
+                    patch.object(rox, "run", side_effect=fake_run), contextlib.redirect_stdout(io.StringIO()):
+                if closing:
+                    rox.dispatch(args, "label", ["down", "x"], [], keep_session=keep)
+                    self.assertEqual(commands[-1][-len(closing):], closing)
+                else:
+                    with self.assertRaisesRegex(rox.Error, "See the Provision tab in session:p on mini"):
+                        rox.dispatch(args, "label", ["up"], [])
+                    self.assertFalse(any("close" in argv or "kill" in argv for argv in commands))
 
     def test_down_signs_the_guest_out_of_the_tailnet(self):
         guest = self.tailnet_guest()

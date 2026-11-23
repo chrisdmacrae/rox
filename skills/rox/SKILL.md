@@ -45,6 +45,7 @@ If the runner must start at boot, pass its command after `rox up ... --`. It run
 
 ## Recover and hand back results
 
+- `rox funnel NAME PORT` puts a guest's server on the public internet. Run it only when the user asks to share something publicly, tell them the URL it prints, and turn it off with `rox funnel NAME PORT --off` when they're done.
 - If the tunnel fails, run `rox reconnect NAME` on the launcher. Reconnect restores Rex access, and starts the container runtime and the guest first if a reboot or runtime restart stopped them. A guest shown as `stopped` in `rox ls` was stopped with `rox stop`; leave it stopped unless the user asks, and start it with `rox start NAME`. A clone or hook that failed still needs to be addressed before the checkout is ready. `rox ls` shows each project's state.
 - For Git SSH failures, distinguish a missing trusted server key from rejected client credentials. Use a verified `--git-known-hosts` file or an authorized `--git-key` on the launcher as appropriate. For backend or tunnel failures, check the workspace record, `tart.log`, or `ssh-tunnel.log` under `${XDG_STATE_HOME:-$HOME/.local/state}/rox` on that machine.
 - Collect the worker's summary and verification results. Review its changes in the guest and transfer needed artifacts through an authorized channel. Keep worker changes and their test results associated with the correct guest. Terminal capture is useful for review. Use a file or Git transport when exact artifact bytes matter.

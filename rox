@@ -135,6 +135,11 @@ class Guest:
     # rox stop sets this, so rox and its service leave the guest stopped until rox start.
     stopped: bool = False
     projects: list = field(default_factory=list)
+    # Ports in the guest that the launcher's Tailscale funnels to the internet, as dicts with port,
+    # https, path, the launcher port the tunnel listens on (local) and the public url.
+    funnels: list = field(default_factory=list)
+    # Guest tabs that rox up and rox add opened, as dicts with session and window, for rox down to close.
+    shell_windows: list = field(default_factory=list)
 
     @property
     def base(self):
@@ -661,11 +666,219 @@ def resume(guest, tailnet=None, boot_timeout=120, force=False):
         close_tunnel(guest)
         start_guest(guest, boot_timeout)
     elif not force and reachable(guest):
-        return False
+        return restore_funnels(guest)
     close_tunnel(guest)
+    # A tunnel to the old address can pass its check until SSH notices the guest went away.
+    for entry in guest.funnels:
+        close_funnel_tunnel(guest, entry)
     connect(guest, tailnet)
     register_guest(guest)
+    restore_funnels(guest)
     return True
+
+
+FUNNEL_PORTS = (443, 8443, 10000)
+
+
+def tailscale_cli():
+    """The Tailscale CLI on this machine, which serves funnels. Rex's own tailnet node can't."""
+    found = shutil.which("tailscale")
+    app = Path("/Applications/Tailscale.app/Contents/MacOS/Tailscale")
+    if found:
+        return found
+    if app.is_file():
+        return str(app)
+    raise Error("Install Tailscale on this machine to funnel guest ports. Rex's own tailnet node can't funnel")
+
+
+def tailscale_json(*args):
+    return json.loads(output([tailscale_cli(), *args, "--json"], timeout=20) or "{}")
+
+
+def funnel_target(funnel):
+    return f"http://127.0.0.1:{funnel['local']}"
+
+
+def funnel_path_args(funnel):
+    return [f"--set-path={funnel['path']}"] if funnel["path"] != "/" else []
+
+
+def funnel_handlers():
+    """Map (https port, path) to what this machine's Tailscale serves there, and whether it's public."""
+    status = tailscale_json("funnel", "status")
+    public = {key.rsplit(":", 1)[-1] for key, allowed in (status.get("AllowFunnel") or {}).items() if allowed}
+    handlers = {}
+    for key, site in (status.get("Web") or {}).items():
+        https = int(key.rsplit(":", 1)[-1])
+        for path, handler in (site.get("Handlers") or {}).items():
+            handlers[(https, path)] = (handler.get("Proxy", ""), str(https) in public)
+    return handlers
+
+
+def funnel_socket(guest, funnel):
+    return guest.runtime / f"f{funnel['port']}"
+
+
+def funnel_tunnel_up(guest, funnel):
+    sock = funnel_socket(guest, funnel)
+    return sock.is_socket() and run(ssh_command(guest, "-S", str(sock), "-O", "check"),
+                                    capture=True, check=False, timeout=10).returncode == 0
+
+
+def open_funnel_tunnel(guest, funnel):
+    """Tunnel a launcher port to the guest's localhost port, picking a new launcher port if it's taken.
+
+    Return whether the launcher port changed.
+    """
+    if funnel_tunnel_up(guest, funnel):
+        return False
+    private_directory(guest.runtime.parent)
+    private_directory(guest.runtime)
+    changed = False
+    for attempt in range(2):
+        result = run(ssh_command(
+            guest, "-fNM", "-S", str(funnel_socket(guest, funnel)), "-o", "ControlPersist=no",
+            "-E", str(guest.directory / "ssh-tunnel.log"), "-o", "ForwardAgent=no",
+            "-o", "ExitOnForwardFailure=yes", "-L", f"127.0.0.1:{funnel['local']}:127.0.0.1:{funnel['port']}",
+        ), capture=True, check=False, timeout=20)
+        if result.returncode == 0:
+            return changed
+        funnel["local"], changed = free_port(), True
+    raise Error(f"Could not tunnel to port {funnel['port']} in {guest.name}. See {guest.directory / 'ssh-tunnel.log'}")
+
+
+def close_funnel_tunnel(guest, funnel):
+    sock = funnel_socket(guest, funnel)
+    if sock.is_socket():
+        run(ssh_command(guest, "-S", str(sock), "-O", "exit"), capture=True, check=False, timeout=10)
+
+
+def funnel_on(funnel):
+    argv = [tailscale_cli(), "funnel", "--bg", "--yes", f"--https={funnel['https']}", *funnel_path_args(funnel),
+            funnel_target(funnel)]
+    try:
+        result = run(argv, capture=True, check=False, timeout=30, stdin=subprocess.DEVNULL)
+    except subprocess.TimeoutExpired as error:
+        text = error.stdout or ""
+        text = text.decode() if isinstance(text, bytes) else text
+        raise Error(f"Tailscale is waiting for Funnel to be enabled. {text.strip()}") from None
+    if result.returncode:
+        raise Error(f"Tailscale couldn't funnel port {funnel['https']}: {(result.stderr or result.stdout).strip()}")
+
+
+def funnel_off(funnel):
+    run([tailscale_cli(), "funnel", "--yes", f"--https={funnel['https']}", *funnel_path_args(funnel), "off"],
+        capture=True, check=False, timeout=30, stdin=subprocess.DEVNULL)
+
+
+def restore_funnels(guest):
+    """Bring the guest's funnels back after a restart: their tunnels and their Tailscale handlers.
+
+    Return whether anything had to be restored. Problems are reported, not raised, so a funnel
+    never keeps the guest itself from coming back.
+    """
+    if not guest.funnels:
+        return False
+    restored = False
+    try:
+        handlers = funnel_handlers()
+        for funnel in guest.funnels:
+            changed = open_funnel_tunnel(guest, funnel)
+            if changed or handlers.get((funnel["https"], funnel["path"])) != (funnel_target(funnel), True):
+                funnel_on(funnel)
+                restored = True
+        if restored:
+            guest.save()
+    except (Error, OSError, ValueError, subprocess.SubprocessError) as error:
+        print(f"rox: Could not restore the funnels for {guest.name}: {error}", file=sys.stderr, flush=True)
+    return restored
+
+
+def stop_funnels(guest, funnels=None):
+    """Take funnels off the internet and close their tunnels. The guest keeps them to restore later."""
+    for funnel in guest.funnels if funnels is None else funnels:
+        try:
+            funnel_off(funnel)
+        except (Error, OSError, subprocess.SubprocessError) as error:
+            print(f"rox: Could not turn off {funnel['url']}. Run tailscale funnel status to check. ({error})",
+                  file=sys.stderr, flush=True)
+        close_funnel_tunnel(guest, funnel)
+
+
+def show_funnels(guest):
+    if not guest.funnels:
+        print(f"{guest.name} has no funnels. Start one with rox funnel {guest.name} PORT")
+    for funnel in guest.funnels:
+        print(f"{funnel['url']}  ->  port {funnel['port']} on {guest.name}")
+
+
+def funnel(name, port=None, https=443, path="/", off=False):
+    """Funnel a port in the guest to the internet through this machine's Tailscale, or turn funnels off."""
+    guest = Guest.load(name)
+    with guest_lock(guest.directory, wait=True):
+        guest = Guest.load(name)
+        if off:
+            chosen = [f for f in guest.funnels if port is None or f["port"] == port]
+            if not chosen:
+                print(f"{name} has no funnel{f' for port {port}' if port else 's'}")
+                return
+            stop_funnels(guest, chosen)
+            guest.funnels = [f for f in guest.funnels if f not in chosen]
+            guest.save()
+            for f in chosen:
+                print(f"Stopped funneling {f['url']} to port {f['port']} on {name}")
+            return
+        if port is None:
+            show_funnels(guest)
+            return
+        if guest.stopped:
+            raise Error(f"{name} is stopped. Start it with rox start {name}")
+        if guest.phase != "ready":
+            raise Error(f"{name} is not ready")
+        cli = tailscale_cli()
+        resume(guest, saved_tailnet(guest))
+        if not path.startswith("/"):
+            path = f"/{path}"
+        # Each public address serves one target, so don't take one that's already in use.
+        for other in local_guests():
+            if other.name != name and any((f["https"], f["path"]) == (https, path) for f in other.funnels):
+                raise Error(f"{other.name} already funnels port {https} at {path}. "
+                            "Pick another with --https 8443 or 10000, or --path")
+        mine = {(f["https"], f["path"]): f for f in guest.funnels}
+        handler = funnel_handlers().get((https, path))
+        if handler and (https, path) not in mine:
+            raise Error(f"Tailscale already serves {handler[0]} on port {https} at {path}. "
+                        "Pick another with --https or --path, or turn it off with tailscale funnel")
+        previous = mine.get((https, path))
+        if previous:
+            close_funnel_tunnel(guest, previous)
+            guest.funnels.remove(previous)
+        dns = tailscale_json("status").get("Self", {}).get("DNSName", "").rstrip(".")
+        if not dns:
+            raise Error(f"{cli} status didn't report this machine's tailnet name. Is Tailscale signed in?")
+        url = f"https://{dns}{'' if https == 443 else f':{https}'}{path}"
+        entry = {"port": port, "https": https, "path": path, "local": free_port(), "url": url}
+        open_funnel_tunnel(guest, entry)
+        try:
+            funnel_on(entry)
+        except Error:
+            close_funnel_tunnel(guest, entry)
+            raise
+        guest.funnels.append(entry)
+        guest.save()
+    print(f"Funneling {url} to port {port} on {name}")
+    print("Anyone on the internet can open it. Stop it with "
+          f"rox funnel {name} {port} --off")
+
+
+def local_guests():
+    guests = []
+    for path in sorted(state_root().glob("*/guest.json")):
+        try:
+            guests.append(Guest.load(path.parent.name))
+        except (Error, OSError, ValueError, KeyError, TypeError):
+            continue
+    return guests
 
 
 def saved_tailnet(guest, config_value=None):
@@ -1349,8 +1562,12 @@ def project_options(project):
 REMOTE_ROX = ["sh", "-c", 'PATH="$HOME/.local/bin:/usr/local/bin:/opt/homebrew/bin:$PATH"; exec rox "$@"', "rox"]
 
 
-def dispatch(args, label, launch, command):
-    """Run a rox command on a Rex remote host in a Provision tab and wait for it."""
+def dispatch(args, label, launch, command, keep_session=True):
+    """Run a rox command on a Rex remote host in a Provision tab and wait for it.
+
+    The tab closes when the command succeeds and stays open to inspect when it fails. With
+    keep_session false, the whole session closes, for a command that leaves nothing else in it.
+    """
     rex = ["rex", "--autostart=false", "-S", args.host]
     launch = [*REMOTE_ROX, *launch]
     for option in ("config", "image", "engine", "cpus", "memory", "git_known_hosts"):
@@ -1377,6 +1594,12 @@ def dispatch(args, label, launch, command):
         print(capture.stdout.rstrip())
     if status.returncode:
         raise Error(f"Provisioning exited with status {status.returncode}. See the Provision tab in {session} on {args.host}.")
+    # up and add open the guest's shell in another tab of this session, so keep that one.
+    closing = [*rex, "block", "close", "-s", session, block] if keep_session else [*rex, "kill", session]
+    closed = run(closing, check=False, capture=True)
+    if closed.returncode:
+        print(f"rox: Could not close the Provision tab in {session} on {args.host}. "
+              f"({closed.stderr.strip()})", file=sys.stderr, flush=True)
     return capture.stdout if capture.returncode == 0 else ""
 
 
@@ -1405,15 +1628,43 @@ def down_remote(args):
     """Remove a guest on a Rex remote host, and this machine's host entry for it."""
     if not args.name or not re.fullmatch(NAME_PATTERN, args.name):
         raise Error("Name the workspace to remove on another host: rox down NAME --host HOST")
-    dispatch(args, args.name, ["down", args.name], [])
-    result = run(["rex", "hosts", "remove", args.name], capture=True, check=False)
-    if result.returncode not in (0, 3):
+    dispatch(args, args.name, ["down", args.name], [], keep_session=False)
+    if not remove_rex_host(args.name):
         raise Error(f"Removed {args.name} on {args.host}, but could not remove its Rex host on this machine")
 
 
 def open_app_shell(session, name, project_id=None):
-    run(["rex", "--autostart=false", "window", "new", "-s", session, "--keep-open",
-         "Guest", "--", str(Path(__file__).resolve()), "shell", name, *([project_id] if project_id else [])])
+    """Open a Guest tab running rox shell, and remember it so rox down can close it."""
+    created = json.loads(output([
+        "rex", "--autostart=false", "window", "new", "-s", session, "--keep-open", "--json",
+        "Guest", "--", str(Path(__file__).resolve()), "shell", name, *([project_id] if project_id else [])]))
+    window = created.get("window_id")
+    if window:
+        guest = Guest.load(name)
+        with guest_lock(guest.directory, wait=True):
+            guest = Guest.load(name)
+            guest.shell_windows.append({"session": session, "window": window})
+            guest.save()
+
+
+def close_shell_windows(guest):
+    """Close the guest's Guest tabs, and a session that has nothing left in it, such as a Provision one."""
+    rex = ["rex", "--autostart=false", "--timeout", "5s"]
+    for entry in guest.shell_windows:
+        run([*rex, "window", "close", "-s", entry["session"], entry["window"]], capture=True, check=False, timeout=15)
+        listing = run([*rex, "window", "ls", "-s", entry["session"], "--json"], capture=True, check=False, timeout=15)
+        try:
+            remaining = json.loads(listing.stdout).get("windows") if listing.returncode == 0 else None
+        except ValueError:
+            remaining = None
+        if remaining == []:
+            run([*rex, "kill", entry["session"]], capture=True, check=False, timeout=15)
+
+
+def remove_rex_host(name):
+    """Remove a Rex host entry, which is done already when there's no such host."""
+    result = run(["rex", "hosts", "remove", name], capture=True, check=False)
+    return result.returncode in (0, 3) or "no host has that label" in result.stderr
 
 
 def app_session_for(args):
@@ -1633,7 +1884,7 @@ def up(args, command):
     if app_session:
         try:
             open_app_shell(app_session, guest.name, project.id if project else None)
-        except subprocess.CalledProcessError as error:
+        except (Error, subprocess.SubprocessError, ValueError) as error:
             raise Error(f"{guest.name} is ready. Open it on this host with rox shell {guest.name}.") from error
 
 
@@ -1664,7 +1915,7 @@ def add(args, command):
     if app_session:
         try:
             open_app_shell(app_session, guest.name, project.id)
-        except subprocess.CalledProcessError as error:
+        except (Error, subprocess.SubprocessError, ValueError) as error:
             raise Error(f"{project.id} is ready. Open it with rox shell {guest.name} {project.id}.") from error
 
 
@@ -1729,6 +1980,7 @@ def stop_workspace(name):
             raise Error(f"{name} is being removed")
         guest.stopped = True
         guest.save()
+        stop_funnels(guest)
         close_tunnel(guest)
         if guest_state(guest) == "running":
             stop_guest(guest)
@@ -1802,6 +2054,7 @@ def down(name):
         guest = Guest.load(name)
         guest.phase = "removing"
         guest.save()
+        stop_funnels(guest)
         leave_tailnet(guest)
         close_tunnel(guest)
         if guest.engine == "container":
@@ -1820,10 +2073,9 @@ def down(name):
                 if vm["Running"]:
                     run(["tart", "stop", name])
                 run(["tart", "delete", name])
-        if guest.registered:
-            result = run(["rex", "hosts", "remove", name], check=False)
-            if result.returncode not in (0, 3):
-                raise Error(f"Could not remove Rex host {name}")
+        if guest.registered and not remove_rex_host(name):
+            raise Error(f"Could not remove Rex host {name}")
+        close_shell_windows(guest)
         if guest.runtime.is_dir():
             shutil.rmtree(guest.runtime)
         shutil.rmtree(guest.directory)
@@ -1886,6 +2138,7 @@ def local_records():
             "socket": guest.guest_socket, "home": str(guest.home) if guest.guest_socket else "", "user": guest.user,
             "checkouts": [{"id": project.id, "name": project.name, "workspace": project.workspace}
                           for project in guest.projects if project.workspace],
+            "funnels": [{"url": f["url"], "port": f["port"]} for f in guest.funnels],
         })
     return records
 
@@ -2181,6 +2434,10 @@ def route_remote(args):
             app_shell(host, name, args.project)
     elif args.command == "forward":
         remote_forward(host, record, args.ports)
+    elif args.command == "funnel":
+        run_on_host(host, f"rox funnel {name}", [
+            "funnel", name, *([str(args.port)] if args.port else []), f"--https={args.https}",
+            f"--path={args.path}", *(["--off"] if args.off else [])])
     elif args.command in ("down", "add"):
         args.host = host
         return False
@@ -2398,6 +2655,16 @@ def install_skill(agents, directory, force):
 APP_HOST_HELP = "don't offer to add the guest to a Rex app that keeps its own host list"
 
 
+def port_number(value):
+    try:
+        number = int(value)
+    except ValueError:
+        number = 0
+    if not 1 <= number <= 65535:
+        raise argparse.ArgumentTypeError(f"expected a port from 1 to 65535, got {value!r}")
+    return number
+
+
 def positive_int(value):
     number = int(value)
     if number < 1:
@@ -2466,7 +2733,16 @@ def main(argv):
     start_parser.add_argument("name")
     stop_parser = commands.add_parser("stop", help="stop a guest and keep it stopped until rox start")
     stop_parser.add_argument("name")
-    for named in (forward_parser, reconnect_parser, start_parser, stop_parser):
+    funnel_parser = commands.add_parser("funnel", help="expose a port in a guest to the internet with Tailscale Funnel")
+    funnel_parser.add_argument("name")
+    funnel_parser.add_argument("port", nargs="?", type=port_number,
+                               help="port the server listens on in the guest; omit to list the guest's funnels")
+    funnel_parser.add_argument("--https", type=int, choices=FUNNEL_PORTS, default=443,
+                               help="public HTTPS port (default 443)")
+    funnel_parser.add_argument("--path", default="/", help="public path to serve it at (default /)")
+    funnel_parser.add_argument("--off", action="store_true",
+                               help="stop funneling PORT, or every funnel of the guest without PORT")
+    for named in (forward_parser, funnel_parser, reconnect_parser, start_parser, stop_parser):
         named.add_argument("-S", "--host", help=HOST_HELP)
     stop = commands.add_parser("down", help="delete a guest and its workspace")
     stop.add_argument("name", nargs="?",
@@ -2518,7 +2794,7 @@ def main(argv):
         add(args, command)
     elif command:
         parser.error("only up and add accept a command after --")
-    elif args.command in ("shell", "forward", "reconnect", "start", "stop", "down") and route_remote(args):
+    elif args.command in ("shell", "forward", "funnel", "reconnect", "start", "stop", "down") and route_remote(args):
         return
     elif args.command == "ls":
         list_guests("all" if args.all else args.host, args.json)
@@ -2530,6 +2806,8 @@ def main(argv):
         reconnect(args.name, app_host=not args.no_app_host)
     elif args.command == "start":
         reconnect(args.name, app_host=False, force=False)
+    elif args.command == "funnel":
+        funnel(args.name, args.port, args.https, args.path, args.off)
     elif args.command == "stop":
         stop_workspace(args.name)
     elif args.command == "key":

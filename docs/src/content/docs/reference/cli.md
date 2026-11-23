@@ -79,6 +79,17 @@ Give each port as `PORT` to use the same number on both sides, or `LOCAL:GUEST` 
 
 Containers started from a `rox:linux` image built before `rox forward` existed refuse the tunnel. Rox rebuilds `rox:linux` on the next `rox up container`, so start a new guest to use it.
 
+## `rox funnel NAME [PORT]`
+
+Put a server listening on `PORT` in the guest on the public internet with Tailscale Funnel, and print its URL. The launcher's Tailscale serves it at the launcher's tailnet name, through an SSH tunnel to the guest's `localhost`, so the server can listen on `localhost`. The launcher needs Tailscale installed and Funnel allowed by your tailnet policy. Without `PORT`, list the guest's funnels. Funnels come back when the guest restarts, go offline at `rox stop` until `rox start`, and are removed by `rox down`. See [Sharing a guest's server on the internet](../../guides/tailnet/#sharing-a-guests-server-on-the-internet).
+
+| Option | Description |
+| --- | --- |
+| `--https PORT` | Public HTTPS port: `443` (the default), `8443` or `10000`. |
+| `--path PATH` | Public path to serve it at. Defaults to `/`. |
+| `--off` | Stop funneling `PORT`, or every funnel of the guest when you leave out `PORT`. |
+| `-S`, `--host HOST` | The Rex host that runs the guest. Without it, Rox looks for the guest on this machine, then on each Rex host. |
+
 ## `rox reconnect NAME`
 
 Restore Rex access to a guest. This also works for a guest kept after a failed clone or setup. Rox starts the container runtime and the guest if they stopped, restarts the guest's Rex server if needed, reopens the tunnel, rejoins the tailnet, and registers the host again. A guest stopped with `rox stop` is started again. If this machine has no record of `NAME`, Rox finds the Rex host that runs it and works there. See [Working with guests on other hosts](../../guides/remote-hosts/#working-with-guests-on-other-hosts).
