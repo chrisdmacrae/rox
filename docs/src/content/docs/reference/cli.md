@@ -35,6 +35,7 @@ rox up container [options] [-- COMMAND [ARG ...]]
 | `--rebuild` | Rebuild the project image before launching. |
 | `--open-shell` | Open the guest's own Rex session in the Rex app on this machine, like `rox open`. Without a Rex app here, open a Guest tab running `rox shell` in the current Rex session instead. Requires a Rex terminal. |
 | `--no-tailscale` | Keep this guest off the tailnet even when `tailscale` is configured. See [Reaching guests from other devices](../../guides/tailnet/). |
+| `--no-agents` | Don't install the configured [agent CLIs](../../guides/agent-clis/) or their credentials in this guest. |
 
 ## `rox add NAME`
 
@@ -105,6 +106,16 @@ Restore Rex access to a guest. This also works for a guest kept after a failed c
 | --- | --- |
 | `-S`, `--host HOST` | The Rex host that runs the guest. Without it, Rox looks for the guest on this machine, then on each Rex host. |
 
+## `rox update-agents NAME` / `rox update-agents --all`
+
+Bring a running guest's [agent CLIs](../../guides/agent-clis/) up to date. Rox checks for the latest releases, installs any version the guest lacks, and writes the current credentials from the config again. New shells get changed credentials right away, and workers that `rex run` starts get them after `rox stop` and `rox start`. `--all` updates every running guest on this machine. If this machine has no record of `NAME`, Rox finds the Rex host that runs it and works there.
+
+| Option | Description |
+| --- | --- |
+| `--all` | Update every running guest on this machine, or on `--host`. |
+| `-S`, `--host HOST` | The Rex host that runs the guest. Without it, Rox looks for the guest on this machine, then on each Rex host. |
+| `--config PATH` | Config file on the machine that runs the guest. |
+
 ## `rox open NAME [PROJECT]`
 
 Show the guest's own Rex session in the Rex app on this machine, so new tabs and splits there run in the guest. Without `PROJECT`, Rox opens the session of the guest's only project, or the guest's own session. When the app doesn't have the guest as a host, Rox copies the guest's address and opens **Add Remote Host**, like `rox add-remote-host`, then waits up to three minutes for the app to connect to the guest before selecting the session. A guest on another Rex host must be on the tailnet. See [Working in the guest's session](../../guides/remote-hosts/#working-in-the-guests-session).
@@ -160,6 +171,18 @@ Ask for a Tailscale auth key, save it to `tailscale-authkey` next to the config 
 | --- | --- |
 | `--tag TAG` | Tag for guest devices. Repeat it for several. Defaults to `tag:rox-guest`. |
 | `--control-url URL` | `https://` URL of a self-hosted control server such as Headscale. Without it, Rox keeps any `control_url` already set. |
+| `--config PATH` | A different rox config file. |
+
+## `rox config agents [claude|codex]`
+
+Install [Claude Code or Codex](../../guides/agent-clis/) in new guests, signed in with your credentials. For `claude`, Rox asks for a token from `claude setup-token`, or an Anthropic API key, and saves it to `claude-token` or `anthropic-api-key` next to the config, readable only by you. For `codex`, Rox uses your Codex login in `~/.codex/auth.json` (or `$CODEX_HOME/auth.json`), or, with `--api-key`, asks for an OpenAI API key and saves it to `openai-api-key`. Leave a token blank to install the agent without credentials. Without an agent, Rox asks which ones to set up. When stdin isn't a terminal, Rox reads the token from stdin. Guests that are already running get the change with `rox update-agents`.
+
+| Option | Description |
+| --- | --- |
+| `--version VERSION` | Pin a version such as `2.1.330`, or `latest`, the default. |
+| `--api-key` | `codex`: sign in with an OpenAI API key instead of the Codex login file. |
+| `--auth-file PATH` | `codex`: the login file to copy into guests. Defaults to `~/.codex/auth.json`. |
+| `--off` | Stop installing the agent in new guests, and delete the token Rox saved for it. |
 | `--config PATH` | A different rox config file. |
 
 ## `rox skill install`

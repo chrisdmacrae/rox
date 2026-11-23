@@ -656,7 +656,8 @@ class WorkspaceTests(unittest.TestCase):
         with self.remote_listing(), patch.object(rox, "rex_output", return_value=(0, "Stopped it")) as remote, \
                 contextlib.redirect_stdout(io.StringIO()) as printed:
             for command, expected in ((["stop"], ["stop"]), (["start"], ["start"]),
-                                      (["reconnect"], ["reconnect", "--no-app-host"])):
+                                      (["reconnect"], ["reconnect", "--no-app-host"]),
+                                      (["update-agents"], ["update-agents"])):
                 with self.subTest(command=command):
                     rox.main([*command, "rv-remote-000011112222"])
                     host, label, argv = remote.call_args.args
@@ -2207,6 +2208,277 @@ class WorkspaceTests(unittest.TestCase):
         self.assertEqual(str(guest.home), "/Users/admin")
         guest.save()
         self.assertEqual(rox.Guest.load(name), guest)
+
+    def agent_config(self, agents):
+        path = self.root / "agents-config.json"
+        path.write_text(json.dumps({"agents": agents}))
+        return path
+
+    def secret(self, name, value, mode=0o600):
+        path = self.root / name
+        path.write_text(value + "\n")
+        path.chmod(mode)
+        return path
+
+    def test_agent_settings_are_validated(self):
+        token = self.secret("token", "sk-ant-oat01-x")
+        self.assertEqual(rox.agent_settings({}, "c"), {})
+        self.assertEqual(rox.agent_settings({"agents": {"claude": {"token_file": str(token)}, "codex": {}}}, "c"),
+                         {"claude": {"version": "latest", "token_file": token}, "codex": {"version": "latest"}})
+        self.assertEqual(rox.agent_settings({"agents": {"codex": {"version": "0.171.0"}}}, "c"),
+                         {"codex": {"version": "0.171.0"}})
+        loose = self.secret("loose", "x", 0o644)
+        for agents, message in (
+            ([], "Expected an object for agents"),
+            ({"gemini": {}}, "Unknown agent gemini"),
+            ({"claude": "latest"}, "Expected an object for agents.claude"),
+            ({"claude": {"auth_file": str(token)}}, "Unknown setting agents.claude.auth_file"),
+            ({"claude": {"version": "v2"}}, "Expected latest or a version"),
+            ({"claude": {"token_file": str(loose)}}, "chmod 600"),
+            ({"claude": {"token_file": str(self.root / "missing")}}, "File does not exist"),
+            ({"claude": {"token_file": str(token), "api_key_file": str(token)}}, "Choose one of"),
+        ):
+            with self.subTest(agents=agents), self.assertRaisesRegex(rox.Error, message):
+                rox.agent_settings({"agents": agents}, "c")
+
+    def test_agent_versions_check_latest_every_few_hours_and_never_block(self):
+        rox.private_directory(rox.state_root())
+        agents = {"claude": {"version": "latest"}, "codex": {"version": "0.1.0"}}
+        with patch.object(rox, "latest_agent_version", return_value="2.0.0") as latest:
+            self.assertEqual(rox.agent_versions(agents, now=1000), {"claude": "2.0.0", "codex": "0.1.0"})
+            latest.return_value = "2.0.1"
+            self.assertEqual(rox.agent_versions(agents, now=2000)["claude"], "2.0.0")
+            self.assertEqual(rox.agent_versions(agents, now=1000 + rox.AGENT_VERSION_TTL)["claude"], "2.0.1")
+            latest.return_value = "2.0.2"
+            self.assertEqual(rox.agent_versions(agents, refresh=True, now=1001 + rox.AGENT_VERSION_TTL)["claude"],
+                             "2.0.2")
+            self.assertEqual([call.args for call in latest.call_args_list], [("claude",)] * 3)
+        self.assertEqual((rox.state_root() / "agent-versions.json").stat().st_mode & 0o777, 0o600)
+        with patch.object(rox, "latest_agent_version", side_effect=OSError("offline")), \
+                contextlib.redirect_stderr(io.StringIO()) as warned:
+            self.assertEqual(rox.agent_versions(agents, refresh=True)["claude"], "2.0.2")
+            (rox.state_root() / "agent-versions.json").unlink()
+            self.assertEqual(rox.agent_versions(agents)["claude"], "latest")
+        self.assertIn("Could not check for a newer Claude Code (offline)", warned.getvalue())
+
+    def test_latest_agent_versions_come_from_each_release_feed(self):
+        class Response(io.BytesIO):
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+        bodies = {rox.AGENT_LATEST["claude"]: b"2.1.330\n",
+                  rox.AGENT_LATEST["codex"]: json.dumps({"name": "@openai/codex", "version": "0.171.0"}).encode()}
+        with patch.object(rox.urllib.request, "urlopen", side_effect=lambda request, timeout: Response(bodies[request.full_url])):
+            self.assertEqual(rox.latest_agent_version("claude"), "2.1.330")
+            self.assertEqual(rox.latest_agent_version("codex"), "0.171.0")
+        bodies[rox.AGENT_LATEST["claude"]] = b"<html>error</html>"
+        with patch.object(rox.urllib.request, "urlopen", side_effect=lambda request, timeout: Response(bodies[request.full_url])), \
+                self.assertRaisesRegex(ValueError, "unexpected version"):
+            rox.latest_agent_version("claude")
+
+    def test_agent_layer_rebuilds_only_for_new_versions_or_a_new_base(self):
+        rox.private_directory(rox.state_root())
+        images = {"rox:web": ("sha256:project", {})}
+        builds = []
+
+        def command(argv, **kwargs):
+            if argv[1:3] == ["image", "inspect"]:
+                if argv[3] not in images:
+                    return subprocess.CompletedProcess(argv, 1, "", "missing")
+                image_id, labels = images[argv[3]]
+                return subprocess.CompletedProcess(argv, 0, json.dumps([{"Id": image_id, "Config": {"Labels": labels}}]), "")
+            if argv[1] == "build":
+                containerfile = (Path(argv[-1]) / "Containerfile").read_text()
+                self.assertIn("FROM rox:web\n", containerfile)
+                self.assertIn('"agents", "claude=2.0.0", "codex=0.1.0"]', containerfile)
+                self.assertTrue((Path(argv[-1]) / "bootstrap.sh").is_file())
+                labels = dict(arg.removeprefix("--label=").split("=", 1) for arg in argv if arg.startswith("--label="))
+                builds.append(labels)
+                images[argv[argv.index("--tag") + 1]] = (f"sha256:agents{len(builds)}", labels)
+            return subprocess.CompletedProcess(argv, 0, "", "")
+
+        versions = {"codex": "0.1.0", "claude": "2.0.0"}
+        with patch.object(rox, "run", side_effect=command), contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(rox.prepare_agent_image("podman", "rox:web", versions), "rox:web-agents")
+            self.assertEqual(builds, [{"io.rox.agents": "claude=2.0.0 codex=0.1.0", "io.rox.agents-base": "sha256:project"}])
+            rox.prepare_agent_image("podman", "rox:web", versions)
+            self.assertEqual(len(builds), 1)
+            images["rox:web"] = ("sha256:project2", {})
+            rox.prepare_agent_image("podman", "rox:web", versions)
+            self.assertEqual(len(builds), 2)
+        self.assertEqual(rox.agent_image_name("ghcr.io/acme/dev:1"), "rox:ghcr.io-acme-dev-1-agents")
+
+        def failing(argv, **kwargs):
+            if argv[1] == "build":
+                raise subprocess.CalledProcessError(1, argv)
+            return command(argv, **kwargs)
+
+        with patch.object(rox, "run", side_effect=failing), contextlib.redirect_stdout(io.StringIO()), \
+                contextlib.redirect_stderr(io.StringIO()) as warned:
+            self.assertEqual(rox.prepare_agent_image("podman", "rox:web", {"claude": "3.0.0"}), "rox:web")
+        self.assertIn("installs them when it boots instead", warned.getvalue())
+
+    def test_agent_credentials_go_to_the_guest_on_stdin(self):
+        token = self.secret("token", "sk-ant-oat01-it's")
+        auth = self.secret("auth.json", '{"tokens": {}}')
+        key = self.secret("openai", "sk-openai")
+        guest = self.saved_guest()
+        sent = []
+
+        def fake_output(argv, input=None, **kwargs):
+            sent.append((argv[-1], input))
+            return ""
+
+        with patch.object(rox, "output", side_effect=fake_output):
+            rox.push_agent_credentials(guest, {"claude": {"token_file": token}, "codex": {"auth_file": auth}})
+            rox.push_agent_credentials(guest, {"codex": {"api_key_file": key}})
+        env = "# Written by rox from the launcher's config. Rox replaces this file.\n"
+        self.assertEqual(sent, [
+            (shlex.join(["bash", "-c", rox.AGENT_ENV_SCRIPT]),
+             env + "export CLAUDE_CODE_OAUTH_TOKEN='sk-ant-oat01-it'\"'\"'s'\n"),
+            (shlex.join(["bash", "-c", rox.CODEX_AUTH_SCRIPT]), '{"tokens": {}}\n'),
+            (shlex.join(["bash", "-c", rox.AGENT_ENV_SCRIPT]), env),
+            (shlex.join(["bash", "-c", rox.CODEX_LOGIN_SCRIPT]), "sk-openai\n"),
+        ])
+        for argv, _ in sent:
+            self.assertNotIn("sk-", argv)
+
+    def test_bootstrap_agents_stage_skips_installed_versions_and_completes_onboarding(self):
+        home = self.root / "home"
+        bin_dir = home / ".local" / "bin"
+        bin_dir.mkdir(parents=True)
+        for name, text in (("claude", "2.1.0 (Claude Code)"), ("codex", "codex-cli 0.9.0"), ("curl", "")):
+            tool = bin_dir / name
+            tool.write_text(f"#!/bin/sh\necho '{text}'\n" if name != "curl" else "#!/bin/sh\nexit 22\n")
+            tool.chmod(0o755)
+        env = {"HOME": str(home), "PATH": "/usr/bin:/bin"}
+
+        def stage(*specs):
+            return subprocess.run(["bash", str(ROOT / "guest/bootstrap.sh"), "agents", *specs], env=env,
+                                  capture_output=True, text=True)
+
+        done = stage("claude=2.1.0", "codex=latest")
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertIn("claude 2.1.0 is installed", done.stderr)
+        self.assertEqual(json.loads((home / ".claude.json").read_text()), {"hasCompletedOnboarding": True})
+        (home / ".claude.json").write_text('{\n  "installMethod": "native"\n}\n')
+        self.assertEqual(stage("claude=2.1.0").returncode, 0)
+        self.assertEqual(json.loads((home / ".claude.json").read_text()),
+                         {"hasCompletedOnboarding": True, "installMethod": "native"})
+        line = '[ -f "$HOME/.rox/agents.env" ] && . "$HOME/.rox/agents.env"'
+        for profile in (".profile", ".bashrc", ".zshenv"):
+            self.assertEqual((home / profile).read_text().splitlines().count(line), 1)
+        # A different version runs the installer, whose download fails here.
+        failed = stage("codex=1.0.0")
+        self.assertNotEqual(failed.returncode, 0)
+        self.assertIn("Installing codex 1.0.0", failed.stderr)
+
+    def test_bootstrap_server_reads_the_agents_credentials(self):
+        script = (ROOT / "guest/bootstrap.sh").read_text()
+        server = script[script.index("    server)"):script.index("    session)")]
+        self.assertLess(server.index('. "$HOME/.rox/agents.env"'), server.index("nohup rex server run"))
+
+    def test_up_installs_agents_before_the_rex_server_starts(self):
+        token = self.secret("token", "sk-ant-oat01-x")
+        config = self.agent_config({"claude": {"token_file": str(token)}})
+        stages = []
+        pushed = []
+
+        def stage(guest, name, *args, agent=None, capture=False):
+            stages.append((name, *args) if name == "agents" else name)
+            if name == "prepare":
+                return f"/home/workspace/.rox/{guest.name}\n/home/workspace/.rox/{guest.name}/r.sock"
+            if name == "session":
+                return '{"session_id":"session:fixture"}'
+            return None
+
+        launched = []
+        with (
+            patch.object(rox, "run", return_value=subprocess.CompletedProcess([], 0, "", "")),
+            patch.object(rox, "prepare_container_image"),
+            patch.object(rox, "agent_versions", return_value={"claude": "2.0.0"}),
+            patch.object(rox, "prepare_agent_image", return_value="rox:linux-agents") as layer,
+            patch.object(rox, "push_agent_credentials", side_effect=lambda guest, agents: pushed.append(agents)),
+            patch.object(rox, "guest_stage", side_effect=stage),
+            patch.object(rox, "check_guest_os"),
+            patch.object(rox, "launch_guest", side_effect=lambda guest, timeout: launched.append(guest.image) or ("127.0.0.1", 22)),
+            patch.object(rox, "attach_guest"),
+            patch.object(rox.shutil, "which", return_value="/fixture"),
+            patch.object(rox.Guest, "runtime", property(lambda guest: self.root / "runtime" / guest.name)),
+            contextlib.redirect_stdout(io.StringIO()) as printed,
+        ):
+            rox.main(["up", "container", "--no-project", "--config", str(config)])
+            rox.main(["up", "container", "--no-project", "--no-agents", "--config", str(config)])
+        layer.assert_called_once_with("docker", "rox:linux", {"claude": "2.0.0"})
+        self.assertEqual(launched, ["rox:linux-agents", "rox:linux"])
+        self.assertEqual(stages, ["prepare", ("agents", "claude=2.0.0"), "server", "session",
+                                  "prepare", "server", "session"])
+        self.assertEqual(pushed, [{"claude": {"version": "latest", "token_file": token}}])
+        self.assertIn("Agents     Claude Code 2.0.0", printed.getvalue())
+        agents = sorted(rox.local_guests(), key=lambda guest: bool(guest.agents))
+        self.assertEqual([guest.agents for guest in agents], [{}, {"claude": "2.0.0"}])
+
+    def test_update_agents_refreshes_running_guests(self):
+        config = self.agent_config({"codex": {}})
+        self.saved_guest("rv-fixture-000011112222", agents={"codex": "0.1.0"})
+        self.saved_guest("rv-stopped-000011113333", stopped=True)
+        installed = []
+        with (
+            patch.object(rox, "agent_versions", return_value={"codex": "0.2.0"}) as versions,
+            patch.object(rox, "guest_stage", side_effect=lambda guest, *args: installed.append((guest.name, *args))),
+            patch.object(rox, "push_agent_credentials"),
+            contextlib.redirect_stdout(io.StringIO()) as printed,
+        ):
+            rox.main(["update-agents", "--all", "--config", str(config)])
+            rox.main(["update-agents", "rv-fixture-000011112222", "--config", str(config)])
+        versions.assert_called_with({"codex": {"version": "latest"}}, refresh=True)
+        self.assertEqual(installed, [("rv-fixture-000011112222", "agents", "codex=0.2.0")] * 2)
+        self.assertEqual(rox.Guest.load("rv-fixture-000011112222").agents, {"codex": "0.2.0"})
+        self.assertIn("has Codex 0.2.0 already", printed.getvalue())
+        with self.assertRaisesRegex(rox.Error, "No agents are configured"):
+            rox.main(["update-agents", "rv-fixture-000011112222", "--config", str(self.root / "none.json")])
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            rox.main(["update-agents"])
+
+    def test_config_agents_saves_private_credentials(self):
+        config = self.root / "config" / "config.json"
+        codex_home = self.root / "codex-home"
+        codex_home.mkdir()
+        (codex_home / "auth.json").write_text("{}")
+        (codex_home / "auth.json").chmod(0o600)
+
+        def configure(*argv, stdin=""):
+            with patch.object(rox.sys, "stdin", io.StringIO(stdin)), \
+                    patch.dict(os.environ, {"CODEX_HOME": str(codex_home)}), \
+                    contextlib.redirect_stdout(io.StringIO()) as printed:
+                rox.main(["config", "agents", *argv, "--config", str(config)])
+            return printed.getvalue(), json.loads(config.read_text())
+
+        _, saved = configure("claude", stdin="sk-ant-oat01-token\n")
+        token = config.with_name("claude-token")
+        self.assertEqual(saved, {"agents": {"claude": {"token_file": str(token)}}})
+        self.assertEqual((token.read_text(), token.stat().st_mode & 0o777), ("sk-ant-oat01-token\n", 0o600))
+        _, saved = configure("claude", "--version", "2.1.0", stdin="sk-ant-api03-key\n")
+        self.assertEqual(saved["agents"]["claude"], {"version": "2.1.0",
+                                                     "api_key_file": str(config.with_name("anthropic-api-key"))})
+        self.assertFalse(token.exists())
+        printed, saved = configure("codex")
+        self.assertEqual(saved["agents"]["codex"], {"auth_file": str((codex_home / "auth.json").resolve())})
+        self.assertIn("If guests sign each other out", printed)
+        _, saved = configure("codex", "--api-key", stdin="sk-proj-key\n")
+        self.assertEqual(saved["agents"]["codex"], {"api_key_file": str(config.with_name("openai-api-key"))})
+        rox.agent_settings(saved, config)
+        _, saved = configure("claude", "--off")
+        self.assertEqual(list(saved["agents"]), ["codex"])
+        self.assertFalse(config.with_name("anthropic-api-key").exists())
+        for argv, message in ((["claude", "--version", "new"], "Expected latest or a version"),
+                              (["claude", "--auth-file", "x"], "--auth-file is for codex"),
+                              ([], "Name the agent to set up")):
+            with self.subTest(argv=argv), self.assertRaisesRegex(rox.Error, message):
+                configure(*argv)
 
 
 if __name__ == "__main__":

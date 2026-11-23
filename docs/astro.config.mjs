@@ -36,6 +36,7 @@ export default defineConfig({
 						{ label: 'Rex remote hosts', slug: 'guides/remote-hosts' },
 						{ label: 'Reaching guests from other devices', slug: 'guides/tailnet' },
 						{ label: 'Keeping guests running', slug: 'guides/keep-running' },
+						{ label: 'Agent CLIs in guests', slug: 'guides/agent-clis' },
 						{ label: 'Orchestrating agents', slug: 'guides/agents' },
 					],
 				},

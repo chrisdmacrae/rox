@@ -16,7 +16,7 @@ The skill ships with each release. After you [install rox](#install), install it
 rox skill install
 ```
 
-Start a new session and invoke `/rox` in Claude Code or `$rox` in Codex. Run `rox skill install` again after upgrading rox to update the skill. Install the toolkit itself on the machine that will run the guests, and make your chosen agent runner available inside those guests.
+Start a new session and invoke `/rox` in Claude Code or `$rox` in Codex. Run `rox skill install` again after upgrading rox to update the skill. Install the toolkit itself on the machine that will run the guests. To have Claude Code or Codex ready in every guest, see [Agent CLIs in guests](#agent-clis-in-guests).
 
 ## Install
 
@@ -214,6 +214,17 @@ By default a guest's Rex server is reachable only on its launcher, through a Uni
 ```
 
 Use a reusable, ephemeral auth key tagged `tag:rox-guest`, stored in a file only you can read, and tailnet ACLs that let your devices reach `tag:rox-guest` without letting guests reach anything. An agent in the guest can use the guest's tailnet identity, so the tag's ACLs are what keep guests isolated. Pass `--no-tailscale` to keep one guest off the tailnet. The [tailnet guide](docs/src/content/docs/guides/tailnet.mdx) has the policy and key setup.
+
+## Agent CLIs in guests
+
+Rox can install Claude Code and Codex in every guest, signed in with your credentials. On the machine that runs the guests:
+
+```sh
+claude setup-token && rox config agents claude   # paste the token, or an Anthropic API key
+codex login && rox config agents codex           # copies ~/.codex/auth.json, or pass --api-key
+```
+
+The credentials go to each guest over SSH on stdin and are never written into an image. The guest's Rex server and shells read them, so `rex run -- claude ...` works with no sign-in. Each agent follows its latest release: Rox checks at `rox up`, at most every six hours, and rebuilds only a last `-agents` layer of the container image when a new one comes out. Pin a version with `rox config agents codex --version 0.171.0`. Update guests that are already running with `rox update-agents NAME` or `rox update-agents --all`. The [agent CLIs guide](docs/src/content/docs/guides/agent-clis.mdx) has the details.
 
 ## Keeping guests running
 

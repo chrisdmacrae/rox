@@ -23,6 +23,7 @@ import sys
 import tempfile
 import time
 from urllib.parse import urlsplit
+import urllib.request
 
 
 HERE = Path(__file__).resolve().parent
@@ -35,7 +36,7 @@ NAME_PATTERN = r"rv-[a-z0-9-]{1,24}-[a-f0-9]{12}"
 PROJECT_CONFIG = ".rox.json"
 PROJECT_KEYS = {backend: {"image", "cpus", "memory", "prebuild"} for backend in BACKENDS}
 # These describe the launch machine, so only its own rox config may set them.
-LAUNCHER_KEYS = {"engine", "user", "identity", "host_key", "git_keys", "git_known_hosts", "tailscale"}
+LAUNCHER_KEYS = {"engine", "user", "identity", "host_key", "git_keys", "git_known_hosts", "tailscale", "agents"}
 
 
 class Error(Exception):
@@ -140,6 +141,8 @@ class Guest:
     funnels: list = field(default_factory=list)
     # Guest tabs that rox up and rox add opened, as dicts with session and window, for rox down to close.
     shell_windows: list = field(default_factory=list)
+    # The agent CLIs rox installed, as {agent: version}.
+    agents: dict = field(default_factory=dict)
 
     @property
     def base(self):
@@ -1133,6 +1136,9 @@ def bake_vm(backend, base, target, branch, url, settings):
         with git_agent(guest, settings["keys"]) as agent:
             guest_stage(guest, "clone", workspace, url, branch, "yes" if agent else "no", agent=agent)
         guest_stage(guest, "bake", workspace, backend, target)
+        if settings.get("agents"):
+            # Guests check these versions again at boot, so a newer release costs only an update.
+            guest_stage(guest, "agents", *agent_specs(settings["agents"]))
         run(remote_command(guest, ["sync"]))
         run(["tart", "stop", guest.name])
         stopped = True
@@ -1225,7 +1231,7 @@ def launch_guest(guest, boot_timeout):
         public_key = Path(f"{guest.identity}.pub").read_text().strip()
         if guest.engine == "container":
             return launch_apple_container(guest, public_key, boot_timeout)
-        local_image = guest.prebuilt or guest.image == DEFAULT_CONTAINER_IMAGE
+        local_image = guest.prebuilt or guest.image.startswith("rox:")
         pull_policy = ["--pull=never"] if local_image else []
         guest.container_id = output([
             guest.engine, "run", "-d", *pull_policy, "--name", guest.name, "--hostname", guest.name,
@@ -1404,6 +1410,356 @@ def tailscale_settings(config, config_path, disabled):
     if not isinstance(control_url, str) or (control_url and not control_url.startswith("https://")):
         raise Error(f"Expected an https:// URL for tailscale.control_url in {config_path}")
     return {"key": key, "tags": tags, "control_url": control_url}
+
+
+# The agent CLIs rox can install in guests. Each credential setting names a file on the launcher.
+# A variable name means the file holds that variable's value for the guest. None means rox handles it
+# another way: codex's auth_file is copied to ~/.codex/auth.json, and its api_key_file goes to codex login.
+AGENT_CREDENTIALS = {
+    "claude": {"token_file": "CLAUDE_CODE_OAUTH_TOKEN", "api_key_file": "ANTHROPIC_API_KEY"},
+    "codex": {"auth_file": None, "api_key_file": None},
+}
+AGENT_NAMES = {"claude": "Claude Code", "codex": "Codex"}
+# Where rox config agents saves each kind of credential, next to the config.
+AGENT_SECRET_FILES = {("claude", "token_file"): "claude-token", ("claude", "api_key_file"): "anthropic-api-key",
+                      ("codex", "api_key_file"): "openai-api-key"}
+AGENT_LATEST = {
+    "claude": "https://downloads.claude.ai/claude-code-releases/latest",
+    "codex": "https://registry.npmjs.org/@openai/codex/latest",
+}
+AGENT_VERSION_TTL = 6 * 3600
+VERSION_PATTERN = r"[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?"
+# Written over SSH with the secrets on stdin, so they never appear in argv.
+AGENT_ENV_SCRIPT = ('umask 077; mkdir -p "$HOME/.rox" && cat > "$HOME/.rox/agents.env.tmp" '
+                    '&& mv "$HOME/.rox/agents.env.tmp" "$HOME/.rox/agents.env"')
+CODEX_AUTH_SCRIPT = ('umask 077; mkdir -p "$HOME/.codex" && cat > "$HOME/.codex/auth.json.tmp" '
+                     '&& mv "$HOME/.codex/auth.json.tmp" "$HOME/.codex/auth.json"')
+CODEX_LOGIN_SCRIPT = 'export PATH="$HOME/.local/bin:$PATH"; codex login --with-api-key >/dev/null'
+
+
+def agent_settings(config, config_path):
+    """The agents the launcher installs in new guests, as {agent: {"version", credential paths}}."""
+    settings = config.get("agents")
+    if settings is None:
+        return {}
+    if not isinstance(settings, dict):
+        raise Error(f"Expected an object for agents in {config_path}")
+    agents = {}
+    for agent, value in settings.items():
+        if agent not in AGENT_CREDENTIALS:
+            raise Error(f"Unknown agent {agent} in {config_path}. Use {' or '.join(AGENT_CREDENTIALS)}")
+        if not isinstance(value, dict):
+            raise Error(f"Expected an object for agents.{agent} in {config_path}")
+        allowed = ["version", *AGENT_CREDENTIALS[agent]]
+        if unknown := sorted(set(value) - set(allowed)):
+            raise Error(f"Unknown setting agents.{agent}.{unknown[0]} in {config_path}. Use {', '.join(allowed)}")
+        version = value.get("version", "latest")
+        if not isinstance(version, str) or not (version == "latest" or re.fullmatch(VERSION_PATTERN, version)):
+            raise Error(f"Expected latest or a version such as 1.2.3 for agents.{agent}.version in {config_path}")
+        credentials = {}
+        for setting in AGENT_CREDENTIALS[agent]:
+            if setting not in value:
+                continue
+            if not isinstance(value[setting], str) or not value[setting]:
+                raise Error(f"Expected a file path for agents.{agent}.{setting} in {config_path}")
+            path = configured_file(value[setting])
+            if path.stat().st_mode & 0o077:
+                raise Error(f"{path} holds a credential for {AGENT_NAMES[agent]}, so only you may read it. "
+                            f"Run chmod 600 {path}")
+            credentials[setting] = path
+        if len(credentials) > 1:
+            raise Error(f"Choose one of {' or '.join(credentials)} for agents.{agent} in {config_path}")
+        agents[agent] = {"version": version, **credentials}
+    return agents
+
+
+def latest_agent_version(agent):
+    request = urllib.request.Request(AGENT_LATEST[agent], headers={"User-Agent": "rox"})
+    with urllib.request.urlopen(request, timeout=5) as response:
+        body = response.read(1 << 20).decode()
+    version = (json.loads(body).get("version") or "") if agent == "codex" else body.strip()
+    if not isinstance(version, str) or not re.fullmatch(VERSION_PATTERN, version):
+        raise ValueError(f"unexpected version {version[:40]!r}")
+    return version
+
+
+def agent_versions(agents, refresh=False, now=None):
+    """The version of each agent to install: its pin, or the latest release, checked every few hours.
+
+    A failed check never stops a launch. Rox uses the last version it found, or the installer's latest.
+    """
+    now = time.time() if now is None else now
+    path = state_root() / "agent-versions.json"
+    try:
+        cache = json.loads(path.read_text())
+    except (FileNotFoundError, ValueError):
+        cache = {}
+    cache = {agent: entry for agent, entry in cache.items() if isinstance(entry, dict)} if isinstance(cache, dict) else {}
+    versions, changed = {}, False
+    for agent, settings in agents.items():
+        if settings["version"] != "latest":
+            versions[agent] = settings["version"]
+            continue
+        cached = cache.get(agent, {})
+        known = cached.get("version") if isinstance(cached.get("version"), str) else ""
+        checked = cached.get("checked") if isinstance(cached.get("checked"), (int, float)) else 0
+        if known and not refresh and now - checked < AGENT_VERSION_TTL:
+            versions[agent] = known
+            continue
+        try:
+            versions[agent] = latest_agent_version(agent)
+        except (OSError, ValueError) as error:
+            versions[agent] = known or "latest"
+            print(f"rox: Could not check for a newer {AGENT_NAMES[agent]} ({error}). "
+                  f"Installing {versions[agent]}.", file=sys.stderr, flush=True)
+            continue
+        cache[agent] = {"version": versions[agent], "checked": now}
+        changed = True
+    if changed:
+        write_private(path, json.dumps(cache, indent=2) + "\n")
+    return versions
+
+
+def agent_specs(versions):
+    return [f"{agent}={versions[agent]}" for agent in sorted(versions)]
+
+
+def describe_agents(versions):
+    return ", ".join(f"{AGENT_NAMES[agent]} {versions[agent]}" for agent in sorted(versions))
+
+
+AGENT_CONTAINERFILE = """\
+FROM {base}
+USER root
+COPY bootstrap.sh /usr/local/share/rox/bootstrap.sh
+USER workspace
+RUN {install}
+USER root
+"""
+
+
+def agent_image_name(base):
+    if base.startswith("rox:"):
+        return f"{base}-agents"
+    slug = re.sub(r"[^a-z0-9_.-]+", "-", base.lower()).strip(".-")[:100] or "image"
+    return f"rox:{slug}-agents"
+
+
+def prepare_agent_image(engine, base, versions):
+    """Return an image of base with the agents installed in one last layer.
+
+    Only that layer rebuilds when a new agent release comes out, so the project's .rox.sh doesn't run
+    again. If the build fails, return base, and the guest installs the agents when it boots.
+    """
+    target = agent_image_name(base)
+    spec = " ".join(agent_specs(versions))
+    with file_lock(state_root() / f"image-{target.replace(':', '-')}.lock"):
+        base_info = image_info(engine, base)
+        if base_info is None:
+            run([engine, "image", "pull", base])
+            base_info = image_info(engine, base)
+        if base_info is None:
+            raise Error(f"Base image {base} is not available to {engine}")
+        wanted = {"io.rox.agents": spec, "io.rox.agents-base": base_info[0]}
+        current = image_info(engine, target)
+        if current and all(current[1].get(key) == value for key, value in wanted.items()):
+            return target
+        reason = ("first build" if not current else
+                  "new agent versions" if current[1].get("io.rox.agents") != spec else "base image changed")
+        print(f"Installing {describe_agents(versions)} in {target} ({reason})", flush=True)
+        with tempfile.TemporaryDirectory(prefix="rox-agents-") as context:
+            context = Path(context)
+            shutil.copy(HERE / "guest" / "bootstrap.sh", context / "bootstrap.sh")
+            install = ["env", "HOME=/home/workspace", "bash", "/usr/local/share/rox/bootstrap.sh", "agents",
+                       *agent_specs(versions)]
+            (context / "Containerfile").write_text(AGENT_CONTAINERFILE.format(base=base, install=json.dumps(install)))
+            try:
+                run([engine, "build", "--file", str(context / "Containerfile"), "--tag", target,
+                     *[f"--label={key}={value}" for key, value in wanted.items()], str(context)])
+            except subprocess.CalledProcessError:
+                print(f"rox: Could not install the agents in {target}. See the build output above. "
+                      "The guest installs them when it boots instead.", file=sys.stderr, flush=True)
+                return base
+        built = image_info(engine, target)
+        if engine != "container" and current and built and built[0] != current[0]:
+            # Drop the superseded image unless a workspace still uses it.
+            run([engine, "rmi", current[0]], capture=True, check=False)
+    return target
+
+
+def agent_environment(agents):
+    """The guest's agents.env, which shells and the guest's Rex server read."""
+    lines = ["# Written by rox from the launcher's config. Rox replaces this file."]
+    for agent, settings in sorted(agents.items()):
+        for setting, variable in AGENT_CREDENTIALS[agent].items():
+            if variable and setting in settings:
+                lines.append(f"export {variable}={shlex.quote(settings[setting].read_text().strip())}")
+    return "\n".join(lines) + "\n"
+
+
+def push_agent_credentials(guest, agents):
+    """Write the agents' credentials into the guest over SSH, with each secret on stdin."""
+    output(remote_command(guest, ["bash", "-c", AGENT_ENV_SCRIPT]), input=agent_environment(agents), timeout=30)
+    codex = agents.get("codex", {})
+    if "auth_file" in codex:
+        output(remote_command(guest, ["bash", "-c", CODEX_AUTH_SCRIPT]), input=codex["auth_file"].read_text(),
+               timeout=30)
+    elif "api_key_file" in codex:
+        output(remote_command(guest, ["bash", "-c", CODEX_LOGIN_SCRIPT]),
+               input=codex["api_key_file"].read_text().strip() + "\n", timeout=60)
+
+
+def install_agents(guest, agents, versions):
+    """Install any agent whose version the guest lacks, and give the agents their credentials."""
+    guest_stage(guest, "agents", *agent_specs(versions))
+    push_agent_credentials(guest, agents)
+    guest.agents = dict(versions)
+    guest.save()
+
+
+def update_agents(name, config_value=None):
+    """Bring a running guest's agents up to the latest versions and refresh their credentials."""
+    config_path = config_location(config_value)
+    agents = agent_settings(config_for(config_path), config_path)
+    if not agents:
+        raise Error(f"No agents are configured in {config_path}. Add them with rox config agents")
+    guest = ready_guest(name)
+    versions = agent_versions(agents, refresh=True)
+    with guest_lock(guest.directory, wait=True):
+        guest = Guest.load(name)
+        before = dict(guest.agents)
+        install_agents(guest, agents, versions)
+    changed = {agent: version for agent, version in versions.items() if before.get(agent) != version}
+    print(f"{name} has {describe_agents(versions)}" + ("" if changed else " already"), flush=True)
+    print("New shells get the credentials now. Agents that rex run starts get changed credentials after "
+          f"the guest restarts with rox stop {name} and rox start {name}.", flush=True)
+
+
+def update_all_agents(config_value=None):
+    guests = [guest for guest in local_guests() if guest.phase == "ready" and not guest.stopped]
+    if not guests:
+        print("No running guests on this machine")
+        return
+    failed = []
+    for guest in guests:
+        try:
+            update_agents(guest.name, config_value)
+        except (Error, OSError, ValueError, subprocess.SubprocessError) as error:
+            failed.append(guest.name)
+            print(f"rox: Could not update {guest.name}. ({error})", file=sys.stderr, flush=True)
+    if failed:
+        raise Error(f"Could not update {', '.join(failed)}")
+
+
+def read_secret(prompt, help_text):
+    """Read a token without echoing it, or a line from stdin when it's piped. Return "" when blank."""
+    if sys.stdin.isatty():
+        if help_text:
+            print(help_text, flush=True)
+        value = getpass.getpass(prompt)
+    else:
+        value = sys.stdin.readline()
+    value = value.strip()
+    if any(character.isspace() for character in value):
+        raise Error("Expected a single token with no spaces")
+    return value
+
+
+def confirm(prompt):
+    return input(f"{prompt} [Y/n] ").strip().lower() in ("", "y", "yes")
+
+
+def codex_auth_location():
+    return Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex").expanduser() / "auth.json"
+
+
+def configure_agents(args):
+    """Save agent credentials next to the config and point the config's agents section at them."""
+    config_path = config_location(args.config)
+    if args.version and not (args.version == "latest" or re.fullmatch(VERSION_PATTERN, args.version)):
+        raise Error("Expected latest or a version such as 1.2.3 for --version")
+    if args.agent is None:
+        if args.off or args.version or args.api_key or args.auth_file:
+            raise Error("Name the agent these options are for: rox config agents claude or rox config agents codex")
+        if not sys.stdin.isatty():
+            raise Error("Name the agent to set up: rox config agents claude or rox config agents codex")
+        chosen = [agent for agent in AGENT_CREDENTIALS if confirm(f"Install {AGENT_NAMES[agent]} in new guests?")]
+        if not chosen:
+            print("No agents chosen. Nothing changed.")
+            return
+    else:
+        chosen = [args.agent]
+    if args.agent != "codex" and args.auth_file:
+        raise Error("--auth-file is for codex")
+
+    updates = {}
+    for agent in chosen:
+        if args.off:
+            updates[agent] = None
+            continue
+        if agent == "claude":
+            value = read_secret("Claude Code token or Anthropic API key: ",
+                                "Run claude setup-token to create a long-lived token for your Claude subscription, "
+                                "or paste an Anthropic API key. Leave it blank to install Claude Code without one.")
+            if not value:
+                updates[agent] = {}
+            else:
+                updates[agent] = {"api_key_file" if value.startswith("sk-ant-api") else "token_file": value}
+        else:
+            auth = Path(args.auth_file).expanduser().resolve() if args.auth_file else codex_auth_location()
+            use_auth = not args.api_key and (args.auth_file or (auth.is_file() and (
+                not sys.stdin.isatty() or args.agent or confirm(f"Use your Codex login in {auth}?"))))
+            if use_auth:
+                configured_file(auth)
+                if auth.stat().st_mode & 0o077:
+                    raise Error(f"{auth} holds your Codex login, so only you may read it. Run chmod 600 {auth}")
+                updates[agent] = {"auth_file": auth}
+            else:
+                value = read_secret("OpenAI API key: ", "Paste an OpenAI API key, or leave it blank to install "
+                                    "Codex without one. To use your ChatGPT login instead, run codex login first.")
+                updates[agent] = {"api_key_file": value} if value else {}
+
+    with locked_config(config_path) as config:
+        current = config.get("agents")
+        if current is not None and not isinstance(current, dict):
+            raise Error(f"Expected an object for agents in {config_path}")
+        current = dict(current or {})
+        for agent, update in updates.items():
+            previous = current.get(agent) if isinstance(current.get(agent), dict) else {}
+            # Delete the secrets rox saved for this agent that the new settings no longer use.
+            for (owner, setting), filename in AGENT_SECRET_FILES.items():
+                if owner == agent and (update is None or setting not in update):
+                    config_path.with_name(filename).unlink(missing_ok=True)
+            if update is None:
+                current.pop(agent, None)
+                print(f"New guests won't get {AGENT_NAMES[agent]}", flush=True)
+                continue
+            settings = {}
+            version = args.version or previous.get("version")
+            if version and version != "latest":
+                settings["version"] = version
+            for setting, value in update.items():
+                if isinstance(value, str):
+                    path = config_path.with_name(AGENT_SECRET_FILES[agent, setting])
+                    write_private(path, value + "\n")
+                    print(f"Saved the {AGENT_NAMES[agent]} credential to {path}", flush=True)
+                    value = path
+                settings[setting] = str(value)
+            current[agent] = settings
+            pinned = f" {settings['version']}" if "version" in settings else ", kept at the latest version"
+            login = "with no credentials" if not update else "signed in"
+            print(f"New guests get {AGENT_NAMES[agent]}{pinned}, {login}", flush=True)
+            if "auth_file" in update:
+                print("Each guest refreshes this login on its own. If guests sign each other out, "
+                      "use rox config agents codex --api-key instead.", flush=True)
+        if current:
+            config["agents"] = current
+        else:
+            config.pop("agents", None)
+        write_config(config_path, config)
+    if not args.off:
+        print("Guests that are already running get the change with rox update-agents NAME, "
+              "or rox update-agents --all", flush=True)
 
 
 def guest_rex(guest, *args):
@@ -1649,6 +2005,8 @@ def describe_guest(guest, project=None):
     print(f"Workspace  {guest.name}")
     if guest.tailnet_name:
         print(f"Tailnet    {guest.tailnet_name}")
+    if guest.agents:
+        print(f"Agents     {describe_agents(guest.agents)}")
     target = guest.name if guest.registered else guest.endpoint
     if project:
         print(f"Project    {project.id}")
@@ -1683,7 +2041,7 @@ def dispatch(args, label, launch, command):
         if (value := getattr(args, option, None)) is not None:
             launch.append(f"--{option.replace('_', '-')}={value}")
     launch.extend(f"--git-key={key}" for key in getattr(args, "git_key", None) or [])
-    for flag in ("no_hook", "no_prebuild", "rebuild", "no_app_host", "no_tailscale"):
+    for flag in ("no_hook", "no_prebuild", "rebuild", "no_app_host", "no_tailscale", "no_agents"):
         if getattr(args, flag, False):
             launch.append(f"--{flag.replace('_', '-')}")
     if command:
@@ -1885,6 +2243,7 @@ def up(args, command):
     config_path, config = load_config(args)
     keys, known_hosts = git_access(args, config, config_path, source[1]) if source else ([], "")
     tailnet = tailscale_settings(config, config_path, args.no_tailscale)
+    agents = {} if args.no_agents else agent_settings(config, config_path)
     fetched = None
     if source:
         require(["git"])
@@ -1952,15 +2311,19 @@ def up(args, command):
     private_directory(state_root())
     if engine:
         prepare_container_image(engine, image)
+    versions = agent_versions(agents) if agents else {}
     prebuilt = ""
     if prebuild:
         vm = {"user": user, "identity": identity, "host_key": host_key, "boot_timeout": args.boot_timeout,
-              "cpus": cpus, "memory": memory}
+              "cpus": cpus, "memory": memory, "agents": versions}
         prebuilt = prepare_project_image(backend, engine, image, source[0], source[1], source[2],
                                          keys, known_hosts, vm, args.rebuild, fetched)
+    launch_image = prebuilt or image
+    if engine and versions:
+        launch_image = prepare_agent_image(engine, launch_image, versions)
 
     name = f"rv-{slugify(source[0] if source else 'host', 24) or 'project'}-{secrets.token_hex(6)}"
-    guest = Guest(name, backend, prebuilt or image, user, engine, prebuilt=bool(prebuilt),
+    guest = Guest(name, backend, launch_image, user, engine, prebuilt=bool(prebuilt),
                   cpus=cpus, memory=memory)
     guest.directory.mkdir(mode=0o700)
     guest.identity = str(identity or guest.directory / "login")
@@ -1980,6 +2343,9 @@ def up(args, command):
                 raise Error("Guest preparation did not return valid state and socket paths")
             guest.guest_socket = paths[1]
             guest.save()
+            if versions:
+                # Before the Rex server starts, so it and every terminal it opens read the credentials.
+                install_agents(guest, agents, versions)
             guest_stage(guest, "server", guest.guest_socket)
             attach_guest(guest)
             if tailnet:
@@ -2575,6 +2941,8 @@ def route_remote(args):
         return False
     else:
         extra = ["--no-app-host"] if args.command == "reconnect" else []
+        if args.command == "update-agents" and args.config:
+            extra = [f"--config={args.config}"]
         run_on_host(host, f"rox {args.command} {name}", [args.command, name, *extra])
     return True
 
@@ -2846,6 +3214,8 @@ def main(argv):
     start.add_argument("--no-app-host", action="store_true", help=APP_HOST_HELP)
     start.add_argument("--no-tailscale", action="store_true",
                        help="keep this guest off the tailnet even when tailscale is configured")
+    start.add_argument("--no-agents", action="store_true",
+                       help="don't install the configured agent CLIs or their credentials in this guest")
     listing = commands.add_parser("ls", help="list managed workspaces")
     where = listing.add_mutually_exclusive_group()
     where.add_argument("-a", "--all", action="store_true",
@@ -2877,6 +3247,11 @@ def main(argv):
     funnel_parser.add_argument("--path", default="/", help="public path to serve it at (default /)")
     funnel_parser.add_argument("--off", action="store_true",
                                help="stop funneling PORT, or every funnel of the guest without PORT")
+    agents_parser = commands.add_parser("update-agents",
+                                        help="update a running guest's agent CLIs and refresh their credentials")
+    agents_parser.add_argument("name", nargs="?", help="guest to update; omit with --all")
+    agents_parser.add_argument("--all", action="store_true", help="update every running guest on this machine")
+    agents_parser.add_argument("--config", help="config file on the machine that runs the guest")
     open_parser = commands.add_parser("open", help="show a guest's own Rex session in the Rex app, so splits run in the guest")
     open_parser.add_argument("name")
     open_parser.add_argument("project", nargs="?", help="project whose session to open; omit for the only one")
@@ -2884,7 +3259,7 @@ def main(argv):
                                      help="add a guest to the Rex app on this machine, which keeps its own host list")
     app_parser.add_argument("name")
     for named in (forward_parser, funnel_parser, reconnect_parser, start_parser, stop_parser, app_parser,
-                  open_parser):
+                  open_parser, agents_parser):
         named.add_argument("-S", "--host", help=HOST_HELP)
     stop = commands.add_parser("down", help="delete a guest and its workspace")
     stop.add_argument("name", nargs="?",
@@ -2914,6 +3289,15 @@ def main(argv):
     tailnet_parser.add_argument("--tag", action="append",
                                 help="tag for guest devices (repeatable); defaults to tag:rox-guest")
     tailnet_parser.add_argument("--control-url", help="https:// URL of a self-hosted control server such as Headscale")
+    agent_config = config_commands.add_parser(
+        "agents", help="install Claude Code or Codex in new guests, signed in with your credentials")
+    agent_config.add_argument("agent", nargs="?", choices=sorted(AGENT_CREDENTIALS),
+                              help="agent to set up; omit to choose interactively")
+    agent_config.add_argument("--config", default=argparse.SUPPRESS, help="alternate Rox configuration file")
+    agent_config.add_argument("--version", help="pin a version such as 1.2.3, or latest (the default)")
+    agent_config.add_argument("--api-key", action="store_true", help="codex: sign in with an OpenAI API key")
+    agent_config.add_argument("--auth-file", help="codex: login file to copy into guests (default ~/.codex/auth.json)")
+    agent_config.add_argument("--off", action="store_true", help="stop installing the agent in new guests")
     skill = commands.add_parser("skill", help="install the rox agent skill")
     skill_commands = skill.add_subparsers(dest="skill_command", required=True)
     install = skill_commands.add_parser("install", help="copy the bundled skill into Claude Code or Codex")
@@ -2936,7 +3320,8 @@ def main(argv):
         add(args, command)
     elif command:
         parser.error("only up and add accept a command after --")
-    elif args.command in ("shell", "forward", "funnel", "reconnect", "start", "stop", "down") and route_remote(args):
+    elif args.command in ("shell", "forward", "funnel", "reconnect", "start", "stop", "down",
+                          "update-agents") and route_remote(args):
         return
     elif args.command == "ls":
         list_guests("all" if args.all else args.host, args.json)
@@ -2956,6 +3341,16 @@ def main(argv):
         add_remote_host(args.name, args.host)
     elif args.command == "stop":
         stop_workspace(args.name)
+    elif args.command == "update-agents":
+        if bool(args.name) == args.all:
+            parser.error("name a guest or pass --all")
+        if args.all and args.host:
+            run_on_host(args.host, "rox update-agents --all",
+                        ["update-agents", "--all", *([f"--config={args.config}"] if args.config else [])])
+        elif args.all:
+            update_all_agents(args.config)
+        else:
+            update_agents(args.name, args.config)
     elif args.command == "key":
         edit_git_keys(args)
     elif args.command == "service":
@@ -2963,6 +3358,8 @@ def main(argv):
          "run": lambda: service_run(args.interval)}[args.service_command]()
     elif args.command == "config" and args.config_command == "tailscale":
         configure_tailscale(args)
+    elif args.command == "config" and args.config_command == "agents":
+        configure_agents(args)
     elif args.command == "config":
         edit_config(args.config)
     elif args.command == "skill":

@@ -1,0 +1,84 @@
+---
+title: Agent CLIs in guests
+description: Install Claude Code and Codex in every guest, signed in with your credentials and kept on the latest release.
+---
+
+import { Aside, Steps } from '@astrojs/starlight/components';
+
+Rox can install Claude Code and Codex in every guest it starts, with their credentials ready. A worker started with `rex run -- claude ...` or `rex run -- codex ...` works right away, with no setup hook and no sign-in.
+
+## Set it up
+
+Run `rox config agents` on the launcher, which is the machine that runs the guests. For guests on a [Rex remote host](../remote-hosts/), run it on that host, because guests get their credentials from the config of the machine that runs them.
+
+<Steps>
+
+1. **Claude Code.** Create a long-lived token for your Claude subscription, then save it:
+
+   ```sh
+   claude setup-token
+   rox config agents claude
+   ```
+
+   Paste the token when Rox asks for it. You can paste an Anthropic API key (`sk-ant-api…`) instead, and Rox sets `ANTHROPIC_API_KEY` in place of `CLAUDE_CODE_OAUTH_TOKEN`.
+
+2. **Codex.** Sign in with your ChatGPT account on the launcher, then point Rox at the login:
+
+   ```sh
+   codex login
+   rox config agents codex
+   ```
+
+   Rox copies `~/.codex/auth.json`, or `$CODEX_HOME/auth.json`, into each guest. To use an OpenAI API key instead, run `rox config agents codex --api-key`.
+
+</Steps>
+
+Run `rox config agents` with no agent to choose both interactively. When stdin isn't a terminal, Rox reads the token or key from stdin. Leave the token blank to install an agent without credentials.
+
+Rox saves each token next to the config, readable only by you, and records it in the config's `agents` section:
+
+```json
+{
+  "agents": {
+    "claude": { "token_file": "~/.config/rox/claude-token" },
+    "codex": { "auth_file": "~/.codex/auth.json", "version": "0.171.0" }
+  }
+}
+```
+
+Pass `--no-agents` to `rox up` to start one guest without them. `rox config agents claude --off` stops installing Claude Code in new guests and deletes the token Rox saved for it.
+
+## What a guest gets
+
+- **The CLIs** in `~/.local/bin`, installed with each tool's official installer.
+- **Claude Code's credential** in `~/.rox/agents.env`, which the guest's Rex server reads when it starts. Every terminal and `rex run` worker it opens gets the credential. Login and interactive shells read the file too. Rox also marks Claude Code's onboarding as done, so a worker doesn't stop at the welcome screen.
+- **Codex's login** at `~/.codex/auth.json`, or, with an API key, the result of `codex login --with-api-key` in the guest.
+
+The credentials go to the guest over SSH, on stdin, so they never appear in a command line or a Rex session. They're never written into an image.
+
+<Aside type="caution">
+A guest with these credentials can spend on your account, the same way the agent can on your own machine. Guests are isolated and short-lived, but treat each one as able to use your subscription or API key.
+
+Each guest refreshes a copied Codex ChatGPT login on its own. If guests start signing each other out, switch Codex to an API key with `rox config agents codex --api-key`.
+</Aside>
+
+## Staying on the latest release
+
+By default, each agent follows its latest release. Rox checks for one at `rox up`, at most every six hours, and caches the answer. A failed check never stops a launch: Rox uses the last version it found. Pin a version with `--version`, and go back to the latest with `--version latest`:
+
+```sh
+rox config agents codex --version 0.171.0
+```
+
+**Containers** get the agents in one last image layer, built on the base or [project image](../project-images/) and named after it with `-agents`, such as `rox:linux-agents`. When a new release comes out, only that layer rebuilds, which takes about half a minute. Your `.rox.sh` doesn't run again. If the layer fails to build, the guest installs the agents when it boots instead.
+
+**Tart VMs** install the agents when they boot, and skip any that are already at the right version. Project images for Tart include them, so later boots only update.
+
+**Guests that are already running** keep their versions until you update them:
+
+```sh
+rox update-agents NAME
+rox update-agents --all
+```
+
+`rox update-agents` checks for the latest releases, installs any that a guest lacks, and writes the current credentials again. New shells get changed credentials right away. Workers that `rex run` starts get them after the guest restarts with `rox stop NAME` and `rox start NAME`, because the guest's Rex server reads them when it starts.

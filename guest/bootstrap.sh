@@ -5,6 +5,29 @@ export PATH="$HOME/.local/bin:/usr/local/bin:/opt/homebrew/bin:$PATH"
 
 stage=$1
 shift
+
+hook_agent_env() {
+    # Shells read the agents' credentials, which rox writes to ~/.rox/agents.env at boot.
+    local line='[ -f "$HOME/.rox/agents.env" ] && . "$HOME/.rox/agents.env"' file
+    for file in "$HOME/.profile" "$HOME/.bashrc" "$HOME/.zshenv"; do
+        grep -qxF "$line" "$file" 2>/dev/null || printf '%s\n' "$line" >>"$file"
+    done
+}
+
+complete_claude_onboarding() {
+    # Rox supplies the credentials, so skip Claude Code's first-run sign-in screens.
+    local file="$HOME/.claude.json"
+    if [[ ! -s $file ]]; then
+        printf '{"hasCompletedOnboarding": true}\n' >"$file"
+    elif ! grep -q '"hasCompletedOnboarding"' "$file"; then
+        perl -0pi -e 's/\A\s*\{\s*\}\s*\z/{"hasCompletedOnboarding": true}\n/ or s/\A\s*\{/{"hasCompletedOnboarding": true,/' "$file"
+    fi
+}
+
+installed_version() {
+    command -v "$1" >/dev/null || return 0
+    "$1" --version 2>/dev/null | grep -Eo '[0-9]+\.[0-9]+\.[0-9]+[^ ]*' | head -n 1 || true
+}
 case "$stage" in
     prepare)
         command -v rex >/dev/null || { echo 'Install Rex in the guest and put it on PATH.' >&2; exit 1; }
@@ -88,6 +111,10 @@ case "$stage" in
             exit 0
         fi
         log="$base/rex.log"
+        # The server, and every terminal it opens, gets the agents' credentials.
+        if [[ -f $HOME/.rox/agents.env ]]; then
+            . "$HOME/.rox/agents.env"
+        fi
         nohup rex server run --listen "$endpoint" --state-dir "$base/rex-state" >"$log" 2>&1 </dev/null &
         server_pid=$!
         deadline=$((SECONDS + 10))
@@ -104,6 +131,34 @@ case "$stage" in
         ;;
     session)
         exec "$@" </dev/null
+        ;;
+    agents)
+        # Each argument is AGENT=VERSION, where VERSION may be latest.
+        hook_agent_env
+        for spec; do
+            agent=${spec%%=*}
+            version=${spec#*=}
+            current=$(installed_version "$agent")
+            if [[ -n $current && ($version == latest || $version == "$current") ]]; then
+                printf '%s %s is installed\n' "$agent" "$current" >&2
+            else
+                printf 'Installing %s %s\n' "$agent" "$version" >&2
+                case $agent in
+                    claude) curl -fsSL https://claude.ai/install.sh | bash -s -- "$version" >&2 ;;
+                    codex) curl -fsSL https://chatgpt.com/codex/install.sh |
+                        CODEX_RELEASE="$version" CODEX_NON_INTERACTIVE=1 sh >&2 ;;
+                    *) printf 'Unknown agent %s\n' "$agent" >&2; exit 1 ;;
+                esac
+                current=$(installed_version "$agent")
+                if [[ -z $current ]]; then
+                    printf 'Installing %s did not put it on PATH\n' "$agent" >&2
+                    exit 1
+                fi
+            fi
+            if [[ $agent == claude ]]; then
+                complete_claude_onboarding
+            fi
+        done
         ;;
     *)
         printf 'Unknown guest stage %s\n' "$stage" >&2

@@ -24,7 +24,7 @@ rox skill install --dir .claude/skills
 
 Start a new agent session and invoke the skill (`/rox` in Claude Code, `$rox` in Codex).
 
-The installed skill is a copy of the one bundled with your rox version. After you upgrade rox, run `rox skill install` again to update it. Rox replaces its own earlier copy, but it won't overwrite a different folder named `rox` unless you pass `--force`. Install rox itself on the launcher, and make your agent runner available inside the guests. A [setup hook](../setup-hook/) is a good place to install it.
+The installed skill is a copy of the one bundled with your rox version. After you upgrade rox, run `rox skill install` again to update it. Rox replaces its own earlier copy, but it won't overwrite a different folder named `rox` unless you pass `--force`. Install rox itself on the launcher. To have Claude Code or Codex ready in every guest, signed in with your credentials, run `rox config agents` on the launcher. See [Agent CLIs in guests](../agent-clis/). For other runners, a [setup hook](../setup-hook/) is a good place to install them.
 
 ## The workflow
 
