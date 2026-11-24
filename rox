@@ -689,6 +689,7 @@ def resume(guest, tailnet=None, boot_timeout=120, force=False):
     close_git_forward(guest)
     connect(guest, tailnet)
     register_guest(guest)
+    share_launcher_hosts(guest)
     restore_funnels(guest)
     restore_git_agent(guest)
     return True
@@ -2327,6 +2328,60 @@ def register_guest(guest):
                   "to reach guests from other devices.", flush=True)
 
 
+def launcher_hosts():
+    """(label, endpoints) for the Rex hosts a guest can reach: this machine's hosts and this machine.
+
+    Guests are left out, and so are socket endpoints, which work only on this machine. This
+    machine is added by its tailnet name when no host already points there.
+    """
+    listing = json.loads(output(["rex", "hosts", "list", "--json"], timeout=15))
+    hosts, seen = [], set()
+    for entry in listing.get("hosts", []):
+        host = entry.get("host", {})
+        label = host.get("label") or ""
+        endpoints = [endpoint for endpoint in host.get("endpoints", []) if not endpoint.startswith("unix:")]
+        if (not label or not endpoints or set(endpoints) <= seen
+                or re.fullmatch(NAME_PATTERN, label.split(".", 1)[0])):
+            continue
+        hosts.append((label, endpoints))
+        seen.update(endpoints)
+    try:
+        status = json.loads(output(["rex", "--autostart=false", "--timeout", "5s", "server", "status", "--json"],
+                                   timeout=10))
+    except (Error, ValueError, subprocess.SubprocessError):
+        status = {}
+    tailscale = status.get("tailscale") or {}
+    own = (tailscale.get("dns_name") or "").rstrip(".")
+    if tailscale.get("state") == "running" and own and own not in seen:
+        label = socket.gethostname().split(".", 1)[0].lower() or own
+        if label.lower() in {name.lower() for name, _ in hosts}:
+            label = own
+        hosts.append((label, [own]))
+    return hosts
+
+
+def share_launcher_hosts(guest):
+    """Add this machine's Rex hosts to the guest's own server, so Rex in the guest can reach them."""
+    try:
+        wanted = launcher_hosts()
+        if not wanted:
+            return
+        listing = json.loads(output(remote_command(guest, guest_rex(guest, "hosts", "list", "--json")), timeout=20))
+        have = {entry.get("host", {}).get("label", "").lower() for entry in listing.get("hosts", [])}
+        added = []
+        for label, endpoints in wanted:
+            if label.lower() in have or label.lower() == guest.name:
+                continue
+            output(remote_command(guest, guest_rex(guest, "hosts", "add", label, *endpoints)), timeout=20)
+            added.append(label)
+    except (Error, ValueError, subprocess.SubprocessError) as error:
+        print(f"rox: Could not add this machine's Rex hosts to {guest.name}, so Rex there can't reach them "
+              f"by label. ({error})", file=sys.stderr, flush=True)
+        return
+    if added:
+        print(f"Added Rex hosts {', '.join(added)} to {guest.name}", flush=True)
+
+
 def app_clients(server=None):
     """The Rex apps connected to a server, this machine's by default."""
     target = ["-S", server] if server else []
@@ -2854,6 +2909,7 @@ def up(args, command):
             if tailnet:
                 enable_tailnet(guest, tailnet, args.boot_timeout)
             register_guest(guest)
+            share_launcher_hosts(guest)
             if not source:
                 guest.session_id = start_session(guest, guest.name, guest.home, command)
                 guest.save()

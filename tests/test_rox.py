@@ -25,6 +25,7 @@ REAL_ENSURE_RUNTIME = rox.ensure_runtime
 REAL_GUEST_STATE = rox.guest_state
 REAL_REACHABLE = rox.reachable
 REAL_SUGGEST_APP_HOST = rox.suggest_app_host
+REAL_SHARE_LAUNCHER_HOSTS = rox.share_launcher_hosts
 REAL_LOCAL_APP = rox.local_app
 REAL_RESTORE_GIT_AGENT = rox.restore_git_agent
 REAL_SYNC_AGENT_SETUP = rox.sync_agent_setup
@@ -60,7 +61,7 @@ class WorkspaceTests(unittest.TestCase):
         self.addCleanup(engine.stop)
         # Treat guests as running and reachable, so commands don't ask a real engine or tunnel.
         # Tests of those checks call the REAL_ copies.
-        for name, value in (("guest_state", "running"), ("reachable", True), ("suggest_app_host", None),
+        for name, value in (("guest_state", "running"), ("reachable", True), ("suggest_app_host", None), ("share_launcher_hosts", None),
                             ("local_app", None), ("restore_git_agent", False),
                             ("sync_agent_setup", "")):
             runtime = patch.object(rox, name, return_value=value)
@@ -1654,6 +1655,40 @@ class WorkspaceTests(unittest.TestCase):
             "mini", "rv-web-0123456789ab", "rv-web-0123456789ab.tail1234.ts.net", "studio.tail1234.ts.net")]}
         with patch.object(rox, "output", return_value=json.dumps(hosts)):
             self.assertEqual(rox.rex_host_labels(), ["mini", "studio.tail1234.ts.net"])
+
+    def test_guests_get_the_launchers_hosts_and_the_launcher_itself(self):
+        guest = self.tailnet_guest()
+        launcher = {"hosts": [
+            {"host": {"label": "air", "endpoints": ["unix:///tmp/air.sock", "air.tail.ts.net"]}},
+            {"host": {"label": "mini.tail.ts.net", "endpoints": ["mini.tail.ts.net"]}},
+            {"host": {"label": "mini", "endpoints": ["mini.tail.ts.net"]}},
+            {"host": {"label": "rv-web-0123456789ab", "endpoints": ["rv-web-0123456789ab.tail.ts.net"]}},
+            {"host": {"label": "local", "endpoints": ["unix:///tmp/local.sock"]}},
+            {"host": {"label": "studio", "endpoints": ["studio.tail.ts.net"]}},
+        ]}
+        status = {"tailscale": {"state": "running", "dns_name": "launcher-rex.tail.ts.net."}}
+        in_guest = {"hosts": [{"host": {"label": "Studio", "endpoints": ["studio.tail.ts.net"]}}]}
+        added = []
+
+        def fake_output(argv, **kwargs):
+            if argv[:3] == ["rex", "hosts", "list"]:
+                return json.dumps(launcher)
+            if "status" in argv:
+                return json.dumps(status)
+            remote = shlex.split(argv[-1])
+            if "add" in remote:
+                added.append(remote[remote.index("add") + 1:])
+                return ""
+            return json.dumps(in_guest)
+
+        with (
+            patch.object(rox, "output", side_effect=fake_output),
+            patch.object(rox.socket, "gethostname", return_value="Launcher.local"),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            REAL_SHARE_LAUNCHER_HOSTS(guest)
+        self.assertEqual(added, [["air", "air.tail.ts.net"], ["mini.tail.ts.net", "mini.tail.ts.net"],
+                                 ["launcher", "launcher-rex.tail.ts.net"]])
 
     def test_down_without_a_name_removes_the_projects_only_workspace(self):
         self.save_guest("rv-other-000011112222", "other project")
