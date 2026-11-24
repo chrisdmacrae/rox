@@ -69,6 +69,22 @@ Open an interactive login shell with `REX_SERVER` pointing at the guest's server
 | --- | --- |
 | `-S`, `--host HOST` | The Rex host that runs the guest. Without it, Rox looks for the guest on this machine, then on each Rex host. |
 
+## `rox agent NAME [PROJECT]`
+
+Start an agent CLI in a new Rex session in a running guest, at a project checkout. Arguments after `--` go to the agent, such as a prompt. The guest's own sessions and projects are left as they are, so you can start several agents in one guest.
+
+```sh
+rox agent NAME [PROJECT] [--agent claude|codex] [--open-shell] [-- ARG ...]
+```
+
+`PROJECT` picks the checkout the way it does for `rox shell`. Without `--agent`, Rox starts the guest's only [agent CLI](../../guides/agent-clis/) and asks you to choose when it has both. The session stays open after the agent exits. Rox prints the new `Session` ID with the `Workspace` and `Checkout`, so a controller can drive it with `rex -S NAME`. If the guest stopped or lost its tunnel, Rox starts it again first. If this machine has no record of `NAME`, Rox finds the Rex host that runs it and starts the agent there.
+
+| Option | Description |
+| --- | --- |
+| `--agent claude\|codex` | The agent CLI to start, even one the guest got some other way, such as from `.rox.sh`. |
+| `--open-shell` | Show the new session in the Rex app on this machine. For a guest on another host, the guest must be on the tailnet. |
+| `-S`, `--host HOST` | The Rex host that runs the guest. Without it, Rox looks for the guest on this machine, then on each Rex host. |
+
 ## `rox forward NAME PORT...`
 
 Forward ports on the launcher's `localhost` to servers listening on the guest's own `localhost`, over the guest's SSH connection. It works with every backend and engine, including Docker and Podman containers, which have no address of their own. The dev server can keep listening on `localhost`, and you open it at `http://localhost:PORT`.
