@@ -315,6 +315,99 @@ def resolve_project(args, required=False):
     return None
 
 
+def local_checkout(args):
+    """The checkout root that --local copies into the guest, or None without --local."""
+    if not getattr(args, "local", False):
+        return None
+    if args.host is not None:
+        raise Error("--local copies this machine's checkout, so it can't be combined with --host")
+    if getattr(args, "no_project", False) or args.project is not None:
+        raise Error("--local copies the current checkout, so it can't be combined with --project or --no-project")
+    if not in_checkout(args.cwd):
+        raise Error(f"--local needs a Git checkout, and {args.cwd} is not inside one")
+    root = Path(output(["git", "-C", str(args.cwd), "rev-parse", "--show-toplevel"]))
+    if run(["git", "-C", str(root), "rev-parse", "--verify", "--quiet", "HEAD^{commit}"],
+           capture=True, check=False).returncode:
+        raise Error(f"--local needs a commit in {root}. Commit something first")
+    return root
+
+
+def working_tree_settings(root):
+    """The checkout's own .rox.json as it is on disk, for a launch that copies the checkout."""
+    path = root / PROJECT_CONFIG
+    if not path.is_file():
+        return {}
+    try:
+        settings = json.loads(path.read_text())
+    except ValueError as error:
+        raise Error(f"{path} is not valid JSON: {error}") from None
+    return checked_project_settings(settings, PROJECT_CONFIG)
+
+
+def local_changes(root, archive):
+    """Write the checkout's uncommitted files to archive and return the tracked paths it deleted.
+
+    Gitignored files stay behind, so build output and secrets such as .env don't reach the guest.
+    """
+    def paths(*args):
+        listed = run(["git", "-C", str(root), *args], capture=True, check=True).stdout
+        return [path for path in listed.split("\0") if path]
+
+    deleted = paths("diff", "--name-only", "--no-renames", "-z", "--diff-filter=D", "HEAD", "--")
+    changed = paths("diff", "--name-only", "--no-renames", "-z", "--diff-filter=d", "HEAD", "--")
+    untracked = paths("ls-files", "-z", "--others", "--exclude-standard")
+    count = 0
+    with tarfile.open(archive, "w") as tar:
+        for path in dict.fromkeys(changed + untracked):
+            file = root / path
+            # A changed submodule shows up as its directory, which a snapshot of files can't carry.
+            if file.is_symlink() or file.is_file():
+                tar.add(file, arcname=path, recursive=False)
+                count += 1
+    return deleted, count
+
+
+def send_local(guest, workspace, root, branch):
+    """Bring a fresh no-checkout clone in the guest to the launcher's HEAD and uncommitted files."""
+    def git(*args, **kwargs):
+        return run(["git", "-C", str(root), *args], capture=True, check=True, **kwargs).stdout.strip()
+
+    head = git("rev-parse", "HEAD^{commit}")
+    # Commits the guest's clone already has, so the bundle only carries what the remote lacks.
+    listed = output(remote_command(guest, ["git", "-C", workspace, "for-each-ref", "--format=%(objectname)"]))
+    known = sorted(set(listed.split()))
+    have = []
+    if known:
+        checked = git("cat-file", "--batch-check=%(objectname) %(objecttype)", input="\n".join(known) + "\n")
+        have = [line.split()[0] for line in checked.splitlines() if line.endswith(" commit")]
+    payload = str(PurePosixPath(workspace).parent / f".{PurePosixPath(workspace).name}.local")
+    with tempfile.TemporaryDirectory(prefix="rox-local-") as scratch:
+        scratch = Path(scratch)
+        uploads = {}
+        # On stdin, since a remote with many branches would overflow the argument list.
+        excluded = "".join(f"^{commit}\n" for commit in have)
+        missing = int(git("rev-list", "--count", "--stdin", head, input=excluded))
+        if missing:
+            bundle = scratch / "commits.bundle"
+            git("bundle", "create", "--quiet", str(bundle), "HEAD", "--stdin", input=excluded)
+            uploads["commits.bundle"] = bundle
+        deleted, count = local_changes(root, scratch / "files.tar")
+        if count:
+            uploads["files.tar"] = scratch / "files.tar"
+        if deleted:
+            (scratch / "deleted").write_text("".join(f"{path}\0" for path in deleted))
+            uploads["deleted"] = scratch / "deleted"
+        print(f"Copying {missing} unpushed {'commit' if missing == 1 else 'commits'}, {count} changed "
+              f"{'file' if count == 1 else 'files'} and {len(deleted)} "
+              f"{'deletion' if len(deleted) == 1 else 'deletions'} from {root}", flush=True)
+        for name, source in uploads.items():
+            target = f"{payload}/{name}"
+            upload = ["bash", "-c", 'umask 077; mkdir -p "${1%/*}" && cat > "$1"', "rox", target]
+            with source.open("rb") as stream:
+                run(remote_command(guest, upload), stdin=stream)
+    guest_stage(guest, "local", workspace, payload, branch, head)
+
+
 def config_location(value):
     if value:
         return Path(value).expanduser().resolve()
@@ -3306,7 +3399,7 @@ def start_session(guest, label, cwd, command):
     return created["session_id"]
 
 
-def provision_project(guest, source, command, keys, known_hosts, no_hook, image_checkout=False):
+def provision_project(guest, source, command, keys, known_hosts, no_hook, image_checkout=False, local=None):
     """Clone a project into a ready guest, run its hook and start a Rex session at the checkout."""
     name, url, branch = source
     project = guest.add_project(name, url, branch)
@@ -3321,7 +3414,10 @@ def provision_project(guest, source, command, keys, known_hosts, no_hook, image_
             upload = ["bash", "-c", 'umask 077; mkdir -p "${1%/*}" && cat > "$1"', "rox", target]
             run(remote_command(guest, upload), input=known_hosts)
         with git_agent(guest, keys) as agent:
-            guest_stage(guest, "clone", project.workspace, url, branch, "yes" if agent else "no", agent=agent)
+            guest_stage(guest, "clone", project.workspace, url, branch, "yes" if agent else "no",
+                        *(["local"] if local else []), agent=agent)
+        if local:
+            send_local(guest, project.workspace, local, branch)
         guest_stage(guest, "setup", project.workspace, guest.name, guest.backend, guest.guest_socket,
                     "prebuilt" if image_checkout else str(no_hook).lower())
         project.session_id = start_session(guest, name, project.workspace, command)
@@ -3342,6 +3438,7 @@ def up(args, command):
     if args.host is not None and not args.host.strip():
         raise Error("--host needs a Rex host label or address")
     source = resolve_project(args)
+    checkout = local_checkout(args)
     local = local_project_settings(args) if source else {}
     if args.host is not None:
         provisioned = dispatch(args, source[0] if source else "host",
@@ -3360,10 +3457,14 @@ def up(args, command):
     agents = {} if args.no_agents else agent_settings(config, config_path)
     forwarded_keys = guest_git_keys(args, config, config_path)
     fetched = None
-    if source:
-        require(["git"])
-        fetched = read_branch(source[1], source[2], keys, known_hosts)
-    project_config = fetched.settings if fetched else {}
+    if checkout:
+        # The guest gets this checkout as it is, so its own .rox.json applies, not the remote branch's.
+        project_config = working_tree_settings(checkout)
+    else:
+        if source:
+            require(["git"])
+            fetched = read_branch(source[1], source[2], keys, known_hosts)
+        project_config = fetched.settings if fetched else {}
     backend = args.backend or local.get("backend") or project_config.get("backend")
     if not backend:
         raise Error(f"Choose a backend with rox up container, linux or macos, or set \"backend\" in {PROJECT_CONFIG}")
@@ -3412,9 +3513,10 @@ def up(args, command):
     prebuild = settings.get("prebuild", True)
     if not isinstance(prebuild, bool):
         raise Error(f"Expected true or false for {backend}.prebuild in {origin('prebuild')}")
-    prebuild = prebuild and bool(source) and not args.no_prebuild and not args.no_hook
+    # A project image holds a remote branch, and a --local launch runs .rox.sh on the copied checkout.
+    prebuild = prebuild and bool(source) and not args.no_prebuild and not args.no_hook and not checkout
     if args.rebuild and not prebuild:
-        raise Error("--rebuild needs a project image, which --no-project, --no-hook, --no-prebuild "
+        raise Error("--rebuild needs a project image, which --no-project, --no-hook, --no-prebuild, --local "
                     "or prebuild: false disable")
 
     required = ["rex", "ssh", engine or "tart"]
@@ -3486,7 +3588,7 @@ def up(args, command):
         project = None
         if source:
             project = provision_project(guest, source, command, keys, known_hosts, args.no_hook,
-                                        image_checkout=bool(prebuilt))
+                                        image_checkout=bool(prebuilt), local=checkout)
         # After the setup hook, which runs without Git keys, so only Git and agents in the guest get them.
         restore_git_agent(guest)
         describe_guest(guest, project)
@@ -3506,6 +3608,7 @@ def add(args, command):
     if not re.fullmatch(NAME_PATTERN, args.name):
         raise Error(f"Invalid workspace name {args.name!r}")
     source = resolve_project(args, required=True)
+    checkout = local_checkout(args)
     if args.host is not None:
         provisioned = dispatch(args, source[0], ["add", args.name, *project_options(source)], command)
         open_remote_guest(provisioned, args.host)
@@ -3522,7 +3625,7 @@ def add(args, command):
         if guest.phase != "ready" or not guest.guest_socket:
             raise Error(f"{guest.name} is {guest.phase}. Run rox reconnect {guest.name} before adding a project")
         resume(guest, saved_tailnet(guest, args.config), force=True)
-        project = provision_project(guest, source, command, keys, known_hosts, args.no_hook)
+        project = provision_project(guest, source, command, keys, known_hosts, args.no_hook, local=checkout)
         restore_git_agent(guest)
         describe_guest(guest, project)
     if app_session:
@@ -4340,6 +4443,8 @@ def main(argv):
         parser.add_argument("--git-key", action="append", help="Git SSH identity (repeatable)")
         parser.add_argument("--git-known-hosts", help="known_hosts file for Git SSH servers")
         parser.add_argument("--no-hook", action="store_true", help="skip the project's .rox.sh")
+        parser.add_argument("--local", action="store_true",
+                            help="copy this checkout's unpushed commits and uncommitted files into the guest")
         parser.add_argument("--open-shell", action="store_true",
                             help="open the guest's session in the Rex app here, or a Guest tab in this Rex session without one")
 

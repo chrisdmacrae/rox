@@ -18,7 +18,7 @@ Commit a `.rox.json` at the root of the branch you launch to describe the guest 
 With this file, `rox up` starts an 8 GB container from `ghcr.io/acme/agent-base:2`. `rox up linux` starts a 16 GB Tart VM from the launcher's usual template and runs `.rox.sh` at boot.
 
 <Aside>
-	Rox reads `.rox.json` from the **remote branch** it launches, the same way it reads [`.rox.sh`](../setup-hook/). Push changes to the file before you launch. Edits in your working tree have no effect until they're pushed.
+	Rox reads `.rox.json` from the **remote branch** it launches, the same way it reads [`.rox.sh`](../setup-hook/). Push changes to the file before you launch. Edits in your working tree have no effect until they're pushed, except in a `--local` launch, which reads `.rox.json` from the working tree.
 </Aside>
 
 ## Settings

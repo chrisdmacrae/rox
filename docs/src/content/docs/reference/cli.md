@@ -31,6 +31,7 @@ rox up container [options] [-- COMMAND [ARG ...]]
 | `--git-known-hosts PATH` | `known_hosts` file for your Git SSH servers. |
 | `--boot-timeout SECONDS` | Timeout for each guest readiness check. Defaults to `120`. |
 | `--no-hook` | Skip the project's `.rox.sh` and the project image. |
+| `--local` | Copy this checkout into the guest as it is: its HEAD, commits the remote doesn't have, and uncommitted and untracked files. Gitignored files stay behind. The guest still clones from the remote first, so `origin` works for pushing, and the branch tracks the remote branch once it exists there. `.rox.json` is read from the working tree, `.rox.sh` runs at boot on the copied files, and no project image is used. Can't be combined with `--host`, `--project` or `--no-project`. |
 | `--no-prebuild` | Clone and run `.rox.sh` at boot instead of using a [project image](../../guides/project-images/). |
 | `--rebuild` | Rebuild the project image before launching. |
 | `--open-shell` | Open the guest's own Rex session in the Rex app on this machine, like `rox open`. Without a Rex app here, open a Guest tab running `rox shell` in the current Rex session instead. Requires a Rex terminal. |
@@ -46,7 +47,7 @@ Clone a project into the running guest `NAME`, run its `.rox.sh`, and create a R
 rox add NAME [options] [-- COMMAND [ARG ...]]
 ```
 
-It accepts `-S`/`--host`, `--config`, `--cwd`, `--project`, `--remote`, `--repo`, `--branch`, `--git-key`, `--git-known-hosts`, `--no-hook`, and `--open-shell`, which work as they do for `rox up`. A project is required. Project images don't apply, so `.rox.sh` always runs at boot. If cloning or the hook fails, the project is marked failed and the guest stays ready.
+It accepts `-S`/`--host`, `--config`, `--cwd`, `--project`, `--remote`, `--repo`, `--branch`, `--git-key`, `--git-known-hosts`, `--no-hook`, `--local`, and `--open-shell`, which work as they do for `rox up`. A project is required. Project images don't apply, so `.rox.sh` always runs at boot. If cloning or the hook fails, the project is marked failed and the guest stays ready.
 
 ## `rox ls`
 

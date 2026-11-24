@@ -72,6 +72,11 @@ case "$stage" in
                 grep -qxF -- "$line" "$HOME/.ssh/known_hosts" || printf '%s\n' "$line" >>"$HOME/.ssh/known_hosts"
             done <"$known_hosts"
         fi
+        if [[ ${5:-} == local ]]; then
+            # The launcher sends its own commits and files next, so the branch needn't be on the remote yet.
+            git -c credential.helper= clone --quiet --no-checkout -- "$url" "$workspace" </dev/null
+            exit 0
+        fi
         if [[ ! -d $workspace/.git ]]; then
             git -c credential.helper= clone --branch "$branch" -- "$url" "$workspace" </dev/null
             exit 0
@@ -88,6 +93,32 @@ case "$stage" in
             git branch --quiet --set-upstream-to="origin/$branch"
         fi
         printf 'Checkout is at %s (%s)\n' "$(git rev-parse --short HEAD)" "$branch" >&2
+        ;;
+    local)
+        # Check out the launcher's HEAD, then lay its uncommitted files over it, as rox up --local sent them.
+        workspace=$1
+        payload=$2
+        branch=$3
+        head=$4
+        cd "$workspace"
+        if [[ -f $payload/commits.bundle ]]; then
+            git fetch --quiet --no-tags "$payload/commits.bundle" HEAD </dev/null
+        fi
+        git checkout --quiet --force -B "$branch" "$head"
+        if git rev-parse --verify --quiet "refs/remotes/origin/$branch" >/dev/null; then
+            git branch --quiet --set-upstream-to="origin/$branch"
+        fi
+        if [[ -f $payload/deleted ]]; then
+            while IFS= read -r -d '' path; do
+                rm -f -- "$path"
+            done <"$payload/deleted"
+        fi
+        if [[ -f $payload/files.tar ]]; then
+            tar -xf "$payload/files.tar"
+        fi
+        rm -rf -- "$payload"
+        printf 'Checkout is at %s (%s) with the launcher'\''s uncommitted changes\n' \
+            "$(git rev-parse --short HEAD)" "$branch" >&2
         ;;
     setup)
         cd "$1"

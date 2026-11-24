@@ -105,7 +105,7 @@ The commands update `git_keys` in `${XDG_CONFIG_HOME:-$HOME/.config}/rox/config.
 
 - `git_keys` is a list of host-side SSH private key paths. Prefer read-only deploy keys. Without `git_keys`, Rox uses your default SSH keys in `~/.ssh`, the ones `git clone` would use. Set `"git_keys": []` to clone with no key. Repeat `--git-key PATH` to supply a different list for one launch. Encrypted keys can prompt for a passphrase on the host.
 - `git_known_hosts` or `--git-known-hosts PATH` supplies verified host keys for your Git servers. When omitted, Rox looks up the matching host and port in the launch machine's `~/.ssh/known_hosts`. Guest SSH still verifies the server's key.
-- The tool uses the current branch's upstream remote and branch when configured. Otherwise it uses `origin` and the current branch name. Use `--remote NAME` or `--repo URL` to override the remote and `--branch NAME` to choose an existing remote branch. The checkout contains the remote branch tip. Push local commits first if you need them in the guest.
+- The tool uses the current branch's upstream remote and branch when configured. Otherwise it uses `origin` and the current branch name. Use `--remote NAME` or `--repo URL` to override the remote and `--branch NAME` to choose an existing remote branch. The checkout contains the remote branch tip. Push local commits first if you need them in the guest, or pass `--local` to copy the checkout as it is: its unpushed commits and its uncommitted and untracked files, but not gitignored ones. With `--local`, the branch doesn't need to be on the remote yet, `.rox.json` is read from the working tree, and `.rox.sh` runs at boot instead of from a project image.
 
 For an HTTPS remote that requires authentication, supply its SSH clone URL.
 

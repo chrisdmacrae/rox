@@ -2857,6 +2857,104 @@ class WorkspaceTests(unittest.TestCase):
                          "other ssh-ed25519 BBBB\ngithub.com ssh-ed25519 AAAA\n")
 
 
+    def test_local_copies_unpushed_commits_and_uncommitted_files_into_the_clone(self):
+        def git(cwd, *args):
+            return subprocess.run(["git", "-C", str(cwd), "-c", "user.name=t", "-c", "user.email=t@example.test",
+                                   *args], check=True, capture_output=True, text=True).stdout.strip()
+
+        remote = self.root / "remote.git"
+        git(self.root, "init", "--quiet", "--bare", "--initial-branch=main", str(remote))
+        launcher = self.root / "launcher"
+        git(self.root, "clone", "--quiet", str(remote), str(launcher))
+        (launcher / "a.txt").write_text("one\n")
+        (launcher / "gone.txt").write_text("bye\n")
+        (launcher / ".gitignore").write_text("secret.env\n")
+        git(launcher, "add", ".")
+        git(launcher, "commit", "--quiet", "-m", "base")
+        git(launcher, "push", "--quiet", "origin", "main")
+        git(launcher, "checkout", "--quiet", "-b", "feature")
+        (launcher / "b.txt").write_text("unpushed\n")
+        git(launcher, "add", "b.txt")
+        git(launcher, "commit", "--quiet", "-m", "unpushed")
+        (launcher / "a.txt").write_text("edited\n")
+        (launcher / "c.txt").write_text("staged\n")
+        git(launcher, "add", "c.txt")
+        (launcher / "new dir").mkdir()
+        (launcher / "new dir" / "e.txt").write_text("untracked\n")
+        (launcher / "link").symlink_to("a.txt")
+        (launcher / "gone.txt").unlink()
+        (launcher / "secret.env").write_text("TOKEN=1\n")
+
+        def guest_checkout(name):
+            workspace = self.root / "guest" / "projects" / name
+            workspace.parent.mkdir(parents=True, exist_ok=True)
+            # What the clone stage does with "local", but over a path, which it doesn't allow.
+            git(self.root, "clone", "--quiet", "--no-checkout", str(remote), str(workspace))
+            return workspace
+
+        printed = io.StringIO()
+        locally = lambda guest, argv, agent=None, tty=False: ["sh", "-c", shlex.join(argv)]
+        with patch.object(rox, "remote_command", side_effect=locally), contextlib.redirect_stdout(printed), \
+                contextlib.redirect_stderr(io.StringIO()):
+            workspace = guest_checkout("first")
+            rox.send_local(None, str(workspace), launcher, "feature")
+            self.assertEqual(git(workspace, "rev-parse", "HEAD"), git(launcher, "rev-parse", "HEAD"))
+            self.assertEqual(git(workspace, "symbolic-ref", "--short", "HEAD"), "feature")
+            self.assertEqual((workspace / "a.txt").read_text(), "edited\n")
+            self.assertEqual((workspace / "b.txt").read_text(), "unpushed\n")
+            self.assertEqual((workspace / "c.txt").read_text(), "staged\n")
+            self.assertEqual((workspace / "new dir" / "e.txt").read_text(), "untracked\n")
+            self.assertEqual(os.readlink(workspace / "link"), "a.txt")
+            self.assertFalse((workspace / "gone.txt").exists())
+            self.assertFalse((workspace / "secret.env").exists())
+            self.assertEqual(sorted(path.name for path in workspace.parent.iterdir()), ["first"])
+            self.assertIn("Copying 1 unpushed commit, 4 changed files and 1 deletion", printed.getvalue())
+
+            # Once the branch is on the remote, only newer commits travel and the branch tracks the remote's.
+            git(launcher, "push", "--quiet", "origin", "feature")
+            git(launcher, "commit", "--quiet", "-am", "after push")
+            workspace = guest_checkout("second")
+            rox.send_local(None, str(workspace), launcher, "feature")
+            self.assertEqual(git(workspace, "rev-parse", "HEAD"), git(launcher, "rev-parse", "HEAD"))
+            self.assertEqual(git(workspace, "rev-parse", "--abbrev-ref", "feature@{upstream}"), "origin/feature")
+            self.assertIn("Copying 1 unpushed commit, 2 changed files and 0 deletions", printed.getvalue())
+
+            # A clean checkout that matches the remote sends nothing but still checks out its HEAD.
+            git(launcher, "add", "-A")
+            git(launcher, "commit", "--quiet", "-m", "all")
+            git(launcher, "push", "--quiet", "origin", "feature")
+            workspace = guest_checkout("third")
+            rox.send_local(None, str(workspace), launcher, "feature")
+            self.assertEqual(git(workspace, "rev-parse", "HEAD"), git(launcher, "rev-parse", "HEAD"))
+            self.assertIn("Copying 0 unpushed commits, 0 changed files and 0 deletions", printed.getvalue())
+
+    def test_local_launches_clone_without_a_checkout_and_skip_the_project_image(self):
+        repo = self.make_repo()
+        subprocess.run(["git", "-C", str(repo), "-c", "user.name=t", "-c", "user.email=t@example.test",
+                        "commit", "--quiet", "--allow-empty", "-m", "start"], check=True)
+        (repo.parent / ".rox.json").write_text('{"backend": "container"}\n')
+        with self.fake_guests() as record, contextlib.redirect_stdout(io.StringIO()), \
+                patch.object(rox, "send_local") as send:
+            rox.main(["up", "--local", "--no-agents", "--cwd", str(repo)])
+            [guest] = self.guests()
+            rox.main(["add", guest.name, "--local", "--no-hook", "--cwd", str(repo)])
+        rox.read_branch.assert_not_called()
+        record["prepare"].assert_not_called()
+        clones = [stage for stage in record["stages"] if stage[0] == "clone"]
+        self.assertEqual([clone[-1] for clone in clones], ["local", "local"])
+        base = f"/home/guest/.rox/{guest.name}/projects"
+        self.assertEqual([call.args[1:] for call in send.call_args_list], [
+            (f"{base}/sample-project", repo.parent, "published-feature"),
+            (f"{base}/sample-project-2", repo.parent, "published-feature"),
+        ])
+        for extra, message in ((["-S", "box"], "--host"), (["--no-project"], "--no-project"),
+                               (["--project", "x", "--repo", "https://git.example.test/x.git", "--branch", "main"],
+                                "--project")):
+            with self.subTest(extra=extra), self.assertRaisesRegex(rox.Error, message):
+                rox.main(["up", "container", "--local", "--cwd", str(repo), *extra])
+        with self.assertRaisesRegex(rox.Error, "not inside one"):
+            rox.main(["up", "container", "--local", "--cwd", str(self.root / "home")])
+
     def test_kcpassword_matches_macos_auto_login_encoding(self):
         # "admin" is what Cirrus Labs' images ship, so this is the /etc/kcpassword they boot with.
         self.assertEqual(rox.kcpassword("admin").hex(), "1ced3f4abcbcddeaa3b91f7d")
