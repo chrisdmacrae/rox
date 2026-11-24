@@ -196,7 +196,9 @@ Commit a `.rox.json` at the root of the branch to set the project's backend and 
 
 With a `backend` there, plain `rox up` picks it. The [Project settings guide](docs/src/content/docs/guides/project-settings.mdx) covers the full format. Each backend section accepts `image`, `cpus`, `memory`, and `prebuild`. Machine-specific settings, such as `engine`, the VM `user`, `identity` and `host_key`, and Git keys, stay in the launcher's config, and Rox rejects them in `.rox.json`.
 
-For a one-off guest, override any of these at launch. Command-line options win over `.rox.json`, which wins over the launcher config.
+To change these for your own launches without committing anything, put the same settings in a gitignored `.rox.local.json` at the root of your checkout. It overrides `.rox.json`, and with `--host` it's sent along from the machine you run `rox up` on.
+
+For a one-off guest, override any of these at launch. Command-line options win over `.rox.local.json`, which wins over `.rox.json`, which wins over the launcher config.
 
 ```sh
 rox up linux --image rox-ubuntu-cuda --cpus 8 --memory 16G

@@ -57,7 +57,8 @@ Each setting comes from the last place that sets it:
 1. Built-in defaults
 2. The launcher's [rox config](../../reference/configuration/)
 3. The branch's `.rox.json`
-4. Command-line options: `--image`, `--cpus`, `--memory`, and `--no-prebuild`
+4. The checkout's `.rox.local.json`, described [below](#settings-for-your-checkout-only)
+5. Command-line options: `--image`, `--cpus`, `--memory`, and `--no-prebuild`
 
 Settings merge one key at a time, so `.rox.json` only replaces the keys it sets. For example, suppose the launcher config has:
 
@@ -72,6 +73,16 @@ and the branch's `.rox.json` has:
 ```
 
 Then `rox up container` starts a Podman container with 2 CPUs and 8 GB, and `rox up container --memory 16G` gives that one launch 16 GB.
+
+## Settings for your checkout only
+
+To change the guest for your own launches without committing anything, put a `.rox.local.json` at the root of your checkout and add it to `.gitignore`. It takes the same keys as `.rox.json` and overrides it:
+
+```json title=".rox.local.json"
+{ "container": { "memory": "8G" } }
+```
+
+Unlike `.rox.json`, Rox reads this file from your working tree, not the branch. It applies when you run `rox up` inside the checkout, and not when you name another project with `--project`. With `--host`, Rox reads it on the machine where you run `rox up` and sends it to the host that starts the guest, so you don't need a copy there.
 
 ## One-off guests
 

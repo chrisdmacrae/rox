@@ -1240,9 +1240,11 @@ class WorkspaceTests(unittest.TestCase):
         with self.assertRaisesRegex(rox.Error, "size such as 4G or 512M for --memory"):
             rox.main(["up", "container", "--memory", "4096", "--cwd", str(cwd), "--config", str(config)])
 
-    def launch_record(self, argv, launcher=None, project=None):
+    def launch_record(self, argv, launcher=None, project=None, local=None):
         """Run rox up until the guest would boot, and return its saved record."""
         cwd = self.make_repo()
+        if local is not None:
+            (cwd.parent / ".rox.local.json").write_text(json.dumps(local))
         config = self.root / "config.json"
         identity, host_key = self.root / "vm_key", self.root / "vm_host_key.pub"
         identity.touch()
@@ -1288,6 +1290,39 @@ class WorkspaceTests(unittest.TestCase):
             project={"backend": "container", "linux": {"image": "rox-ubuntu-small", "cpus": 2}})
         self.assertEqual((record["backend"], record["image"], record["cpus"], record["memory"]),
                          ("linux", "rox-ubuntu-gpu", 8, "16G"))
+
+    def test_local_config_overrides_the_branch_and_the_command_line_overrides_it(self):
+        record = self.launch_record([], project={"backend": "linux", "container": {"memory": "2G", "cpus": 2}},
+                                    local={"backend": "container", "container": {"memory": "8G"}},
+                                    launcher={"container": {"engine": "podman"}})
+        self.assertEqual((record["backend"], record["cpus"], record["memory"]), ("container", 2, "8G"))
+        shutil.rmtree(rox.state_root())
+        record = self.launch_record(["container", "--memory", "16G"], local={"container": {"memory": "8G"}},
+                                    launcher={"container": {"engine": "podman"}})
+        self.assertEqual(record["memory"], "16G")
+
+    def test_local_config_is_checked_and_sent_to_a_remote_launch(self):
+        cwd = self.make_repo()
+        local = cwd.parent / ".rox.local.json"
+        local.write_text(json.dumps({"container": {"engine": "docker"}}))
+        with self.assertRaisesRegex(rox.Error, r"only be set in the rox config.*\.rox\.local\.json"):
+            rox.main(["up", "container", "-S", "mini", "--cwd", str(cwd)])
+        local.write_text(json.dumps({"container": {"memory": "8G"}}))
+        with patch.object(rox, "dispatch", return_value="") as dispatched, \
+                contextlib.redirect_stdout(io.StringIO()):
+            rox.main(["up", "container", "-S", "mini", "--cwd", str(cwd)])
+        launch = dispatched.call_args.args[2]
+        self.assertIn('--local-settings={"container": {"memory": "8G"}}', launch)
+        # The remote end takes the settings from the option, not from a checkout of its own.
+        args = rox.argparse.Namespace(local_settings='{"container": {"memory": "8G"}}', project="p",
+                                      cwd=self.root)
+        self.assertEqual(rox.local_project_settings(args), {"container": {"memory": "8G"}})
+        # A launch that names another project leaves the checkout's settings alone.
+        with patch.object(rox, "dispatch", return_value="") as dispatched, \
+                contextlib.redirect_stdout(io.StringIO()):
+            rox.main(["up", "container", "-S", "mini", "--cwd", str(cwd), "--project=other",
+                      "--repo=https://git.example.test/other.git", "--branch=main"])
+        self.assertFalse(any(arg.startswith("--local-settings") for arg in dispatched.call_args.args[2]))
 
     def test_up_needs_a_backend_from_the_command_line_or_project_config(self):
         cwd = self.make_repo()

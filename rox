@@ -42,6 +42,8 @@ ENGINES = ("container", "docker", "podman")
 NAME_PATTERN = r"rv-[a-z0-9-]{1,24}-[a-f0-9]{12}"
 # Per-project launch settings, read from the launched branch like .rox.sh.
 PROJECT_CONFIG = ".rox.json"
+# Settings for this checkout only, kept out of Git. They override the branch's .rox.json.
+LOCAL_CONFIG = ".rox.local.json"
 PROJECT_KEYS = {backend: {"image", "cpus", "memory", "prebuild"} for backend in BACKENDS}
 # These describe the launch machine, so only its own rox config may set them.
 LAUNCHER_KEYS = {"engine", "user", "identity", "host_key", "git_keys", "git_known_hosts", "tailscale", "agents",
@@ -1200,26 +1202,58 @@ def project_settings(mirror, commit):
         settings = json.loads(output(["git", "-C", str(mirror), "show", f"{commit}:{PROJECT_CONFIG}"]))
     except ValueError as error:
         raise Error(f"{PROJECT_CONFIG} on the branch is not valid JSON: {error}") from None
+    return checked_project_settings(settings, PROJECT_CONFIG)
+
+
+def local_project_settings(args):
+    """The checkout's .rox.local.json, when rox up launches the checkout it runs in.
+
+    A launch on another host gets them from the machine that ran rox up, as --local-settings.
+    """
+    if args.local_settings is not None:
+        try:
+            settings = json.loads(args.local_settings)
+        except ValueError as error:
+            raise Error(f"--local-settings is not valid JSON: {error}") from None
+        return checked_project_settings(settings, LOCAL_CONFIG)
+    if args.project is not None or getattr(args, "no_project", False) or not in_checkout(args.cwd):
+        return {}
+    root = output(["git", "-C", str(args.cwd), "rev-parse", "--show-toplevel"]).strip()
+    path = Path(root) / LOCAL_CONFIG
+    if not path.is_file():
+        return {}
+    try:
+        settings = json.loads(path.read_text())
+    except ValueError as error:
+        raise Error(f"{path} is not valid JSON: {error}") from None
+    settings = checked_project_settings(settings, LOCAL_CONFIG)
+    if settings:
+        print(f"Using settings from {path}", flush=True)
+    return settings
+
+
+def checked_project_settings(settings, where):
+    """Check .rox.json or .rox.local.json settings, named by where in errors."""
     if not isinstance(settings, dict):
-        raise Error(f"Expected a JSON object in {PROJECT_CONFIG}")
+        raise Error(f"Expected a JSON object in {where}")
     for key, value in settings.items():
         if key == "backend":
             if value not in BACKENDS:
-                raise Error(f"Expected backend to be one of {', '.join(BACKENDS)} in {PROJECT_CONFIG}")
+                raise Error(f"Expected backend to be one of {', '.join(BACKENDS)} in {where}")
         elif key in PROJECT_KEYS:
             if not isinstance(value, dict):
-                raise Error(f"Expected an object for {key} in {PROJECT_CONFIG}")
+                raise Error(f"Expected an object for {key} in {where}")
             for setting in value:
                 if setting in LAUNCHER_KEYS:
                     raise Error(f"{key}.{setting} can only be set in the rox config on the launch machine, "
-                                f"not in {PROJECT_CONFIG}")
+                                f"not in {where}")
                 if setting not in PROJECT_KEYS[key]:
                     allowed = ", ".join(sorted(PROJECT_KEYS[key]))
-                    raise Error(f"Unknown setting {key}.{setting} in {PROJECT_CONFIG}. Use {allowed}")
+                    raise Error(f"Unknown setting {key}.{setting} in {where}. Use {allowed}")
         elif key in LAUNCHER_KEYS:
-            raise Error(f"{key} can only be set in the rox config on the launch machine, not in {PROJECT_CONFIG}")
+            raise Error(f"{key} can only be set in the rox config on the launch machine, not in {where}")
         else:
-            raise Error(f"Unknown setting {key} in {PROJECT_CONFIG}. Use backend, {', '.join(BACKENDS)}")
+            raise Error(f"Unknown setting {key} in {where}. Use backend, {', '.join(BACKENDS)}")
     return settings
 
 
@@ -2792,10 +2826,12 @@ def up(args, command):
     if args.host is not None and not args.host.strip():
         raise Error("--host needs a Rex host label or address")
     source = resolve_project(args)
+    local = local_project_settings(args) if source else {}
     if args.host is not None:
         provisioned = dispatch(args, source[0] if source else "host",
                                ["up", *([args.backend] if args.backend else []), *project_options(source),
-                                f"--boot-timeout={args.boot_timeout}"], command)
+                                f"--boot-timeout={args.boot_timeout}",
+                                *([f"--local-settings={json.dumps(local)}"] if local else [])], command)
         register_remote_guest(provisioned, args.host)
         open_remote_guest(provisioned, args.host)
         return
@@ -2812,20 +2848,23 @@ def up(args, command):
         require(["git"])
         fetched = read_branch(source[1], source[2], keys, known_hosts)
     project_config = fetched.settings if fetched else {}
-    backend = args.backend or project_config.get("backend")
+    backend = args.backend or local.get("backend") or project_config.get("backend")
     if not backend:
         raise Error(f"Choose a backend with rox up container, linux or macos, or set \"backend\" in {PROJECT_CONFIG}")
     if not args.backend:
-        print(f"Using the {backend} backend from {PROJECT_CONFIG}", flush=True)
+        print(f"Using the {backend} backend from {LOCAL_CONFIG if local.get('backend') else PROJECT_CONFIG}",
+              flush=True)
     launcher_settings = config.get(backend, {})
     if not isinstance(launcher_settings, dict):
         raise Error(f"Expected an object for {backend} in {config_path}")
     project_section = project_config.get(backend, {})
-    # The project's settings override the launcher's, and command-line options override both.
-    settings = {**launcher_settings, **project_section}
+    local_section = local.get(backend, {})
+    # The branch's settings override the launcher's, the checkout's override the branch's, and
+    # command-line options override them all.
+    settings = {**launcher_settings, **project_section, **local_section}
 
     def origin(key):
-        return PROJECT_CONFIG if key in project_section else config_path
+        return LOCAL_CONFIG if key in local_section else PROJECT_CONFIG if key in project_section else config_path
 
     if args.engine and backend != "container":
         raise Error("--engine applies to the container backend")
@@ -3795,6 +3834,8 @@ def main(argv):
     start.add_argument("--image", help="container image or prepared Tart template")
     start.add_argument("--cpus", type=positive_int, help="CPUs for the container or VM")
     start.add_argument("--memory", help="memory for the container or VM, such as 8G or 512M")
+    # A launch on another host carries the checkout's .rox.local.json here.
+    start.add_argument("--local-settings", help=argparse.SUPPRESS)
     start.add_argument("--engine", choices=ENGINES,
                        help="container engine; defaults to container on Apple Silicon Macs, otherwise docker")
     start.add_argument("--boot-timeout", type=positive_int, default=120, help="seconds per guest readiness check")
