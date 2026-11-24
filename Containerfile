@@ -2,7 +2,7 @@ FROM docker.io/library/debian:bookworm-slim
 
 # Rox rebuilds rox:linux when this differs from the image's label.
 # Bump it whenever this file or guest/container-entrypoint.sh changes.
-LABEL io.rox.toolkit="3"
+LABEL io.rox.toolkit="4"
 
 ARG REX_CHANNEL=preview
 RUN apt-get update \
@@ -22,7 +22,20 @@ RUN --mount=type=secret,id=rex_binary \
     fi \
     && rex version
 
-RUN useradd --create-home --shell /bin/bash workspace && passwd -d workspace
+# Docker from Docker's own packages, for docker compose v2. Rox starts the daemon only in
+# containers that run in their own VM (Apple's container), where it can't reach the host.
+RUN set -eu; \
+    install -m 0755 -d /etc/apt/keyrings; \
+    curl -fsSL https://download.docker.com/linux/debian/gpg -o /etc/apt/keyrings/docker.asc; \
+    . /etc/os-release; \
+    printf 'deb [arch=%s signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/debian %s stable\n' \
+        "$(dpkg --print-architecture)" "$VERSION_CODENAME" > /etc/apt/sources.list.d/docker.list; \
+    apt-get update; \
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        containerd.io docker-buildx-plugin docker-ce docker-ce-cli docker-compose-plugin iptables; \
+    rm -rf /var/lib/apt/lists/*
+
+RUN useradd --create-home --shell /bin/bash --groups docker workspace && passwd -d workspace
 COPY guest/container-entrypoint.sh /usr/local/bin/rox-container
 RUN chmod 0755 /usr/local/bin/rox-container
 
