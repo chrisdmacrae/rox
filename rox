@@ -1306,8 +1306,9 @@ def memory_megabytes(size):
 
 
 def launch_apple_container(guest, public_key, boot_timeout):
+    # Each Apple container is its own VM, so the workspace user gets passwordless sudo there.
     output(["container", "run", "--detach", "--name", guest.name, *container_resources(guest),
-            "--env", f"ROX_SSH_PUBLIC_KEY={public_key}", guest.image])
+            "--env", f"ROX_SSH_PUBLIC_KEY={public_key}", "--env", "ROX_SUDO=1", guest.image])
     guest.container_id = guest.name
     guest.save()
     key = wait_for(

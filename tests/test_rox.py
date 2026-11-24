@@ -338,6 +338,8 @@ class WorkspaceTests(unittest.TestCase):
         launch = output.call_args_list[0].args[0]
         self.assertEqual(launch[:4], ["docker", "run", "-d", "--pull=never"])
         self.assertEqual(launch[-1], "rox:linux")
+        # Docker shares the host kernel, so its guests get no sudo.
+        self.assertNotIn("ROX_SUDO=1", launch)
         # The engine brings the container back after it restarts, unless rox stop stopped it.
         self.assertIn("--restart unless-stopped", " ".join(launch))
 
@@ -1209,6 +1211,7 @@ class WorkspaceTests(unittest.TestCase):
         self.assertIn("--cpus=2", launch)
         self.assertIn("--memory=4G", launch)
         self.assertNotIn("--publish", launch)
+        self.assertIn("ROX_SUDO=1", launch)
         self.assertEqual(launch[-1], "rox:linux")
         self.assertEqual(output.call_args_list[1].args[0],
                          ["container", "exec", guest.name, "cat", "/etc/ssh/ssh_host_ed25519_key.pub"])

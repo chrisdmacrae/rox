@@ -2,12 +2,12 @@ FROM docker.io/library/debian:bookworm-slim
 
 # Rox rebuilds rox:linux when this differs from the image's label.
 # Bump it whenever this file or guest/container-entrypoint.sh changes.
-LABEL io.rox.toolkit="2"
+LABEL io.rox.toolkit="3"
 
 ARG REX_CHANNEL=preview
 RUN apt-get update \
     && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-       bash ca-certificates curl git libpam0g openssh-client openssh-server tini xz-utils \
+       bash ca-certificates curl git libpam0g openssh-client openssh-server sudo tini xz-utils \
     && rm -rf /var/lib/apt/lists/* /etc/ssh/ssh_host_*
 
 # The optional secret is an official, architecture-matched Linux rex executable.
