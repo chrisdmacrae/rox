@@ -2345,6 +2345,8 @@ def launcher_hosts():
             continue
         hosts.append((label, endpoints))
         seen.update(endpoints)
+        # A host may give this machine's tailnet name as https://NAME.
+        seen.update(re.sub(r"^https://|/$", "", endpoint) for endpoint in endpoints)
     try:
         status = json.loads(output(["rex", "--autostart=false", "--timeout", "5s", "server", "status", "--json"],
                                    timeout=10))
@@ -2366,6 +2368,9 @@ def share_launcher_hosts(guest):
         wanted = launcher_hosts()
         if not wanted:
             return
+        # Rex in the guest reads hosts from its home, which defaults to a server the guest doesn't
+        # run. Make the guest's own server the home, for rox and for every terminal in the guest.
+        output(remote_command(guest, guest_rex(guest, "home", "set", f"unix://{guest.guest_socket}")), timeout=20)
         listing = json.loads(output(remote_command(guest, guest_rex(guest, "hosts", "list", "--json")), timeout=20))
         have = {entry.get("host", {}).get("label", "").lower() for entry in listing.get("hosts", [])}
         added = []

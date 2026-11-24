@@ -1666,9 +1666,10 @@ class WorkspaceTests(unittest.TestCase):
             {"host": {"label": "local", "endpoints": ["unix:///tmp/local.sock"]}},
             {"host": {"label": "studio", "endpoints": ["studio.tail.ts.net"]}},
         ]}
+        mini_listing = {"hosts": [{"host": {"label": "mini", "endpoints": ["https://launcher-rex.tail.ts.net"]}}]}
         status = {"tailscale": {"state": "running", "dns_name": "launcher-rex.tail.ts.net."}}
         in_guest = {"hosts": [{"host": {"label": "Studio", "endpoints": ["studio.tail.ts.net"]}}]}
-        added = []
+        added, homes = [], []
 
         def fake_output(argv, **kwargs):
             if argv[:3] == ["rex", "hosts", "list"]:
@@ -1676,6 +1677,9 @@ class WorkspaceTests(unittest.TestCase):
             if "status" in argv:
                 return json.dumps(status)
             remote = shlex.split(argv[-1])
+            if "home" in remote:
+                homes.append(remote[remote.index("set") + 1])
+                return ""
             if "add" in remote:
                 added.append(remote[remote.index("add") + 1:])
                 return ""
@@ -1689,6 +1693,16 @@ class WorkspaceTests(unittest.TestCase):
             REAL_SHARE_LAUNCHER_HOSTS(guest)
         self.assertEqual(added, [["air", "air.tail.ts.net"], ["mini.tail.ts.net", "mini.tail.ts.net"],
                                  ["launcher", "launcher-rex.tail.ts.net"]])
+        self.assertEqual(homes, [f"unix://{guest.guest_socket}"])
+        # A host that names this machine as https://NAME already covers it.
+        launcher = mini_listing
+        added.clear()
+        with (
+            patch.object(rox, "output", side_effect=fake_output),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            REAL_SHARE_LAUNCHER_HOSTS(guest)
+        self.assertEqual(added, [["mini", "https://launcher-rex.tail.ts.net"]])
 
     def test_down_without_a_name_removes_the_projects_only_workspace(self):
         self.save_guest("rv-other-000011112222", "other project")
