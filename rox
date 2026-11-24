@@ -4397,7 +4397,240 @@ def install_skill(agents, directory, force):
             shutil.rmtree(staging, ignore_errors=True)
         label = {"claude": "Claude Code", "codex": "Codex"}.get(agent, "")
         print(f"Installed the rox skill ({version}){f' for {label}' if label else ''} at {destination}")
-    print("Start a new agent session to load it. Run rox skill install again after upgrading rox.")
+    print("Start a new agent session to load it. rox self-update keeps it up to date.")
+
+
+RELEASES = "https://github.com/chrisdmacrae/rox/releases"
+RELEASE_PATTERN = r"v[0-9]+\.[0-9]+\.[0-9]+"
+UPDATE_CHECK_TTL = 6 * 3600
+UPDATE_MODES = ("auto", "notify", "off")
+INSTALL_COMMAND = (f"curl -fsSL {RELEASES}/latest/download/rox.tar.gz -o /tmp/rox.tar.gz && rm -rf {{dir}} "
+                   "&& mkdir -p {dir} && tar -xzf /tmp/rox.tar.gz -C {dir} --strip-components=1")
+
+
+def installed_version():
+    """The release this rox came from, or "" for a checkout or any other copy without a VERSION file."""
+    try:
+        version = (HERE / "VERSION").read_text().strip()
+    except OSError:
+        return ""
+    return version if re.fullmatch(RELEASE_PATTERN, version) else ""
+
+
+def version_key(version):
+    return tuple(int(part) for part in version.lstrip("v").split("."))
+
+
+def latest_release():
+    """The tag of the latest release, read from where GitHub's latest release page redirects."""
+    request = urllib.request.Request(f"{RELEASES}/latest", headers={"User-Agent": "rox"})
+    with urllib.request.urlopen(request, timeout=5) as response:
+        final = response.geturl()
+    match = re.search(rf"/releases/tag/({RELEASE_PATTERN})$", urlsplit(final).path)
+    if not match:
+        raise ValueError(f"unexpected latest release page {final[:80]}")
+    return match[1]
+
+
+def newer_release(refresh=False, now=None):
+    """(the newer release or "", whether GitHub was asked just now). Asked at most every few hours."""
+    current = installed_version()
+    if not current:
+        return "", False
+    now = time.time() if now is None else now
+    path = state_root() / "update-check.json"
+    try:
+        cache = json.loads(path.read_text())
+    except (FileNotFoundError, ValueError):
+        cache = {}
+    cache = cache if isinstance(cache, dict) else {}
+    latest, checked = cache.get("latest"), cache.get("checked")
+    latest = latest if isinstance(latest, str) and re.fullmatch(RELEASE_PATTERN, latest) else ""
+    fresh = isinstance(checked, (int, float)) and 0 <= now - checked < UPDATE_CHECK_TTL
+    asked = refresh or not fresh
+    if asked:
+        try:
+            latest = latest_release()
+        finally:
+            # A failed check waits for the next one too, so being offline doesn't slow every command.
+            write_private(path, json.dumps({"latest": latest or None, "checked": now}, indent=2) + "\n")
+    return (latest if latest and version_key(latest) > version_key(current) else ""), asked
+
+
+def update_mode():
+    """auto installs new releases before a command, notify only says one is out, and off does neither."""
+    mode = os.environ.get("ROX_UPDATES")
+    where = "ROX_UPDATES"
+    if not mode:
+        path = config_location(None)
+        try:
+            mode = config_for(path).get("updates", "auto")
+        except (OSError, ValueError, Error):
+            return "auto"
+        where = f"updates in {path}"
+    if mode not in UPDATE_MODES:
+        raise Error(f"Expected {', '.join(UPDATE_MODES)} for {where}")
+    return mode
+
+
+def update_blocker():
+    """Why rox can't replace its own install, or "" when it can."""
+    if (HERE / ".git").exists():
+        return f"{HERE} is a Git checkout. Pull it to update"
+    for path in (HERE, HERE.parent):
+        if not os.access(path, os.W_OK):
+            return f"rox can't write to {path}. Reinstall it with: {INSTALL_COMMAND.format(dir=shlex.quote(str(HERE)))}"
+    return ""
+
+
+def download(url, path):
+    request = urllib.request.Request(url, headers={"User-Agent": "rox"})
+    with urllib.request.urlopen(request, timeout=60) as response, path.open("wb") as file:
+        shutil.copyfileobj(response, file)
+
+
+def extract_release(archive, destination):
+    with tarfile.open(archive) as tar:
+        if hasattr(tarfile, "data_filter"):
+            tar.extractall(destination, filter="data")
+            return
+        for member in tar.getmembers():
+            parts = PurePosixPath(member.name).parts
+            if member.name.startswith("/") or ".." in parts or not (member.isfile() or member.isdir()):
+                raise Error(f"The release archive holds an unsafe entry {member.name}")
+        tar.extractall(destination)
+
+
+def install_release(tag):
+    """Download the release, check it against its published SHA-256, and swap it in for this install."""
+    staging = Path(tempfile.mkdtemp(prefix=f".{HERE.name}-update-", dir=HERE.parent))
+    try:
+        archive = staging / "rox.tar.gz"
+        download(f"{RELEASES}/download/{tag}/rox.tar.gz", archive)
+        download(f"{RELEASES}/download/{tag}/rox.tar.gz.sha256", staging / "rox.tar.gz.sha256")
+        expected = ((staging / "rox.tar.gz.sha256").read_text().split() or [""])[0].lower()
+        actual = hashlib.sha256(archive.read_bytes()).hexdigest()
+        if expected != actual:
+            raise Error(f"The {tag} download doesn't match its published SHA-256, so rox kept {installed_version()}")
+        extract_release(archive, staging / "new")
+        new = staging / "new" / "rox"
+        if not (new / "rox").is_file() or (new / "VERSION").read_text().strip() != tag:
+            raise Error(f"The {tag} archive isn't a rox release")
+        new.chmod(HERE.stat().st_mode & 0o7777)
+        # Swap whole folders, so files a release dropped go too and a failed swap leaves the old one.
+        HERE.rename(staging / "old")
+        try:
+            new.rename(HERE)
+        except OSError:
+            (staging / "old").rename(HERE)
+            raise
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
+
+
+def refresh_skills():
+    """Reinstall the rox skill for each agent that has it, from the rox now installed."""
+    agents = [agent for agent in SKILL_AGENTS
+              if not (agent_home(agent) / "skills" / "rox").is_symlink()
+              and is_rox_skill(agent_home(agent) / "skills" / "rox")]
+    if not agents:
+        return
+    # The new rox installs its own skill, in case how it does that changed.
+    result = run([sys.executable, str(HERE / "rox"), "skill", "install",
+                  *[option for agent in agents for option in ("--agent", agent)]], capture=True, check=False,
+                 env={**os.environ, "ROX_UPDATED": "1"})
+    if result.returncode:
+        print(f"rox: Could not update the rox skill: {result.stderr.strip()}. Run rox skill install",
+              file=sys.stderr, flush=True)
+    else:
+        names = " and ".join({"claude": "Claude Code", "codex": "Codex"}[agent] for agent in agents)
+        print(f"rox: Updated the rox skill for {names}. Start a new agent session to load it",
+              file=sys.stderr, flush=True)
+
+
+@contextmanager
+def update_lock(wait):
+    """Yield whether this process holds the update lock. Without wait, another update means False."""
+    path = state_root() / "update.lock"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX if wait else fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            yield False
+            return
+        yield True
+
+
+def update_to(tag):
+    """Install tag and refresh the skill. False when another rox already installed it."""
+    with update_lock(wait=True):
+        current = installed_version()
+        if current and version_key(current) >= version_key(tag):
+            return False
+        install_release(tag)
+    refresh_skills()
+    return True
+
+
+def auto_update(argv):
+    """Before a command, install a newer rox and rerun the command with it, or say one is out.
+
+    A failed check or download never stops the command.
+    """
+    if os.environ.get("ROX_UPDATED") or argv[:1] in (["self-update"], ["-h"], ["--help"], ["--version"]) \
+            or argv[:2] == ["service", "run"]:
+        return
+    current = installed_version()
+    if not current:
+        return
+    try:
+        mode = update_mode()
+        if mode == "off":
+            return
+        latest, asked = newer_release()
+    except (Error, OSError, ValueError) as error:
+        print(f"rox: Could not check for a newer rox ({error})", file=sys.stderr, flush=True)
+        return
+    if not latest:
+        return
+    blocker = update_blocker()
+    if mode == "notify" or blocker:
+        # Say so once per check, not before every command.
+        if asked:
+            print(f"rox: {latest} is out (this is {current}). "
+                  f"{blocker or 'Run rox self-update to install it'}.", file=sys.stderr, flush=True)
+        return
+    print(f"rox: Updating from {current} to {latest}", file=sys.stderr, flush=True)
+    try:
+        update_to(latest)
+    except (Error, OSError, ValueError, tarfile.TarError) as error:
+        print(f"rox: Could not update to {latest} ({error}). Continuing with {current}",
+              file=sys.stderr, flush=True)
+        return
+    os.environ["ROX_UPDATED"] = latest
+    os.execv(sys.executable, [sys.executable, str(HERE / "rox"), *argv])
+
+
+def self_update(check):
+    current = installed_version()
+    if not current:
+        raise Error(f"{HERE} has no VERSION file, so it isn't a release install. "
+                    f"Install a release with: {INSTALL_COMMAND.format(dir='~/.local/share/rox')}")
+    latest, _ = newer_release(refresh=True)
+    if not latest:
+        print(f"rox {current} is the latest release")
+        return
+    if check:
+        print(f"rox {latest} is out (this is {current}). Run rox self-update to install it")
+        return
+    if blocker := update_blocker():
+        raise Error(blocker)
+    print(f"Updating rox from {current} to {latest}", flush=True)
+    if update_to(latest):
+        print(f"Updated rox to {latest}")
+    else:
+        print(f"Another rox already updated to {installed_version()}")
 
 
 # Older releases asked to add each guest to the Rex app, and --no-app-host skipped that. rox
@@ -4424,6 +4657,7 @@ def positive_int(value):
 
 def main(argv):
     parser = argparse.ArgumentParser(description=__doc__, epilog="Pass -- COMMAND [ARG ...] to up or add to start a command in Rex.")
+    parser.add_argument("--version", action="version", version=f"rox {installed_version() or 'development'}")
     commands = parser.add_subparsers(dest="command", required=True)
     start = commands.add_parser("up", help="start and provision a new guest")
     start.add_argument("backend", nargs="?", choices=BACKENDS,
@@ -4580,6 +4814,8 @@ def main(argv):
                          help="agent to install for (repeatable); defaults to each one set up on this machine")
     install.add_argument("--dir", help="skills folder to install into instead, such as a project's .claude/skills")
     install.add_argument("--force", action="store_true", help="replace a folder named rox that isn't a rox skill")
+    updater = commands.add_parser("self-update", help="install the latest rox release and update the rox skill")
+    updater.add_argument("--check", action="store_true", help="only say whether a newer release is out")
     command = []
     if argv[:1] not in (["key"], ["skill"]) and "--" in argv:
         index = argv.index("--")
@@ -4647,6 +4883,8 @@ def main(argv):
         configure_agents(args)
     elif args.command == "config":
         edit_config(args.config)
+    elif args.command == "self-update":
+        self_update(args.check)
     elif args.command == "skill":
         if args.agent and args.dir:
             parser.error("choose --agent or --dir, not both")
@@ -4662,6 +4900,7 @@ def main(argv):
 
 if __name__ == "__main__":
     try:
+        auto_update(sys.argv[1:])
         main(sys.argv[1:])
     except (Error, OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as error:
         message = str(error)

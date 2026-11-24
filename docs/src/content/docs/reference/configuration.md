@@ -39,6 +39,7 @@ Rox reads `${XDG_CONFIG_HOME:-$HOME/.config}/rox/config.json` on the machine tha
 | `git_agent` | boolean | `true`, the default, keeps the Git keys forwarded into each guest for its whole life, so Git works there after the clone. `false` forwards them only while the guest clones. See [Private repositories](../../guides/private-repositories/). |
 | `git_known_hosts` | path | Verified host keys for your Git servers. If you leave it out, Rox copies the matching entries from `~/.ssh/known_hosts`. |
 | `tailscale` | object | Put each guest's Rex server on your tailnet so other devices can reach it. See [Reaching guests from other devices](../../guides/tailnet/). |
+| `updates` | string | `auto`, the default, installs new rox releases and updates the rox skill before a command. `notify` only says a release is out, and `off` stops checking. The `ROX_UPDATES` environment variable overrides it. Rox reads this from the default config file only. |
 | `agents` | object | Install Claude Code (`claude`) and Codex (`codex`) in new guests, with their credentials. Set it up with `rox config agents`. See [Agent CLIs in guests](../../guides/agent-clis/). |
 
 ### `tailscale`

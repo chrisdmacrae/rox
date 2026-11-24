@@ -50,7 +50,7 @@ Rox finds its guest scripts and Containerfile next to the real file in `~/.local
 
 ### Upgrade or pin a version
 
-Run the same command again to upgrade, then run `rox skill install` again if you use the skill. The installed version is in `~/.local/share/rox/VERSION`. To install a specific version, replace `latest/download` with `download/vX.Y.Z`. See [releases](https://github.com/chrisdmacrae/rox/releases) for the available versions.
+A release install keeps itself up to date: before a command, at most every six hours, rox asks GitHub for the latest release. When one is out, it downloads it, checks it against the release's `rox.tar.gz.sha256`, swaps it in, updates the rox skill for each agent that has it, and runs your command with the new version. If it can't write to its install folder, or it's a Git checkout, it says the release is out instead. Run `rox self-update` to update now, or `rox self-update --check` to only check. Set `"updates": "notify"` in the rox config to be told without installing, or `"off"` to stop checking. `ROX_UPDATES` overrides it for one command. You can also run the install command again to upgrade, then `rox skill install` to update the skill. The installed version is in `~/.local/share/rox/VERSION`. To install a specific version, replace `latest/download` with `download/vX.Y.Z`. See [releases](https://github.com/chrisdmacrae/rox/releases) for the available versions.
 
 Each release also includes `rox.tar.gz.sha256`. To check a download, keep the archive and run `shasum -a 256 -c rox.tar.gz.sha256` in the folder that holds both files.
 

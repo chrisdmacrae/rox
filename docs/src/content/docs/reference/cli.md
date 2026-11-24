@@ -209,9 +209,19 @@ Install [Claude Code or Codex](../../guides/agent-clis/) in new guests, signed i
 | `--mcp NAME` | Copy this MCP server into guests. It must run over the network. Repeat it for more. |
 | `--config PATH` | A different rox config file. |
 
+## `rox self-update`
+
+Install the latest rox release in place, then update the rox skill for each agent that has it. Rox checks GitHub for releases, downloads `rox.tar.gz`, checks it against `rox.tar.gz.sha256`, and swaps the whole install folder, so a failed update leaves the old one. It works on an install from a release archive, which has a `VERSION` file, and rox can write to. A Git checkout updates with `git pull`.
+
+Rox also does this on its own before a command, checking at most every six hours, and then runs the command with the new version. A failed check or download never stops the command. Set [`updates`](../configuration/#top-level-settings) to `notify` or `off`, or `ROX_UPDATES` for one command, to change that. `rox --version` prints the installed version.
+
+| Option | Description |
+| --- | --- |
+| `--check` | Only say whether a newer release is out. |
+
 ## `rox skill install`
 
-Copy the [rox skill](../../guides/agents/) bundled with this rox version into an agent's skills folder. Without options, it installs for each agent set up on this machine: Claude Code (`${CLAUDE_CONFIG_DIR:-~/.claude}/skills/rox`) and Codex (`${CODEX_HOME:-~/.codex}/skills/rox`). Run it again after upgrading rox to update the skill.
+Copy the [rox skill](../../guides/agents/) bundled with this rox version into an agent's skills folder. Without options, it installs for each agent set up on this machine: Claude Code (`${CLAUDE_CONFIG_DIR:-~/.claude}/skills/rox`) and Codex (`${CODEX_HOME:-~/.codex}/skills/rox`). `rox self-update` and automatic updates reinstall it for each agent that has it.
 
 | Option | Description |
 | --- | --- |

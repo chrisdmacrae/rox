@@ -3182,5 +3182,145 @@ class WorkspaceTests(unittest.TestCase):
         with patch.object(rox, "output", side_effect=rox.Error("no rex")):
             self.assertEqual(rox.rex_channel(), "preview")
 
+
+class SelfUpdateTests(unittest.TestCase):
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.root = Path(directory.name).resolve()
+        environment = patch.dict(os.environ, {"XDG_STATE_HOME": str(self.root / "state"),
+                                              "XDG_CONFIG_HOME": str(self.root / "config"),
+                                              "CLAUDE_CONFIG_DIR": str(self.root / "claude"),
+                                              "CODEX_HOME": str(self.root / "codex")})
+        environment.start()
+        self.addCleanup(environment.stop)
+        os.environ.pop("ROX_UPDATES", None)
+        os.environ.pop("ROX_UPDATED", None)
+        self.install = self.release(self.root / "share" / "rox", "v0.1.0")
+        here = patch.object(rox, "HERE", self.install)
+        here.start()
+        self.addCleanup(here.stop)
+        self.published = {}
+
+    def release(self, folder, version, skill="old skill"):
+        """A copy of rox laid out as the release workflow builds it."""
+        folder.mkdir(parents=True)
+        shutil.copy2(ROOT / "rox", folder / "rox")
+        shutil.copytree(ROOT / "skills", folder / "skills")
+        (folder / "skills" / "rox" / "notes.md").write_text(f"{skill}\n")
+        (folder / "VERSION").write_text(f"{version}\n")
+        return folder
+
+    def publish(self, version, digest=None):
+        build = self.root / "build" / version
+        self.release(build / "rox", version, skill=f"skill {version}")
+        archive = io.BytesIO()
+        with rox.tarfile.open(fileobj=archive, mode="w:gz") as tar:
+            tar.add(build / "rox", arcname="rox")
+        data = archive.getvalue()
+        base = f"{rox.RELEASES}/download/{version}"
+        self.published[f"{base}/rox.tar.gz"] = data
+        self.published[f"{base}/rox.tar.gz.sha256"] = \
+            f"{digest or rox.hashlib.sha256(data).hexdigest()}  rox.tar.gz\n".encode()
+
+    def download(self, url, path):
+        path.write_bytes(self.published[url])
+
+    def test_versions_compare_by_number(self):
+        self.assertEqual(rox.installed_version(), "v0.1.0")
+        self.assertGreater(rox.version_key("v0.10.0"), rox.version_key("v0.9.3"))
+
+    def test_checks_github_at_most_every_few_hours(self):
+        with patch.object(rox, "latest_release", return_value="v0.2.0") as latest:
+            self.assertEqual(rox.newer_release(now=1000), ("v0.2.0", True))
+            self.assertEqual(rox.newer_release(now=1000 + 60), ("v0.2.0", False))
+            self.assertEqual(rox.newer_release(now=1000 + rox.UPDATE_CHECK_TTL), ("v0.2.0", True))
+            self.assertEqual(latest.call_count, 2)
+            latest.return_value = "v0.1.0"
+            self.assertEqual(rox.newer_release(refresh=True, now=1000), ("", True))
+        # A checkout has no VERSION, so it never asks.
+        (self.install / "VERSION").unlink()
+        with patch.object(rox, "latest_release") as latest:
+            self.assertEqual(rox.newer_release(), ("", False))
+            latest.assert_not_called()
+
+    def test_self_update_installs_the_release_and_its_skill(self):
+        claude = self.root / "claude" / "skills" / "rox"
+        codex = self.root / "codex"
+        claude.parent.mkdir(parents=True)
+        shutil.copytree(self.install / "skills" / "rox", claude)
+        codex.mkdir()  # Codex is set up without the skill, so the update leaves it so.
+        (self.install / "stale").write_text("dropped by the new release\n")
+        self.publish("v0.2.0")
+        with patch.object(rox, "latest_release", return_value="v0.2.0"), \
+                patch.object(rox, "download", side_effect=self.download), \
+                contextlib.redirect_stdout(io.StringIO()) as printed, \
+                contextlib.redirect_stderr(io.StringIO()) as notes:
+            rox.main(["self-update"])
+        self.assertIn("Updated rox to v0.2.0", printed.getvalue())
+        self.assertEqual(rox.installed_version(), "v0.2.0")
+        self.assertFalse((self.install / "stale").exists())
+        self.assertEqual((claude / "notes.md").read_text(), "skill v0.2.0\n")
+        self.assertFalse((codex / "skills").exists())
+        self.assertIn("Updated the rox skill for Claude Code", notes.getvalue())
+        self.assertEqual(sorted(path.name for path in self.install.parent.iterdir()), ["rox"])
+
+    def test_a_download_that_fails_its_checksum_leaves_rox_alone(self):
+        self.publish("v0.2.0", digest="0" * 64)
+        with patch.object(rox, "latest_release", return_value="v0.2.0"), \
+                patch.object(rox, "download", side_effect=self.download), \
+                contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaisesRegex(rox.Error, "doesn't match its published SHA-256"):
+                rox.main(["self-update"])
+        self.assertEqual(rox.installed_version(), "v0.1.0")
+        self.assertEqual(sorted(path.name for path in self.install.parent.iterdir()), ["rox"])
+
+    def test_auto_update_reruns_the_command_with_the_new_rox(self):
+        self.publish("v0.2.0")
+        with patch.object(rox, "latest_release", return_value="v0.2.0"), \
+                patch.object(rox, "download", side_effect=self.download), \
+                patch.object(rox.os, "execv") as execv, \
+                patch.dict(os.environ, {}), \
+                contextlib.redirect_stderr(io.StringIO()) as notes:
+            rox.auto_update(["ls", "--json"])
+            self.assertEqual(os.environ["ROX_UPDATED"], "v0.2.0")
+        self.assertIn("Updating from v0.1.0 to v0.2.0", notes.getvalue())
+        self.assertEqual(rox.installed_version(), "v0.2.0")
+        execv.assert_called_once_with(rox.sys.executable,
+                                      [rox.sys.executable, str(self.install / "rox"), "ls", "--json"])
+
+    def test_auto_update_only_tells_when_it_cannot_or_should_not_install(self):
+        with patch.object(rox, "latest_release", return_value="v0.2.0"), \
+                patch.object(rox, "install_release") as install, \
+                patch.object(rox.os, "execv") as execv:
+            with patch.dict(os.environ, {"ROX_UPDATES": "notify"}), \
+                    contextlib.redirect_stderr(io.StringIO()) as notes:
+                rox.auto_update(["ls"])
+                self.assertIn("v0.2.0 is out (this is v0.1.0). Run rox self-update", notes.getvalue())
+                # Once per check, not before every command.
+                rox.auto_update(["ls"])
+                self.assertEqual(notes.getvalue().count("is out"), 1)
+            (self.install / ".git").mkdir()
+            with contextlib.redirect_stderr(io.StringIO()) as notes:
+                rox.newer_release(refresh=True)
+                (self.root / "state" / "rox" / "update-check.json").unlink()
+                rox.auto_update(["ls"])
+            self.assertIn("is a Git checkout", notes.getvalue())
+            with patch.dict(os.environ, {"ROX_UPDATES": "off"}), \
+                    patch.object(rox, "newer_release") as check:
+                rox.auto_update(["ls"])
+                check.assert_not_called()
+            install.assert_not_called()
+            execv.assert_not_called()
+
+    def test_auto_update_carries_on_when_github_is_unreachable(self):
+        with patch.object(rox, "latest_release", side_effect=OSError("offline")), \
+                contextlib.redirect_stderr(io.StringIO()) as notes:
+            rox.auto_update(["ls"])
+            # It doesn't ask again, or say so again, until the next check is due.
+            rox.auto_update(["ls"])
+        self.assertEqual(notes.getvalue().count("Could not check for a newer rox (offline)"), 1)
+
+
 if __name__ == "__main__":
     unittest.main()

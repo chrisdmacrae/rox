@@ -16,7 +16,7 @@ The skill ships with each release. After you [install rox](#install), install it
 rox skill install
 ```
 
-Start a new session and invoke `/rox` in Claude Code or `$rox` in Codex. Run `rox skill install` again after upgrading rox to update the skill. Install the toolkit itself on the machine that will run the guests. To have Claude Code or Codex ready in every guest, see [Agent CLIs in guests](#agent-clis-in-guests).
+Start a new session and invoke `/rox` in Claude Code or `$rox` in Codex. `rox self-update` and automatic updates keep the skill up to date. Install the toolkit itself on the machine that will run the guests. To have Claude Code or Codex ready in every guest, see [Agent CLIs in guests](#agent-clis-in-guests).
 
 ## Install
 
@@ -29,7 +29,7 @@ curl -fsSL https://github.com/chrisdmacrae/rox/releases/latest/download/rox.tar.
   && ln -sf ~/.local/share/rox/rox ~/.local/bin/rox && rm /tmp/rox.tar.gz
 ```
 
-Run the same command to upgrade. Make sure `~/.local/bin` is on your PATH. To install a specific version, replace `latest/download` with `download/vX.Y.Z`. Each release also includes `rox.tar.gz.sha256` to check the download, and the installed version is in `~/.local/share/rox/VERSION`.
+A release install keeps itself up to date: before a command, at most every six hours, rox asks GitHub for the latest release. When one is out, it downloads it, checks it against the release's `rox.tar.gz.sha256`, swaps it in, updates the rox skill for each agent that has it, and runs your command with the new version. If it can't write to its install folder, or it's a Git checkout, it says the release is out instead. Run `rox self-update` to update now, or `rox self-update --check` to only check. Set `"updates": "notify"` in the rox config to be told without installing, or `"off"` to stop checking. `ROX_UPDATES` overrides it for one command. You can also run the same command to upgrade. Make sure `~/.local/bin` is on your PATH. To install a specific version, replace `latest/download` with `download/vX.Y.Z`. Each release also includes `rox.tar.gz.sha256` to check the download, and the installed version is in `~/.local/share/rox/VERSION`.
 
 Releases are built by `.github/workflows/release.yml` when you push a version tag:
 
@@ -258,6 +258,7 @@ It checks every 15 seconds, logs to `~/.local/state/rox/service.log`, and leaves
 | `rox open NAME [PROJECT]` | Show the guest's own Rex session in the Rex app on this machine, so splits and new tabs run in the guest. If the app doesn't have the guest as a host yet, it copies the guest's address and opens Add Remote Host for you to paste it. |
 | `rox add-remote-host NAME` | Add a guest to the Rex app on this machine, for app builds that keep their own host list. |
 | `rox stop NAME` / `rox start NAME` | Stop a guest without deleting it, and keep it stopped until `rox start`. |
+| `rox self-update` | Install the latest rox release and update the rox skill. `--check` only checks. Rox also does this on its own; see [Install](#install). |
 | `rox service install` | Keep guests running across reboots and container runtime restarts. See [Keeping guests running](#keeping-guests-running). |
 | `rox down NAME` | Delete the guest, its filesystem, and its Rex host entry. |
 | `rox down` | From a project checkout, remove the guest that has that project. If several do, Rox lists them and asks which one to remove. |
