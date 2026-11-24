@@ -1324,43 +1324,63 @@ def install_template_rex(guest):
                 raise Error(f"Could not install Rex in {guest.name}")
 
 
-def prepare_template(args):
-    """Clone, set up and check a macOS Tart template, then point the macos config at it."""
-    if sys.platform != "darwin" or platform.machine() != "arm64":
-        raise Error("Tart templates need an Apple Silicon Mac")
-    require(["tart", "ssh", "ssh-keygen", "ditto"])
-    if not (REX_APP / REX_APP_CLI).is_file():
-        raise Error(f"Install the Rex app at {REX_APP} first. rox template copies it into the template")
-    config_path, config = load_config(args)
-    settings = config.get("macos", {})
-    if not isinstance(settings, dict):
-        raise Error(f"Expected an object for macos in {config_path}")
-    name = args.name or settings.get("image") or DEFAULT_TEMPLATE_NAME
+def template_login(name, settings, config_path):
+    """Check the template name and user, and return the VM login key, created if it's missing."""
     user = settings.get("user", "admin")
     if not re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9_.-]*", name) or re.fullmatch(NAME_PATTERN, name):
         raise Error(f"Choose a template name other than {name!r}")
-    if not re.fullmatch(r"[a-zA-Z_][a-zA-Z0-9_.-]*", user):
-        raise Error(f"Expected a user name for macos.user in {config_path}")
+    if not isinstance(user, str) or not re.fullmatch(r"[a-zA-Z_][a-zA-Z0-9_.-]*", user):
+        raise Error(f"Expected a user name in {config_path}")
     identity_setting = settings.get("identity") or "~/.ssh/rox_vm"
-    host_key_setting = settings.get("host_key") or f"~/.ssh/{name.replace('-', '_')}_host.pub"
     identity = Path(identity_setting).expanduser().resolve()
-    host_key = Path(host_key_setting).expanduser().resolve()
-    password_path = config_path.with_name(f"{name}-{user}-password")
-
-    if name in tart_images():
-        guest_probe = TemplateGuest(name, "macos", name, user)
-        if guest_state(guest_probe) == "running":
-            raise Error(f"{name} is running. Shut it down and run rox template again")
-        print(f"Updating template {name}", flush=True)
-    else:
-        print(f"Cloning {args.base} into {name}. A first pull downloads about 30 GB.", flush=True)
-        run(["tart", "clone", args.base, name])
     if not identity.exists():
         identity.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-C", "rox vm login", "-f", str(identity)],
             stdin=subprocess.DEVNULL)
         print(f"Created VM login key {identity}", flush=True)
-    public_key = Path(f"{identity}.pub").read_text().strip()
+    return user, identity_setting, identity, Path(f"{identity}.pub").read_text().strip()
+
+
+def clone_template(name, base, size):
+    """Clone base into the template unless it exists. Refuse a template that's running."""
+    if name in tart_images():
+        if guest_state(TemplateGuest(name, "linux", name, "admin")) == "running":
+            raise Error(f"{name} is running. Shut it down and run rox template again")
+        print(f"Updating template {name}", flush=True)
+    else:
+        print(f"Cloning {base} into {name}. A first pull downloads {size}.", flush=True)
+        run(["tart", "clone", base, name])
+
+
+def prepare_template(args):
+    """Prepare a Tart template for the macos or linux backend."""
+    if sys.platform != "darwin" or platform.machine() != "arm64":
+        raise Error("Tart templates need an Apple Silicon Mac")
+    require(["tart", "ssh", "ssh-keygen"])
+    config_path, config = load_config(args)
+    settings = config.get(args.backend, {})
+    if not isinstance(settings, dict):
+        raise Error(f"Expected an object for {args.backend} in {config_path}")
+    if args.backend == "linux":
+        prepare_linux_template(args, config_path, settings)
+    else:
+        if args.distro or args.default or args.rex_channel:
+            raise Error("--distro, --default and --rex-channel are for rox template linux")
+        prepare_macos_template(args, config_path, settings)
+
+
+def prepare_macos_template(args, config_path, settings):
+    """Clone, set up and check a macOS Tart template, then point the macos config at it."""
+    require(["ditto"])
+    if not (REX_APP / REX_APP_CLI).is_file():
+        raise Error(f"Install the Rex app at {REX_APP} first. rox template copies it into the template")
+    name = args.name or settings.get("image") or DEFAULT_TEMPLATE_NAME
+    base = args.base or DEFAULT_TEMPLATE_BASE
+    user, identity_setting, identity, public_key = template_login(name, settings, config_path)
+    host_key_setting = settings.get("host_key") or f"~/.ssh/{name.replace('-', '_')}_host.pub"
+    host_key = Path(host_key_setting).expanduser().resolve()
+    password_path = config_path.with_name(f"{name}-{user}-password")
+    clone_template(name, base, "about 30 GB")
 
     guest = TemplateGuest(name, "macos", name, user, identity=str(identity))
     shutil.rmtree(guest.directory, ignore_errors=True)
@@ -1402,6 +1422,269 @@ def prepare_template(args):
     shutil.rmtree(guest.directory, ignore_errors=True)
     print(f"Template  {name}\nPassword  {password_path}\nConfig    {config_path} (macos)\n"
           f"Launch with rox up macos. Run rox template macos again after upgrading Rex.", flush=True)
+
+
+# Cirrus Labs' Tart images for each distribution rox template knows. None means none is published.
+LINUX_TEMPLATE_BASES = {
+    "ubuntu": "ghcr.io/cirruslabs/ubuntu:24.04",
+    "debian": "ghcr.io/cirruslabs/debian:trixie",
+    "fedora": "ghcr.io/cirruslabs/fedora:42",
+    "arch": None,
+}
+DEFAULT_LINUX_DISTRO = "ubuntu"
+REX_INSTALLER = "https://pkgs.superlogical.com/rex/install.sh"
+# Every Linux template gets this host key, because the config pins one host_key for the linux backend.
+LINUX_HOST_KEY = "rox-linux-host-key"
+
+# Read the new password from stdin. Install what rox needs, keep the guest's Rex server running after
+# SSH logs out, keep cloud-init from replacing host keys in clones, take only key logins, and install Rex.
+LINUX_SETUP_SCRIPT = r"""set -eu
+IFS= read -r new
+user=$(id -un)
+if ! sudo -n true 2>/dev/null; then
+  echo "$user needs passwordless sudo in the template." >&2
+  exit 1
+fi
+packages="git bash curl ca-certificates tar gzip"
+quiet() {
+  log=$("$@" 2>&1) || { printf '%s\n' "$log" >&2; exit 1; }
+}
+if command -v apt-get >/dev/null; then
+  quiet sudo -n env DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a apt-get update -q
+  quiet sudo -n env DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a apt-get install -y -q $packages
+elif command -v dnf >/dev/null; then
+  quiet sudo -n dnf install -y $packages
+elif command -v pacman >/dev/null; then
+  quiet sudo -n pacman -Syu --noconfirm --needed $packages
+elif command -v zypper >/dev/null; then
+  quiet sudo -n zypper -n install $packages
+elif command -v apk >/dev/null; then
+  quiet sudo -n apk add $packages
+else
+  echo "rox template doesn't know this distribution's package manager. Install $packages in the template." >&2
+  exit 1
+fi
+printf '%s:%s\n' "$user" "$new" | sudo -n chpasswd
+if command -v loginctl >/dev/null; then
+  sudo -n loginctl enable-linger "$user"
+fi
+if [ -d /etc/cloud/cloud.cfg.d ]; then
+  printf 'ssh_deletekeys: false\nssh_genkeytypes: []\n' | sudo -n tee /etc/cloud/cloud.cfg.d/99-rox.cfg >/dev/null
+fi
+sudo -n mkdir -p /etc/ssh/sshd_config.d
+if ! sudo -n grep -qE '^[[:space:]]*Include[[:space:]]+/etc/ssh/sshd_config\.d/' /etc/ssh/sshd_config; then
+  sudo -n sed -i '1i Include /etc/ssh/sshd_config.d/*.conf' /etc/ssh/sshd_config
+fi
+settings='PasswordAuthentication no\nAllowAgentForwarding yes\nAllowStreamLocalForwarding yes\n'
+if sudo -n sshd -T 2>/dev/null | grep -qi '^kbdinteractiveauthentication '; then
+  settings="${settings}KbdInteractiveAuthentication no\n"
+fi
+printf "$settings" | sudo -n tee /etc/ssh/sshd_config.d/05-rox.conf >/dev/null
+installer=$(mktemp)
+trap 'rm -f "$installer"' EXIT
+curl -fsSL "$2" -o "$installer"
+quiet sudo -n sh "$installer" --tarball --channel "$1"
+"""
+
+# Replace the ed25519 host key with the shared one from stdin, then restart sshd. Running sessions survive.
+LINUX_HOST_KEY_SCRIPT = r"""set -eu
+key=$(mktemp)
+trap 'rm -f "$key"' EXIT
+cat > "$key"
+sudo -n install -m 600 -o root -g root "$key" /etc/ssh/ssh_host_ed25519_key
+printf '%s\n' "$1" | sudo -n tee /etc/ssh/ssh_host_ed25519_key.pub >/dev/null
+sudo -n chmod 644 /etc/ssh/ssh_host_ed25519_key.pub
+if command -v restorecon >/dev/null; then
+  sudo -n restorecon /etc/ssh/ssh_host_ed25519_key /etc/ssh/ssh_host_ed25519_key.pub
+fi
+sudo -n sshd -t
+for unit in ssh.service sshd.service; do
+  sudo -n systemctl try-restart "$unit" 2>/dev/null || true
+done
+"""
+
+LINUX_CHECK_SCRIPT = r"""set -eu
+if ! command -v rex >/dev/null; then
+  echo "rex isn't on SSH's PATH in the template." >&2
+  exit 1
+fi
+rex version | head -n 1
+git --version
+bash --version | head -n 1
+if command -v loginctl >/dev/null; then
+  echo "linger: $(loginctl show-user "$(id -un)" -p Linger --value 2>/dev/null || echo unknown)"
+fi
+"""
+
+
+def rex_channel():
+    """The Rex release channel this machine runs, so guests match it."""
+    try:
+        version = output(["rex", "version"], timeout=10).splitlines()[0]
+    except (Error, OSError, IndexError, subprocess.TimeoutExpired):
+        return "preview"
+    if re.search(r"alpha|snapshot", version):
+        return "snapshot"
+    if "preview" in version or not re.search(r"\d+\.\d+\.\d+\s*$", version):
+        return "preview"
+    return "stable"
+
+
+def password_ssh(guest, argv, password):
+    """Run argv in the guest over SSH with the base image's password, before it takes the login key."""
+    with tempfile.TemporaryDirectory() as scratch:
+        askpass = Path(scratch) / "askpass"
+        askpass.write_text('#!/bin/sh\nprintf "%s\\n" "$ROX_TEMPLATE_PASSWORD"\n')
+        askpass.chmod(0o700)
+        env = {**os.environ, "SSH_ASKPASS": str(askpass), "SSH_ASKPASS_REQUIRE": "force",
+               "ROX_TEMPLATE_PASSWORD": password, "DISPLAY": os.environ.get("DISPLAY", ":0")}
+        command = [
+            "ssh", "-F", "/dev/null", "-T", "-o", "BatchMode=no", "-o", "ConnectTimeout=5",
+            "-o", "StrictHostKeyChecking=yes", "-o", "GlobalKnownHostsFile=/dev/null",
+            "-o", f"HostKeyAlias={guest.name}",
+            "-o", f"UserKnownHostsFile={json.dumps(str(guest.directory / 'known_hosts'), ensure_ascii=False)}",
+            "-o", "PubkeyAuthentication=no", "-o", "PreferredAuthentications=keyboard-interactive,password",
+            "-o", "NumberOfPasswordPrompts=1", "-l", guest.user, "-p", str(guest.port), "--", guest.address,
+            shlex.join(argv),
+        ]
+        return run(command, env=env, stdin=subprocess.DEVNULL, capture=True, check=False, timeout=60)
+
+
+def scanned_host_key(guest):
+    """The guest's ed25519 host key as ssh-keyscan reads it. Only used to log in with a password once."""
+    lines = output(["ssh-keyscan", "-T", "5", "-t", "ed25519", "-p", str(guest.port), guest.address], timeout=20)
+    for line in lines.splitlines():
+        fields = line.split()
+        if len(fields) >= 3 and not line.startswith("#"):
+            return " ".join(fields[1:3])
+    raise Error(f"{guest.name} didn't offer an ed25519 host key")
+
+
+def reach_linux_template(guest, public_key, shared_host_key, base_password, boot_timeout):
+    """Make sure SSH takes the login key. Leave the guest's current host key pinned."""
+
+    def ready():
+        guest.address, guest.port = vm_address(guest)
+        pin_host(guest, shared_host_key)
+        if run(remote_command(guest, ["true"]), capture=True, check=False, timeout=15).returncode == 0:
+            return "ssh"  # rox prepared it before.
+        if run(["tart", "exec", guest.name, "true"], capture=True, check=False, timeout=15).returncode == 0:
+            return "agent"
+        try:
+            pin_host(guest, scanned_host_key(guest))
+        except (Error, subprocess.TimeoutExpired):
+            return None
+        return "password" if password_ssh(guest, ["true"], base_password).returncode == 0 else None
+
+    how = wait_for(ready, boot_timeout, f"SSH or the Tart guest agent in {guest.name}")
+    if how == "agent":
+        output(["tart", "exec", guest.name, "/bin/sh", "-c", AUTHORIZE_SCRIPT, "rox", public_key], timeout=30)
+        pin_host(guest, output(["tart", "exec", guest.name, "cat", "/etc/ssh/ssh_host_ed25519_key.pub"],
+                               timeout=30))
+    elif how == "password":
+        result = password_ssh(guest, ["sh", "-c", AUTHORIZE_SCRIPT, "rox", public_key], base_password)
+        if result.returncode:
+            raise Error(f"Could not authorize the login key in {guest.name}: {result.stderr.strip()}")
+    check_guest_os(guest, boot_timeout)
+
+
+def shared_linux_host_key(config_path):
+    """The private and public host key every Linux template shares, created on first use."""
+    private = config_path.with_name(LINUX_HOST_KEY)
+    if not private.exists():
+        private.parent.mkdir(parents=True, exist_ok=True)
+        run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-C", "rox linux template", "-f", str(private)],
+            stdin=subprocess.DEVNULL)
+    public = " ".join(output(["ssh-keygen", "-y", "-f", str(private)]).split()[:2])
+    return private.read_text(), public
+
+
+def check_template_clone(template, user, identity, host_key, boot_timeout):
+    """Boot a throwaway clone and log in with the pinned host key, as rox up does."""
+    clone = TemplateGuest(f"{template}-check-{secrets.token_hex(3)}", "linux", template, user,
+                          identity=str(identity))
+    clone.directory.mkdir(mode=0o700, parents=True)
+    run(["tart", "clone", template, clone.name])
+    vm = None
+    try:
+        pin_host(clone, host_key)
+        vm = boot_template(clone, boot_timeout)
+        output(remote_command(clone, ["sh", "-c", "command -v rex >/dev/null && rex version >/dev/null"]),
+               timeout=30)
+        shut_down_template(clone, vm)
+    finally:
+        if vm is not None and vm.poll() is None:
+            run(["tart", "stop", clone.name], capture=True, check=False, timeout=120)
+        run(["tart", "delete", clone.name], capture=True, check=False, timeout=120)
+        shutil.rmtree(clone.directory, ignore_errors=True)
+
+
+def prepare_linux_template(args, config_path, settings):
+    """Clone, set up and check a Linux Tart template, then point the linux config at it."""
+    require(["ssh-keyscan"])
+    distro = args.distro
+    if args.base:
+        base = args.base
+    else:
+        distro = distro or DEFAULT_LINUX_DISTRO
+        base = LINUX_TEMPLATE_BASES[distro]
+        if not base:
+            raise Error(f"No Tart image of {distro} is published. Pass --base with one")
+    name = args.name or (f"rox-{distro}" if distro else "")
+    if not name:
+        raise Error("Name the template with --name, or say which distribution --base is with --distro")
+    user, identity_setting, identity, public_key = template_login(name, settings, config_path)
+    host_key_setting = settings.get("host_key") or "~/.ssh/rox_linux_host.pub"
+    host_key = Path(host_key_setting).expanduser().resolve()
+    private_host_key, shared_public = shared_linux_host_key(config_path)
+    if host_key.is_file() and host_key.read_text().split()[:2] != shared_public.split():
+        # A template prepared by hand has its own key. Keep it, and pin the shared one elsewhere.
+        if host_key_setting != "~/.ssh/rox_linux_host.pub":
+            print(f"Linux templates now share one host key, so linux.host_key moves from {host_key_setting} to "
+                  "~/.ssh/rox_linux_host.pub. Run rox template linux for templates you prepared by hand.",
+                  flush=True)
+            host_key_setting = "~/.ssh/rox_linux_host.pub"
+            host_key = Path(host_key_setting).expanduser().resolve()
+    password_path = config_path.with_name(f"{name}-{user}-password")
+    clone_template(name, base, "a few GB")
+    channel = args.rex_channel or rex_channel()
+
+    guest = TemplateGuest(name, "linux", name, user, identity=str(identity))
+    shutil.rmtree(guest.directory, ignore_errors=True)
+    guest.directory.mkdir(mode=0o700, parents=True)
+    print(f"Booting {name}", flush=True)
+    vm = run_vm(guest)
+    try:
+        reach_linux_template(guest, public_key, shared_public, args.base_password, args.boot_timeout)
+        print(f"Installing Git and Rex ({channel}), replacing the password and turning on lingering", flush=True)
+        run(remote_command(guest, ["bash", "-c", LINUX_SETUP_SCRIPT, "rox", channel, REX_INSTALLER]),
+            input=template_password(password_path) + "\n")
+        print("Installing the shared Linux host key", flush=True)
+        run(remote_command(guest, ["sh", "-c", LINUX_HOST_KEY_SCRIPT, "rox", shared_public]),
+            input=private_host_key)
+        pin_host(guest, shared_public)
+        print(output(remote_command(guest, ["bash", "-c", LINUX_CHECK_SCRIPT]), timeout=30), flush=True)
+        shut_down_template(guest, vm)
+    finally:
+        if vm.poll() is None:
+            run(["tart", "stop", guest.name], capture=True, check=False, timeout=120)
+    shutil.rmtree(guest.directory, ignore_errors=True)
+    host_key.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    host_key.write_text(shared_public + "\n")
+
+    print(f"Booting a clone of {name} to check that it takes SSH with the pinned host key", flush=True)
+    check_template_clone(name, user, identity, shared_public, args.boot_timeout)
+
+    with locked_config(config_path) as current:
+        section = current.setdefault("linux", {})
+        default = not section.get("image") or section.get("image") == name or args.default
+        if default:
+            section["image"] = name
+        section.update(user=user, identity=identity_setting, host_key=host_key_setting)
+        write_config(config_path, current)
+    launch = "rox up linux" if default else f"rox up linux --image {name}"
+    print(f"Template  {name} ({base})\nPassword  {password_path}\nConfig    {config_path} (linux)\n"
+          f"Launch with {launch}. Run rox template linux again to update Rex.", flush=True)
 
 
 @dataclass
@@ -4145,12 +4428,19 @@ def main(argv):
     service_loop = service_commands.add_parser("run", help="run the service in the foreground")
     service_loop.add_argument("--interval", type=positive_int, default=SERVICE_INTERVAL,
                               help=f"seconds between checks (default {SERVICE_INTERVAL})")
-    template = commands.add_parser("template", help="prepare a macOS Tart template and point the config at it")
-    template.add_argument("backend", choices=("macos",), help="guest type; only macos for now")
+    template = commands.add_parser("template", help="prepare a Tart template and point the config at it")
+    template.add_argument("backend", choices=("macos", "linux"), help="guest type")
     template.add_argument("-S", "--host", help="prepare it on this Rex remote host")
     template.add_argument("--config", help="config file on the machine that runs the guests")
-    template.add_argument("--name", help=f"template name; defaults to macos.image or {DEFAULT_TEMPLATE_NAME}")
-    template.add_argument("--base", default=DEFAULT_TEMPLATE_BASE, help="Tart image to clone the template from")
+    template.add_argument("--name", help=f"template name; defaults to macos.image or {DEFAULT_TEMPLATE_NAME}, "
+                          "or rox-DISTRO")
+    template.add_argument("--base", help="Tart image to clone the template from")
+    template.add_argument("--distro", choices=sorted(LINUX_TEMPLATE_BASES),
+                          help=f"Linux distribution; defaults to {DEFAULT_LINUX_DISTRO}, or none with --base")
+    template.add_argument("--default", action="store_true",
+                          help="make this the linux image even when another one is configured")
+    template.add_argument("--rex-channel", choices=("stable", "preview", "snapshot"),
+                          help="Rex channel for a Linux template; defaults to this machine's")
     template.add_argument("--base-password", default=DEFAULT_BASE_PASSWORD,
                           help="the base image's login password, which rox replaces")
     template.add_argument("--boot-timeout", type=positive_int, default=600, help="seconds per readiness check")
@@ -4234,8 +4524,10 @@ def main(argv):
         edit_git_keys(args)
     elif args.command == "template" and args.host:
         options = [f"--{option.replace('_', '-')}={value}" for option, value in
-                   (("config", args.config), ("name", args.name), ("base", args.base),
-                    ("base_password", args.base_password), ("boot_timeout", args.boot_timeout)) if value]
+                   (("config", args.config), ("name", args.name), ("base", args.base), ("distro", args.distro),
+                    ("rex_channel", args.rex_channel), ("base_password", args.base_password),
+                    ("boot_timeout", args.boot_timeout)) if value]
+        options += ["--default"] if args.default else []
         # A first template pulls a large image, so give it hours rather than minutes.
         run_on_host(args.host, "rox template", ["template", args.backend, *options], wait=4 * 3600)
     elif args.command == "template":

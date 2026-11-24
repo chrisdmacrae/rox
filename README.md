@@ -119,7 +119,9 @@ Only the selected keys are loaded into an SSH agent on the host, one per guest. 
 
 On an Apple Silicon Mac, install Tart and prepare one template per guest OS. With the Rex app installed, `rox template macos` (or `rox template macos --host HOST`) builds the macOS one: it pulls `ghcr.io/cirruslabs/macos-tahoe-base:latest` into `rox-macos`, authorizes a VM login key, pins the host key, replaces the default password while keeping auto-login working, installs Rex, checks that it boots to SSH and its desktop, and fills in the `macos` config. Run it again after upgrading Rex.
 
-To prepare a template by hand instead, which Ubuntu still needs:
+`rox template linux` does the same for Linux: Ubuntu 24.04 by default, `--distro debian` or `--distro fedora`, or any Tart image with `--base`, such as an Arch one. Each gets Git and Rex, lingering, key-only SSH and one host key shared by all Linux templates, so `rox up linux --image rox-debian` can pick any of them.
+
+To prepare a template by hand instead:
 
 ```sh
 tart clone ghcr.io/cirruslabs/ubuntu:24.04 rox-ubuntu

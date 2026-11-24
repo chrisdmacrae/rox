@@ -148,18 +148,23 @@ Install a background service that [keeps guests running](../../guides/keep-runni
 
 `rox service uninstall` stops and removes the service. `rox service status` shows whether it's running. `rox service run` runs the same loop in the foreground, with `--interval SECONDS` to check more or less often.
 
-## `rox template macos`
+## `rox template macos` / `rox template linux`
 
-Prepare a macOS [Tart template](../../guides/tart-vms/) and point the `macos` config at it. Rox clones `--base` into the template unless it already exists, creates the VM login key `identity` if it's missing, and boots the template. Through Tart's guest agent it authorizes the key and pins the template's SSH host key at `host_key`. Over SSH it replaces the base image's password, updates `/etc/kcpassword` and the login keychain so the template still signs in to its desktop on boot, and copies this Mac's `/Applications/Rex.app` into it with `rex` on SSH's `PATH`. It checks `rex`, `git` and `bash` as the SSH user, reboots the template to confirm the desktop session, shuts it down and writes `image`, `user`, `identity` and `host_key` under `macos`. The new password is saved, readable only by you, next to the config as `TEMPLATE-USER-password`.
+Prepare a [Tart template](../../guides/tart-vms/) and point the backend's config at it. Rox clones `--base` into the template unless it already exists, creates the VM login key `identity` if it's missing, boots the template, authorizes the key and replaces the base image's password. The new password is saved, readable only by you, next to the config as `TEMPLATE-USER-password`. Run the command again to update Rex in the template. It reuses the saved password and doesn't pull the image again. The template must be shut down, and the base image needs passwordless `sudo` for the user, as Cirrus Labs' images have.
 
-Run it again after upgrading Rex to copy the new version into the template. It reuses the saved password and doesn't pull the image again. The template must be shut down. The base image needs Tart's guest agent, SSH, and passwordless `sudo` for the user, as Cirrus Labs' images have.
+**macOS** templates get this Mac's `/Applications/Rex.app`, with `rex` linked onto SSH's `PATH`. Rox keeps `/etc/kcpassword` and the login keychain in step with the new password, so the template still signs in to its desktop on boot, and reboots it to check. It pins the template's own host key at `host_key` and writes `image`, `user`, `identity` and `host_key` under `macos`.
+
+**Linux** templates get Git, Bash and curl from the distribution's package manager (apt, dnf, pacman, zypper or apk), and Rex from its official installer on the channel this Mac runs. Rox turns on lingering so the guest's Rex server outlives the SSH session, makes sshd take only keys while allowing agent and socket forwarding, and stops cloud-init from replacing host keys. Every Linux template gets the same host key, kept next to the config as `rox-linux-host-key` and pinned at `host_key` (default `~/.ssh/rox_linux_host.pub`), so `rox up linux --image` can pick any of them. Rox then boots a throwaway clone to check that it takes SSH with the pinned key. It sets `linux.image` only when none is set, or with `--default`.
 
 | Option | Description |
 | --- | --- |
 | `-S`, `--host HOST` | Prepare the template on this Rex remote host. |
 | `--config PATH` | A different rox config file, on the machine that runs the guests. |
-| `--name NAME` | Template name. Defaults to `macos.image`, then `rox-macos`. |
-| `--base IMAGE` | Tart image to clone from. Defaults to `ghcr.io/cirruslabs/macos-tahoe-base:latest`. |
+| `--name NAME` | Template name. Defaults to `macos.image`, then `rox-macos`, for macOS, and to `rox-DISTRO` for Linux. |
+| `--distro NAME` | Linux only. `ubuntu` (24.04, the default), `debian` (trixie) or `fedora` (42) pick Cirrus Labs' image. `arch` has none, so pass `--base` with it. |
+| `--base IMAGE` | Tart image to clone from. Defaults to `ghcr.io/cirruslabs/macos-tahoe-base:latest` for macOS and the `--distro` image for Linux. With an image rox doesn't know, pass `--name` or `--distro`. |
+| `--default` | Linux only. Make this template `linux.image` even when another one is set. |
+| `--rex-channel NAME` | Linux only. `stable`, `preview` or `snapshot`. Defaults to the channel of this Mac's Rex. |
 | `--base-password PASSWORD` | The base image's login password, which Rox replaces. Defaults to `admin`. |
 | `--boot-timeout SECONDS` | Seconds per readiness check. Defaults to 600. |
 

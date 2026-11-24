@@ -16,15 +16,26 @@ rox template macos                 # on this Mac
 rox template macos --host mini     # on a Rex remote host
 ```
 
-It pulls `ghcr.io/cirruslabs/macos-tahoe-base:latest` into `rox-macos` (about 30 GB the first time), authorizes a VM login key, pins the host key, replaces the default `admin` password, installs Rex, checks that the template boots to SSH and to its desktop, shuts it down and fills in the `macos` [config](../../reference/configuration/). The new password is saved next to the config as `rox-macos-admin-password`. Run the same command after you upgrade Rex. See [`rox template`](../../reference/cli/#rox-template-macos) for the options.
+It pulls `ghcr.io/cirruslabs/macos-tahoe-base:latest` into `rox-macos` (about 30 GB the first time), authorizes a VM login key, pins the host key, replaces the default `admin` password, installs Rex, checks that the template boots to SSH and to its desktop, shuts it down and fills in the `macos` [config](../../reference/configuration/). The new password is saved next to the config as `rox-macos-admin-password`. Run the same command after you upgrade Rex. See [`rox template`](../../reference/cli/#rox-template-macos--rox-template-linux) for the options.
 
 <Aside type="caution">
 	macOS signs the template in at boot with the password stored in `/etc/kcpassword`. If you change the template's password by hand, update that file too, or the template boots to the login window and GUI work in its guests fails.
 </Aside>
 
+## Prepare Linux templates
+
+```sh
+rox template linux                    # rox-ubuntu, from Ubuntu 24.04
+rox template linux --distro debian    # rox-debian, from Debian trixie
+rox template linux --distro fedora    # rox-fedora, from Fedora 42
+rox template linux --distro arch --base ghcr.io/you/arch-tart:latest
+```
+
+Each one gets Git and Rex, a new password, lingering for the guest account, key-only SSH and the host key all Linux templates share. Rox checks that a clone boots and takes SSH. The first template becomes `linux.image`. Launch the others with `rox up linux --image rox-debian`, or make one the default with `--default`. Cirrus Labs publishes no Arch image, so build or find a Tart Arch image and pass it with `--base`. Rox detects pacman, zypper and apk as well as apt and dnf. See [`rox template`](../../reference/cli/#rox-template-macos--rox-template-linux) for the options.
+
 ## Prepare a template by hand
 
-For Ubuntu, or a macOS template rox template can't build, clone the image and set it up from its console.
+For an image rox template can't prepare, clone it and set it up from its console.
 
 ```sh
 tart clone ghcr.io/cirruslabs/ubuntu:24.04 rox-ubuntu

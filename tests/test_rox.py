@@ -2960,13 +2960,126 @@ class WorkspaceTests(unittest.TestCase):
 
     def test_template_on_a_remote_host_runs_there_and_waits_for_the_pull(self):
         with patch.object(rox, "run_on_host") as remote:
-            rox.main(["template", "macos", "-S", "mini", "--name", "tahoe"])
+            rox.main(["template", "linux", "-S", "mini", "--distro", "debian", "--default"])
         host, _, argv = remote.call_args.args
         self.assertEqual(host, "mini")
-        self.assertEqual(argv[:2], ["template", "macos"])
-        self.assertIn("--name=tahoe", argv)
-        self.assertIn(f"--base={rox.DEFAULT_TEMPLATE_BASE}", argv)
+        self.assertEqual(argv, ["template", "linux", "--distro=debian", "--base-password=admin",
+                                "--boot-timeout=600", "--default"])
         self.assertEqual(remote.call_args.kwargs["wait"], 4 * 3600)
+
+    def linux_template_fixture(self, images=()):
+        """Fake Tart and SSH for a fresh Linux image that takes the login key through Tart's guest agent."""
+        ssh = self.root / "home" / ".ssh"
+        ssh.mkdir(parents=True, exist_ok=True)
+        (ssh / "rox_vm").write_text("private\n")
+        (ssh / "rox_vm.pub").write_text("ssh-ed25519 AAAAlogin rox\n")
+        calls, state = [], {"authorized": False}
+
+        def fake_run(argv, **kwargs):
+            calls.append((argv, kwargs.get("input")))
+            if argv[0] == "ssh-keygen":
+                key = Path(argv[argv.index("-f") + 1])
+                key.write_text("SHARED PRIVATE HOST KEY\n")
+            if argv[0] == "ssh" and argv[-1] == "true":
+                return subprocess.CompletedProcess(argv, 0 if state["authorized"] else 255, "", "")
+            return subprocess.CompletedProcess(argv, 0, "", "")
+
+        def fake_output(argv, **kwargs):
+            calls.append((argv, kwargs.get("input")))
+            remote = argv[-1]
+            if argv[:2] == ["ssh-keygen", "-y"]:
+                return "ssh-ed25519 AAAAshared rox linux template"
+            if argv[:2] == ["rex", "version"]:
+                return "rex 0.1.0-preview.21\ncommit: abc"
+            if argv[:2] == ["tart", "ip"]:
+                return "192.168.64.7"
+            if argv[:2] == ["tart", "exec"] and rox.AUTHORIZE_SCRIPT in argv:
+                state["authorized"] = True
+                return ""
+            if remote.endswith("ssh_host_ed25519_key.pub"):
+                return "ssh-ed25519 AAAAimage root@ubuntu"
+            if "uname" in remote:
+                return "Linux"
+            return "rex 0.1.0-preview.21"
+
+        vm = unittest.mock.MagicMock()
+        vm.poll.return_value = None
+        patches = [
+            patch.object(rox.sys, "platform", "darwin"),
+            patch.object(rox.platform, "machine", return_value="arm64"),
+            patch.object(rox, "require"),
+            patch.object(rox, "tart_images", return_value=set(images)),
+            patch.object(rox, "guest_state", return_value="stopped"),
+            patch.object(rox, "run", side_effect=fake_run),
+            patch.object(rox, "output", side_effect=fake_output),
+            patch.object(rox, "run_vm", return_value=vm),
+        ]
+        for item in patches:
+            item.start()
+            self.addCleanup(item.stop)
+        return calls
+
+    def test_linux_template_installs_rex_shares_one_host_key_and_checks_a_clone(self):
+        calls = self.linux_template_fixture()
+        printed = io.StringIO()
+        with contextlib.redirect_stdout(printed):
+            rox.main(["template", "linux"])
+        commands = [argv for argv, _ in calls]
+        self.assertIn(["tart", "clone", rox.LINUX_TEMPLATE_BASES["ubuntu"], "rox-ubuntu"], commands)
+        self.assertIn(["tart", "exec", "rox-ubuntu", "/bin/sh", "-c", rox.AUTHORIZE_SCRIPT, "rox",
+                       "ssh-ed25519 AAAAlogin rox"], commands)
+        config_dir = self.root / "config-home" / "rox"
+        self.assertEqual(json.loads((config_dir / "config.json").read_text())["linux"], {
+            "image": "rox-ubuntu", "user": "admin", "identity": "~/.ssh/rox_vm",
+            "host_key": "~/.ssh/rox_linux_host.pub"})
+        self.assertEqual((self.root / "home" / ".ssh" / "rox_linux_host.pub").read_text(),
+                         "ssh-ed25519 AAAAshared\n")
+        # Rex follows this machine's channel, and secrets reach the guest only on stdin.
+        setup = next((argv, given) for argv, given in calls if argv[0] == "ssh" and "chpasswd" in argv[-1])
+        self.assertIn("preview", setup[0][-1])
+        password = (config_dir / "rox-ubuntu-admin-password").read_text().strip()
+        self.assertEqual(setup[1], password + "\n")
+        host_key = next(given for argv, given in calls if argv[0] == "ssh" and "ssh_host_ed25519_key" in argv[-1]
+                        and given)
+        self.assertEqual(host_key, "SHARED PRIVATE HOST KEY\n")
+        self.assertFalse(any(password in " ".join(argv) or "SHARED PRIVATE" in " ".join(argv)
+                             for argv in commands))
+        # A throwaway clone boots and takes SSH with the pinned key, then goes away.
+        clone = next(argv[3] for argv in commands if argv[:3] == ["tart", "clone", "rox-ubuntu"])
+        self.assertRegex(clone, r"^rox-ubuntu-check-[0-9a-f]{6}$")
+        self.assertIn(["tart", "delete", clone], commands)
+        self.assertIn("Launch with rox up linux.", printed.getvalue())
+
+    def test_another_linux_template_keeps_the_default_image_unless_asked(self):
+        config_dir = self.root / "config-home" / "rox"
+        config_dir.mkdir(parents=True)
+        (config_dir / "config.json").write_text(json.dumps({"linux": {"image": "rox-ubuntu"}}))
+        self.linux_template_fixture()
+        printed = io.StringIO()
+        with contextlib.redirect_stdout(printed):
+            rox.main(["template", "linux", "--distro", "debian"])
+        self.assertEqual(json.loads((config_dir / "config.json").read_text())["linux"]["image"], "rox-ubuntu")
+        self.assertIn("rox up linux --image rox-debian", printed.getvalue())
+        with contextlib.redirect_stdout(io.StringIO()):
+            rox.main(["template", "linux", "--distro", "fedora", "--default"])
+        self.assertEqual(json.loads((config_dir / "config.json").read_text())["linux"]["image"], "rox-fedora")
+
+    def test_linux_template_needs_a_base_for_arch_and_a_name_for_an_unknown_base(self):
+        self.linux_template_fixture()
+        with self.assertRaisesRegex(rox.Error, "No Tart image of arch"):
+            rox.main(["template", "linux", "--distro", "arch"])
+        with self.assertRaisesRegex(rox.Error, "--name"):
+            rox.main(["template", "linux", "--base", "ghcr.io/acme/tart-arch:latest"])
+        with self.assertRaisesRegex(rox.Error, "rox template linux"):
+            rox.main(["template", "macos", "--distro", "debian"])
+
+    def test_rex_channel_follows_this_machines_rex(self):
+        for version, channel in (("rex 0.1.0-preview.21", "preview"), ("rex 0.1.0alpha2460", "snapshot"),
+                                 ("rex 1.2.0", "stable")):
+            with self.subTest(version=version), patch.object(rox, "output", return_value=version):
+                self.assertEqual(rox.rex_channel(), channel)
+        with patch.object(rox, "output", side_effect=rox.Error("no rex")):
+            self.assertEqual(rox.rex_channel(), "preview")
 
 if __name__ == "__main__":
     unittest.main()
