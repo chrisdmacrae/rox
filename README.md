@@ -251,6 +251,7 @@ It checks every 15 seconds, logs to `~/.local/state/rox/service.log`, and leaves
 | `rox ls` | List local workspace records, their provisioning state, IP address (Tart VMs and Apple containers), and each guest's projects. Add `--all` to include the guests on every Rex host you can reach, `--host HOST` for one host, or `--json`. |
 | `rox add NAME` | Clone a project into a running guest and start a Rex session at its checkout. |
 | `rox shell NAME [PROJECT]` | Open an interactive shell at a project checkout. Without `PROJECT`, it opens the guest's only checkout, or the guest home when there are none or several. |
+| `rox agent NAME [PROJECT]` | Start Claude Code or Codex in a new Rex session at a checkout in a running guest. Pick one with `--agent` when the guest has both, pass the agent's arguments after `--`, and add `--open-shell` to show it in the Rex app. |
 | `rox forward NAME PORT...` | Forward `localhost` ports on the launcher to servers on the guest's `localhost`, for example dev servers. Use `LOCAL:GUEST` to pick a different local port. Runs until Ctrl-C. |
 | `rox funnel NAME PORT` | Put a server in the guest on the internet with Tailscale Funnel, through the launcher's Tailscale. `--https 8443` or `10000` and `--path` pick the public address, and `--off` stops it. See the [tailnet guide](docs/src/content/docs/guides/tailnet.mdx#sharing-a-guests-server-on-the-internet). |
 | `rex -S NAME ls` | List the guest's Rex sessions after a local launch with host registration. |

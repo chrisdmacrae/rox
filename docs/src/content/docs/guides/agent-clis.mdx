@@ -115,6 +115,13 @@ rox config agents codex --version 0.171.0
 
 **Tart VMs** install the agents when they boot, and skip any that are already at the right version. Project images for Tart include them, so later boots only update.
 
+**To start an agent in a running guest**, in a new Rex session at a checkout:
+
+```sh
+rox agent NAME --open-shell
+rox agent NAME api --agent codex -- "fix the failing tests"
+```
+
 **Guests that are already running** keep their versions until you update them:
 
 ```sh

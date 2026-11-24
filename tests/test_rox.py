@@ -1894,6 +1894,57 @@ class WorkspaceTests(unittest.TestCase):
                       listed.getvalue())
         self.assertEqual(self.down_without_name()[0], guest.name)
 
+    def test_agent_starts_an_agent_session_at_a_checkout_in_a_running_guest(self):
+        repo = self.make_repo()
+        printed = io.StringIO()
+        with self.fake_guests() as record, contextlib.redirect_stdout(printed):
+            rox.main(["up", "container", "--no-agents", "--cwd", str(repo)])
+            [guest] = self.guests()
+            with self.assertRaisesRegex(rox.Error, "has no agent CLI from rox. Choose one with --agent"):
+                rox.main(["agent", guest.name])
+            guest.agents = {"claude": "2.1.0", "codex": "0.171.0"}
+            guest.save()
+            with self.assertRaisesRegex(rox.Error, "Choose one with --agent claude or --agent codex"):
+                rox.main(["agent", guest.name])
+            record["stages"].clear()
+            rox.main(["agent", guest.name, "--agent", "codex", "--", "fix the tests"])
+            guest.agents = {"claude": "2.1.0"}
+            guest.save()
+            rox.main(["agent", guest.name, "sample-project"])
+            with self.assertRaisesRegex(rox.Error, "is not a project"):
+                rox.main(["agent", guest.name, "missing"])
+            with patch.object(rox, "local_app", return_value="Rex"), patch.object(rox, "open_in_app") as opened:
+                rox.main(["agent", guest.name, "--open-shell"])
+        workspace = f"/home/guest/.rox/{guest.name}/projects/sample-project"
+        sessions = [stage for stage in record["stages"] if stage[0] == "session"]
+        self.assertEqual([stage[stage.index("new") + 1:] for stage in sessions], [
+            ("codex sample-project", "-c", workspace, "--json", "--keep-open", "--", "codex", "fix the tests"),
+            ("claude sample-project", "-c", workspace, "--json", "--keep-open", "--", "claude"),
+            ("claude sample-project", "-c", workspace, "--json", "--keep-open", "--", "claude"),
+        ])
+        [(name, _, session, _)] = [call.args for call in opened.call_args_list]
+        self.assertEqual((name, session), (guest.name, "session:4"))
+        self.assertIn(f"Agent      Codex\nProject    sample-project\nCheckout   {workspace}\nSession    session:2",
+                      printed.getvalue())
+        # The guest's own session and its projects are left as they were.
+        self.assertEqual(rox.Guest.load(guest.name).projects[0].session_id, "session:1")
+
+    def test_agent_for_a_guest_on_another_host_runs_there_and_opens_through_the_tailnet(self):
+        record = {"name": "rv-app-000011112222", "tailnet": "rv-app-000011112222.example.ts.net"}
+        ran = []
+
+        def remote(server, label, argv, wait=30):
+            ran.append((server, argv))
+            return 0, "Workspace  rv-app-000011112222\nSession    session:9\n"
+
+        with patch.object(rox, "find_remote_guest", return_value=("mini", record)), \
+                patch.object(rox, "rex_output", side_effect=remote), \
+                patch.object(rox, "open_in_app") as opened, contextlib.redirect_stdout(io.StringIO()):
+            rox.main(["agent", record["name"], "api", "--agent", "claude", "--open-shell", "--", "-p", "hi"])
+        self.assertEqual(ran, [("mini", [*rox.REMOTE_ROX, "agent", record["name"], "api", "--agent=claude",
+                                         "--", "-p", "hi"])])
+        opened.assert_called_once_with(record["name"], record["tailnet"], "session:9", record["tailnet"])
+
     def test_add_marks_a_failed_project_and_keeps_the_guest_ready(self):
         with self.fake_guests() as record, contextlib.redirect_stdout(io.StringIO()):
             rox.main(["up", "container", "--no-project", "--cwd", str(self.root)])

@@ -3672,6 +3672,66 @@ def shell(name, key=None):
     os.execvpe(argv[0], argv, {**os.environ, "TERM": "xterm-256color"})
 
 
+def pick_agent(guest, agent=None):
+    """The agent CLI to start: the one asked for, or the guest's only installed one."""
+    if agent:
+        return agent
+    installed = sorted(guest.agents)
+    if len(installed) == 1:
+        return installed[0]
+    if not installed:
+        raise Error(f"{guest.name} has no agent CLI from rox. Choose one with --agent, or set them up for new "
+                    "guests with rox config agents")
+    raise Error(f"{guest.name} has {' and '.join(AGENT_NAMES[name] for name in installed)}. "
+                f"Choose one with --agent {' or --agent '.join(installed)}")
+
+
+def start_agent(name, key=None, agent=None, arguments=(), open_app=False):
+    """rox agent: start an agent CLI in a new Rex session in a running guest, at a checkout."""
+    guest = ready_guest(name)
+    project = guest.find_project(key) if key else None
+    if project and project.phase != "ready":
+        raise Error(f"{project.id} on {name} is {project.phase}, so it has no checkout to start in")
+    checkouts = [(entry.id, entry.name, entry.workspace) for entry in guest.projects if entry.phase == "ready"]
+    directory = shell_directory(name, checkouts, str(guest.home), key)
+    project = project or next((entry for entry in guest.projects if entry.workspace == directory), None)
+    agent = pick_agent(guest, agent)
+    label = f"{agent} {project.id}" if project else agent
+    session = start_session(guest, label, directory, [agent, *arguments])
+    print(f"Workspace  {guest.name}")
+    print(f"Agent      {AGENT_NAMES[agent]}")
+    if project:
+        print(f"Project    {project.id}")
+    print(f"Checkout   {directory}")
+    print(f"Session    {session}")
+    print(f"Inspect    rex -S {guest.name if guest.registered else guest.endpoint} session inspect {session}",
+          flush=True)
+    if open_app:
+        if not local_app():
+            raise Error(f"Open the Rex app on this machine to watch {session}, or connect with "
+                        f"rex -S {guest.name}")
+        open_in_app(guest.name, guest.endpoint, session, guest.tailnet_name or guest.endpoint)
+
+
+def remote_agent(host, record, args, arguments):
+    """rox agent for a guest on another host: start it there, and open it here through the tailnet."""
+    name = record["name"]
+    argv = ["agent", name, *([args.project] if args.project else []),
+            *([f"--agent={args.agent}"] if args.agent else []), *(["--", *arguments] if arguments else [])]
+    returncode, text = rex_output(host, f"rox agent {name}", [*REMOTE_ROX, *argv], wait=120)
+    if text.strip():
+        print(text.rstrip(), flush=True)
+    if returncode:
+        raise Error(f"rox agent exited with status {returncode} on {host}")
+    if not args.open_shell:
+        return
+    session = next((line.split()[1] for line in text.splitlines() if line.startswith("Session ")), "")
+    if not record.get("tailnet") or not session:
+        raise Error(f"{name} runs on {host} and isn't on the tailnet, so the Rex app here can't reach it. "
+                    f"Open the session from {host}")
+    open_in_app(name, record["tailnet"], session, record["tailnet"])
+
+
 def reconnect(name, force=True):
     """Start the guest if it stopped, and restore its tunnel, Rex server and tailnet node."""
     guest = Guest.load(name)
@@ -4481,6 +4541,15 @@ def main(argv):
     shell_parser.add_argument("project", nargs="?", help="project checkout to open; omit for the only one or the guest home")
     HOST_HELP = "Rex host that runs the guest; found automatically when omitted"
     shell_parser.add_argument("-S", "--host", help=HOST_HELP)
+    agent_parser = commands.add_parser("agent", help="start an agent CLI in a new Rex session in a running guest")
+    agent_parser.add_argument("name")
+    agent_parser.add_argument("project", nargs="?",
+                              help="project checkout to start in; omit for the only one or the guest home")
+    agent_parser.add_argument("--agent", choices=sorted(AGENT_NAMES),
+                              help="agent CLI to start; defaults to the guest's only one")
+    agent_parser.add_argument("--open-shell", action="store_true",
+                              help="show the new session in the Rex app on this machine")
+    agent_parser.add_argument("-S", "--host", help=HOST_HELP)
     forward_parser = commands.add_parser("forward", help="forward localhost ports to servers in a guest")
     forward_parser.add_argument("name")
     forward_parser.add_argument("ports", nargs="+", type=forward_spec, metavar="PORT|LOCAL:GUEST",
@@ -4593,8 +4662,14 @@ def main(argv):
         if args.host is None and re.fullmatch(NAME_PATTERN, args.name) and not is_local(args.name):
             args.host = find_remote_guest(args.name)[0]
         add(args, command)
+    elif args.command == "agent":
+        if args.host is not None or not is_local(args.name):
+            host, record = find_remote_guest(args.name, args.host)
+            remote_agent(host, record, args, command)
+        else:
+            start_agent(args.name, args.project, args.agent, command, args.open_shell)
     elif command:
-        parser.error("only up and add accept a command after --")
+        parser.error("only up, add and agent accept arguments after --")
     elif args.command in ("shell", "forward", "funnel", "reconnect", "start", "stop", "down",
                           "update-agents") and route_remote(args):
         return
