@@ -69,19 +69,23 @@ Open an interactive login shell with `REX_SERVER` pointing at the guest's server
 | --- | --- |
 | `-S`, `--host HOST` | The Rex host that runs the guest. Without it, Rox looks for the guest on this machine, then on each Rex host. |
 
-## `rox agent NAME [PROJECT]`
+## `rox agent [NAME] [PROJECT]`
 
 Start an agent CLI in a new Rex session in a running guest, at a project checkout. Arguments after `--` go to the agent, such as a prompt. The guest's own sessions and projects are left as they are, so you can start several agents in one guest.
 
 ```sh
-rox agent NAME [PROJECT] [--agent claude|codex] [--open-shell] [-- ARG ...]
+rox agent [NAME] [PROJECT] [--agent claude|codex] [--local] [--open-shell] [-- ARG ...]
 ```
+
+Without `NAME`, Rox looks at the running guests on this machine and on each Rex host. Inside a checkout it picks among the guests with a checkout of that project and starts there. A guest's checkout counts when its name matches the checkout's folder or a remote's repository name, or its URL matches one of the checkout's remotes, so a second checkout of a repository under another folder name finds the same guest. When none has it, Rox asks at a terminal whether to start one with `rox up` (with `--local` and `--host` carried over) and then starts the agent in it. Outside a checkout, any running guest will do. With one candidate Rox uses it, and with several it asks, or lists them when there's no terminal. `rox agent PROJECT` picks among the guests with that project.
 
 `PROJECT` picks the checkout the way it does for `rox shell`. Without `--agent`, Rox starts the guest's only [agent CLI](../../guides/agent-clis/) and asks you to choose when it has both. The session stays open after the agent exits. Rox prints the new `Session` ID with the `Workspace` and `Checkout`, so a controller can drive it with `rex -S NAME`. If the guest stopped or lost its tunnel, Rox starts it again first. If this machine has no record of `NAME`, Rox finds the Rex host that runs it and starts the agent there.
 
 | Option | Description |
 | --- | --- |
 | `--agent claude\|codex` | The agent CLI to start, even one the guest got some other way, such as from `.rox.sh`. |
+| `--local` | First bring the guest's checkout of this project to this checkout's HEAD and uncommitted files, as `rox add --local` does. Rox refuses when the guest's checkout has working changes, or commits on the branch that this checkout lacks, unless its files already match this checkout's. Only for guests on this machine. |
+| `--cwd DIR` | The directory within the current project, instead of the working directory. |
 | `--open-shell` | Show the new session in the Rex app on this machine. For a guest on another host, the guest must be on the tailnet. |
 | `-S`, `--host HOST` | The Rex host that runs the guest. Without it, Rox looks for the guest on this machine, then on each Rex host. |
 

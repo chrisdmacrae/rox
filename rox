@@ -323,9 +323,14 @@ def local_checkout(args):
         raise Error("--local copies this machine's checkout, so it can't be combined with --host")
     if getattr(args, "no_project", False) or args.project is not None:
         raise Error("--local copies the current checkout, so it can't be combined with --project or --no-project")
-    if not in_checkout(args.cwd):
-        raise Error(f"--local needs a Git checkout, and {args.cwd} is not inside one")
-    root = Path(output(["git", "-C", str(args.cwd), "rev-parse", "--show-toplevel"]))
+    return checkout_root(args.cwd)
+
+
+def checkout_root(cwd):
+    """The root of the checkout at cwd, which needs a commit for --local to copy."""
+    if not in_checkout(cwd):
+        raise Error(f"--local needs a Git checkout, and {cwd} is not inside one")
+    root = Path(output(["git", "-C", str(cwd), "rev-parse", "--show-toplevel"]))
     if run(["git", "-C", str(root), "rev-parse", "--verify", "--quiet", "HEAD^{commit}"],
            capture=True, check=False).returncode:
         raise Error(f"--local needs a commit in {root}. Commit something first")
@@ -406,6 +411,69 @@ def send_local(guest, workspace, root, branch):
             with source.open("rb") as stream:
                 run(remote_command(guest, upload), stdin=stream)
     guest_stage(guest, "local", workspace, payload, branch, head)
+
+
+# What rox agent --local needs to know about a checkout in the guest before it replaces it: the
+# branch, HEAD, and, when it has working changes, their tree and the first few of them.
+CHECKOUT_STATE_SCRIPT = r"""set -eu
+cd "$1"
+git symbolic-ref --quiet --short HEAD || echo
+git rev-parse HEAD
+changes=$(git status --porcelain --untracked-files=all)
+[ -n "$changes" ] || exit 0
+index=$(mktemp)
+trap 'rm -f "$index"' EXIT
+cp "$(git rev-parse --git-path index)" "$index"
+GIT_INDEX_FILE=$index git add -A
+GIT_INDEX_FILE=$index git write-tree
+printf '%s\n' "$changes" | head -n 10
+"""
+
+
+def working_tree(root):
+    """The tree of a checkout's files as they are, uncommitted and untracked ones included."""
+    def git(*args, env=None):
+        return run(["git", "-C", str(root), *args], capture=True, check=True, env=env).stdout.strip()
+
+    with tempfile.TemporaryDirectory(prefix="rox-index-") as scratch:
+        index = Path(scratch) / "index"
+        current = Path(root) / git("rev-parse", "--git-path", "index")
+        if current.exists():
+            shutil.copyfile(current, index)  # Its stat cache saves hashing unchanged files again.
+        env = {**os.environ, "GIT_INDEX_FILE": str(index)}
+        git("add", "-A", env=env)
+        return git("write-tree", env=env)
+
+
+def update_local(guest, project, root):
+    """rox agent --local: bring a guest's checkout to the launcher's HEAD and uncommitted files.
+
+    It refuses when the guest's checkout has working changes of its own, or commits on the branch
+    that the launcher's checkout lacks, since replacing the checkout would lose them.
+    """
+    def git(*args):
+        return run(["git", "-C", str(root), *args], capture=True, check=False)
+
+    branch = project_from(root, None, None, None)[2]
+    state = output(remote_command(guest, ["sh", "-c", CHECKOUT_STATE_SCRIPT, "rox", project.workspace]))
+    lines = state.splitlines()
+    guest_branch, guest_head = lines[0].strip(), lines[1].strip()
+    if len(lines) > 2:
+        if lines[2].strip() == working_tree(root):
+            print(f"{project.id} on {guest.name} already has this checkout's changes", flush=True)
+            return
+        changes = "\n".join(f"  {line}" for line in lines[3:])
+        raise Error(f"{project.id} on {guest.name} has working changes, so --local would overwrite them. "
+                    f"Commit or discard them in the guest first:\n{changes}")
+    # Moving off another branch keeps its commits, but resetting this one would drop the guest's.
+    if guest_branch in ("", branch) and git("merge-base", "--is-ancestor", guest_head, "HEAD").returncode:
+        where = f"on {branch}" if guest_branch else "at its detached HEAD"
+        raise Error(f"{project.id} on {guest.name} has commits {where} that {root} lacks. "
+                    f"Push them from the guest and pull them here first")
+    send_local(guest, project.workspace, root, branch)
+    if project.branch != branch:
+        project.branch = branch
+        guest.save()
 
 
 def config_location(value):
@@ -3686,16 +3754,32 @@ def pick_agent(guest, agent=None):
                 f"Choose one with --agent {' or --agent '.join(installed)}")
 
 
-def start_agent(name, key=None, agent=None, arguments=(), open_app=False):
-    """rox agent: start an agent CLI in a new Rex session in a running guest, at a checkout."""
+def start_agent(name, key=None, agent=None, arguments=(), open_app=False, local=None):
+    """rox agent: start an agent CLI in a new Rex session in a running guest, at a checkout.
+
+    With local, a checkout root on this machine, the guest's checkout of it gets its changes first.
+    """
     guest = ready_guest(name)
+    if local:
+        checkout = current_checkout(local)
+        records = [{"checkouts": [{"id": entry.id, "name": entry.name, "url": entry.url}]} for entry in guest.projects]
+        key = key or next((found for found in (matching_checkout(record, None, checkout) for record in records)
+                           if found), local.name)
+        if not any(key in (entry.id, entry.name) for entry in guest.projects):
+            raise Error(f"{name} has no checkout of {key} for --local to update. "
+                        f"Add one with rox add {name} --local")
     project = guest.find_project(key) if key else None
     if project and project.phase != "ready":
         raise Error(f"{project.id} on {name} is {project.phase}, so it has no checkout to start in")
+    agent = pick_agent(guest, agent)
+    if local:
+        with guest_lock(guest.directory, wait=True):
+            guest = Guest.load(name)
+            project = guest.find_project(project.id)
+            update_local(guest, project, local)
     checkouts = [(entry.id, entry.name, entry.workspace) for entry in guest.projects if entry.phase == "ready"]
     directory = shell_directory(name, checkouts, str(guest.home), key)
     project = project or next((entry for entry in guest.projects if entry.workspace == directory), None)
-    agent = pick_agent(guest, agent)
     label = f"{agent} {project.id}" if project else agent
     session = start_session(guest, label, directory, [agent, *arguments])
     print(f"Workspace  {guest.name}")
@@ -3730,6 +3814,142 @@ def remote_agent(host, record, args, arguments):
         raise Error(f"{name} runs on {host} and isn't on the tailnet, so the Rex app here can't reach it. "
                     f"Open the session from {host}")
     open_in_app(name, record["tailnet"], session, record["tailnet"])
+
+
+def agent_guests(args):
+    """(host, record) for the running guests rox agent can start in, with None as this machine's host."""
+    if args.local:
+        found, problems = {"this machine": local_records()}, {}
+    else:
+        try:
+            found, problems = gather_records(args.host or "all")
+        except (Error, OSError, ValueError, KeyError, subprocess.SubprocessError) as error:
+            print(f"rox: Could not check other Rex hosts for workspaces. ({error})", file=sys.stderr, flush=True)
+            found, problems = {"this machine": local_records()}, {}
+    for host, problem in problems.items():
+        print(f"rox: Could not check {host} for workspaces. ({problem})", file=sys.stderr, flush=True)
+    return [(None if host == "this machine" else host, record) for host, records in found.items()
+            for record in records if record.get("phase") == "ready"]
+
+
+def remote_key(url):
+    """A Git remote URL as host/path, so the SSH and HTTPS forms of one repository compare equal."""
+    url = url.strip().rstrip("/").removesuffix(".git")
+    parsed = urlsplit(url)
+    if parsed.scheme and parsed.hostname:
+        return f"{parsed.hostname.lower()}/{parsed.path.strip('/')}"
+    host, _, path = url.partition(":")
+    return f"{host.rpartition('@')[2].lower()}/{path.strip('/')}" if path else url
+
+
+def current_checkout(cwd):
+    """(names, remotes) that identify the checkout at cwd in guests, or None outside a checkout.
+
+    A guest's project is named after the checkout it came from, so a second checkout of the same
+    repository under another directory name still matches by a remote's repository name or URL.
+    """
+    if not in_checkout(cwd):
+        return None
+    root = Path(output(["git", "-C", str(cwd), "rev-parse", "--show-toplevel"]))
+    listing = run(["git", "-C", str(root), "config", "--get-regexp", r"^remote\..*\.url$"],
+                  capture=True, check=False).stdout
+    urls = [line.split(None, 1)[1] for line in listing.splitlines() if len(line.split(None, 1)) == 2]
+    return {root.name, *map(repo_name, urls)}, {remote_key(url) for url in urls}
+
+
+def matching_checkout(record, wanted, checkout):
+    """The id of the guest record's checkout of the wanted project or the current checkout, or None."""
+    entries = record.get("checkouts") or []
+    if wanted:
+        return next((entry.get("id") for entry in entries if wanted in (entry.get("id"), entry.get("name"))), None)
+    if not checkout:
+        return None
+    names, remotes = checkout
+    # A remote match is surest; a name match also covers older rox records, which carry no URL.
+    return next((entry.get("id") for entry in entries if entry.get("url") and remote_key(entry["url"]) in remotes),
+                next((entry.get("id") for entry in entries if names & {entry.get("id"), entry.get("name")}), None))
+
+
+class NoAgentGuest(Error):
+    """rox agent found no running guest to start in."""
+
+
+def choose_agent_guest(args):
+    """Pick the guest for rox agent without NAME, here or on another Rex host. Return (host, record).
+
+    Inside a checkout, only the guests with a checkout of that project, and it starts in that checkout.
+    Elsewhere, any running guest, unless a project was asked for.
+    """
+    guests = agent_guests(args)
+    checkout = current_checkout(args.cwd)
+    if args.project or checkout:
+        matching = []
+        for host, record in guests:
+            key = matching_checkout(record, args.project, checkout)
+            if key:
+                matching.append((host, record, key))
+        guests = [(host, record) for host, record, _ in matching]
+    where = "on this machine" if args.local else f"on {args.host}" if args.host else "here or on any Rex host"
+    if not guests:
+        wanted = args.project or (sorted(checkout[0], key=len)[0] if checkout else "")
+        having = f" with a checkout of {wanted}" if wanted else ""
+        raise NoAgentGuest(f"No running guests{having} {where}. Start one with rox up, or run rox ls --all")
+    rows = [(host, record["name"], record.get("backend") or "-", record.get("phase") or "-",
+             record.get("projects") or "-") for host, record in guests]
+    title = f"{len(guests)} running guests{' have this project' if args.project or checkout else ''}"
+    index = pick_guest(rows, title, "Start the agent in which guest?", "rox agent NAME")
+    host, record = guests[index]
+    if args.project or checkout:
+        args.project = matching[index][2]
+    if len(guests) == 1:
+        print(f"Starting the agent in {record['name']}{f' on {host}' if host else ''}", file=sys.stderr, flush=True)
+    return host, record
+
+
+def offer_guest(args, missing, parse):
+    """Ask at a terminal whether to start a guest for the current checkout when rox agent found none."""
+    if args.project or not in_checkout(args.cwd) or not sys.stdin.isatty():
+        raise missing
+    root = Path(output(["git", "-C", str(args.cwd), "rev-parse", "--show-toplevel"]))
+    where = f" on {args.host}" if args.host else ""
+    print(missing, file=sys.stderr, flush=True)
+    try:
+        answer = input(f"Start a guest for {root.name}{where} with rox up{' --local' if args.local else ''}? [Y/n] ")
+    except EOFError:
+        answer = "n"
+    if answer.strip().lower() not in ("", "y", "yes"):
+        raise missing
+    up(parse(["up", "--cwd", str(root), *(["--local"] if args.local else []),
+              *(["-S", args.host] if args.host else [])]), [])
+    return choose_agent_guest(args)
+
+
+def run_agent(args, arguments, parse):
+    """rox agent: find the guest, here or on another Rex host, and start the agent in it."""
+    if args.name and args.project is None and not re.fullmatch(NAME_PATTERN, args.name):
+        args.name, args.project = None, args.name  # rox agent PROJECT
+    local = None
+    if args.local:
+        if args.host is not None:
+            raise Error("--local copies this machine's checkout, so it can't be combined with --host")
+        local = checkout_root(args.cwd)
+    if not args.name:
+        try:
+            host, record = choose_agent_guest(args)
+        except NoAgentGuest as missing:
+            host, record = offer_guest(args, missing, parse)
+        args.name = record["name"]
+    elif args.host is None and is_local(args.name):
+        host, record = None, None
+    else:
+        host, record = find_remote_guest(args.name, args.host)
+    if host is None:
+        start_agent(args.name, args.project, args.agent, arguments, args.open_shell, local)
+    elif local:
+        raise Error(f"--local copies this checkout into guests on this machine, and {args.name} runs on {host}. "
+                    f"Run rox agent --local from a checkout on {host}")
+    else:
+        remote_agent(host, record, args, arguments)
 
 
 def reconnect(name, force=True):
@@ -3893,21 +4113,27 @@ def choose_project_guest(cwd):
     guests += remote_project_guests(project)
     if not guests:
         raise Error(f"No workspaces for {project}. Run rox ls --all to see all workspaces.")
-    if len(guests) == 1:
-        return guests[0][1], guests[0][0]
+    host, name = guests[pick_guest(guests, f"{project} has {len(guests)} workspaces", "Remove which workspace?",
+                                   "rox down NAME")][:2]
+    return name, host
+
+
+def pick_guest(rows, title, question, usage):
+    """The index of one of the (host, name, backend, phase, projects) rows, asking at a terminal."""
+    if len(rows) == 1:
+        return 0
     listing = "\n".join(f"  {index}) {name}  {f'on {host}  ' if host else ''}{backend}  {phase}  {projects}"
-                        for index, (host, name, backend, phase, projects) in enumerate(guests, 1))
+                        for index, (host, name, backend, phase, projects) in enumerate(rows, 1))
     if not sys.stdin.isatty():
-        raise Error(f"{project} has {len(guests)} workspaces. Choose one with rox down NAME:\n{listing}")
-    print(f"{project} has {len(guests)} workspaces:\n{listing}")
+        raise Error(f"{title}. Choose one with {usage}:\n{listing}")
+    print(f"{title}:\n{listing}")
     try:
-        answer = input(f"Remove which workspace? [1-{len(guests)}] ").strip()
+        answer = input(f"{question} [1-{len(rows)}] ").strip()
     except EOFError:
         answer = ""
-    if not answer.isdigit() or not 1 <= int(answer) <= len(guests):
+    if not answer.isdigit() or not 1 <= int(answer) <= len(rows):
         raise Error("No workspace selected")
-    host, name = guests[int(answer) - 1][:2]
-    return name, host
+    return int(answer) - 1
 
 
 def project_summary(guest):
@@ -3935,7 +4161,7 @@ def local_records():
             "ip": guest_ip(guest), "tailnet": guest.tailnet_name, "projects": project_summary(guest),
             # What another machine needs to open a shell in the guest through its tailnet Rex server.
             "socket": guest.guest_socket, "home": str(guest.home) if guest.guest_socket else "", "user": guest.user,
-            "checkouts": [{"id": project.id, "name": project.name, "workspace": project.workspace}
+            "checkouts": [{"id": project.id, "name": project.name, "url": project.url, "workspace": project.workspace}
                           for project in guest.projects if project.workspace],
             "funnels": [{"url": f["url"], "port": f["port"]} for f in guest.funnels],
             # Rex sessions in the guest's own server: "" for the guest's, and one per project.
@@ -4776,9 +5002,14 @@ def main(argv):
     HOST_HELP = "Rex host that runs the guest; found automatically when omitted"
     shell_parser.add_argument("-S", "--host", help=HOST_HELP)
     agent_parser = commands.add_parser("agent", help="start an agent CLI in a new Rex session in a running guest")
-    agent_parser.add_argument("name")
+    agent_parser.add_argument("name", nargs="?",
+                              help="guest to start in; omit to pick from the running guests here and on Rex hosts")
     agent_parser.add_argument("project", nargs="?",
-                              help="project checkout to start in; omit for the only one or the guest home")
+                              help="project checkout to start in; omit for the current project's, the only one "
+                                   "or the guest home")
+    agent_parser.add_argument("--local", action="store_true",
+                              help="first copy this checkout's commits and uncommitted files into the guest's checkout")
+    agent_parser.add_argument("--cwd", type=Path, default=Path.cwd(), help="directory within the current project")
     agent_parser.add_argument("--agent", choices=sorted(AGENT_NAMES),
                               help="agent CLI to start; defaults to the guest's only one")
     agent_parser.add_argument("--open-shell", action="store_true",
@@ -4899,11 +5130,7 @@ def main(argv):
             args.host = find_remote_guest(args.name)[0]
         add(args, command)
     elif args.command == "agent":
-        if args.host is not None or not is_local(args.name):
-            host, record = find_remote_guest(args.name, args.host)
-            remote_agent(host, record, args, command)
-        else:
-            start_agent(args.name, args.project, args.agent, command, args.open_shell)
+        run_agent(args, command, parser.parse_args)
     elif command:
         parser.error("only up, add and agent accept arguments after --")
     elif args.command in ("shell", "forward", "funnel", "reconnect", "start", "stop", "down",

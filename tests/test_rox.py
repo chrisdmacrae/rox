@@ -12,9 +12,10 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from types import SimpleNamespace
 import unittest
 import unittest.mock
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -766,7 +767,7 @@ class WorkspaceTests(unittest.TestCase):
         record = rox.local_records()[0]
         self.assertEqual(record["socket"], guest.guest_socket)
         self.assertEqual(record["user"], "workspace")
-        self.assertEqual(record["checkouts"], [{"id": "web", "name": "web", "workspace": "/home/workspace/web"}])
+        self.assertEqual(record["checkouts"], [{"id": "web", "name": "web", "url": "", "workspace": "/home/workspace/web"}])
 
     FUNNEL_STATUS = {
         "TCP": {"10000": {"HTTPS": True}},
@@ -1944,6 +1945,132 @@ class WorkspaceTests(unittest.TestCase):
         self.assertEqual(ran, [("mini", [*rox.REMOTE_ROX, "agent", record["name"], "api", "--agent=claude",
                                          "--", "-p", "hi"])])
         opened.assert_called_once_with(record["name"], record["tailnet"], "session:9", record["tailnet"])
+
+    def test_agent_without_a_name_picks_a_running_guest_here_or_on_another_host(self):
+        repo = self.make_repo()
+        outside = self.root / "elsewhere"
+        outside.mkdir()
+        with self.fake_guests() as record, contextlib.redirect_stdout(io.StringIO()):
+            rox.main(["up", "container", "--no-agents", "--cwd", str(repo)])
+            rox.main(["up", "container", "--no-agents", "--no-project", "--cwd", str(outside)])
+            for guest in self.guests():
+                guest.agents = {"claude": "2.1.0"}
+                guest.save()
+            [with_project] = [guest for guest in self.guests() if guest.projects]
+            here = lambda scope: ({"this machine": rox.local_records()}, {})
+            with patch.object(rox, "gather_records", side_effect=here):
+                record["stages"].clear()
+                # Inside the checkout, the guest that has it, at its checkout. A project name works too.
+                rox.main(["agent", "--cwd", str(repo)])
+                rox.main(["agent", "sample-project", "--cwd", str(outside)])
+                # Elsewhere, any running guest, so two of them need choosing.
+                with self.assertRaisesRegex(rox.Error, "2 running guests. Choose one with rox agent NAME"):
+                    rox.main(["agent", "--cwd", str(outside)])
+                with self.assertRaisesRegex(rox.Error, "No running guests with a checkout of missing"):
+                    rox.main(["agent", "missing", "--cwd", str(outside)])
+        workspace = f"/home/guest/.rox/{with_project.name}/projects/sample-project"
+        sessions = [stage for stage in record["stages"] if stage[0] == "session"]
+        self.assertEqual([stage[stage.index("-c") + 1] for stage in sessions], [workspace, workspace])
+
+        remote = {"name": "rv-app-000011112222", "phase": "ready", "checkouts": [{"id": "app", "name": "app"}]}
+        with patch.object(rox, "gather_records", return_value=({"this machine": [], "mini": [remote]}, {})), \
+                patch.object(rox, "remote_agent") as started, contextlib.redirect_stderr(io.StringIO()):
+            rox.main(["agent", "app", "--cwd", str(outside)])
+        self.assertEqual(started.call_args.args[:2], ("mini", remote))
+        self.assertEqual(started.call_args.args[2].project, "app")
+        with self.assertRaisesRegex(rox.Error, "can't be combined with --host"):
+            rox.main(["agent", "--local", "-S", "mini"])
+
+    def test_agent_without_a_name_matches_another_checkout_of_the_same_repository(self):
+        other = self.root / "repo-review"
+        subprocess.run(["git", "init", "--quiet", str(other)], check=True)
+        subprocess.run(["git", "-C", str(other), "remote", "add", "origin", "git@git.example.test:main/repo.git"],
+                       check=True)
+        unrelated = self.root / "unrelated"
+        subprocess.run(["git", "init", "--quiet", str(unrelated)], check=True)
+        named = {"name": "rv-sample-000011112222", "phase": "ready",
+                 "checkouts": [{"id": "sample-project", "name": "sample project",
+                                "url": "https://git.example.test/main/repo.git"}]}
+        old = {"name": "rv-repo-000011113333", "phase": "ready", "checkouts": [{"id": "repo", "name": "repo"}]}
+        for record, project in ((named, "sample-project"), (old, "repo")):
+            with patch.object(rox, "gather_records", return_value=({"this machine": [], "mini": [record]}, {})), \
+                    patch.object(rox, "remote_agent") as started, contextlib.redirect_stderr(io.StringIO()):
+                rox.main(["agent", "--cwd", str(other)])
+            self.assertEqual(started.call_args.args[1], record)
+            self.assertEqual(started.call_args.args[2].project, project)
+        # A checkout of another project doesn't start in an unrelated guest.
+        with patch.object(rox, "gather_records", return_value=({"this machine": [], "mini": [named]}, {})), \
+                patch.object(rox, "remote_agent") as started, \
+                self.assertRaisesRegex(rox.Error, "No running guests with a checkout of unrelated"):
+            rox.main(["agent", "--cwd", str(unrelated)])
+        started.assert_not_called()
+
+    def test_agent_without_a_guest_for_the_checkout_offers_to_start_one(self):
+        repo = self.make_repo()
+        records = []
+        listing = lambda scope: ({"this machine": records}, {})
+        launched = {"name": "rv-sample-000011112222", "phase": "ready",
+                    "checkouts": [{"id": "sample-project", "name": "sample project", "url": ""}]}
+
+        def fake_up(args, command):
+            self.assertEqual((args.cwd, args.local, args.host), (repo.parent, False, None))
+            records.append(launched)
+
+        tty = Mock(isatty=Mock(return_value=True))
+        with patch.object(rox, "gather_records", side_effect=listing), patch.object(rox, "up", side_effect=fake_up), \
+                patch.object(rox, "start_agent") as started, patch.object(rox.sys, "stdin", tty), \
+                contextlib.redirect_stderr(io.StringIO()):
+            with patch("builtins.input", return_value="n"), \
+                    self.assertRaisesRegex(rox.Error, "No running guests with a checkout of"):
+                rox.main(["agent", "--cwd", str(repo)])
+            self.assertEqual(records, [])
+            with patch("builtins.input", return_value="") as asked:
+                rox.main(["agent", "--cwd", str(repo)])
+        self.assertIn("Start a guest for sample project with rox up?", asked.call_args.args[0])
+        self.assertEqual(started.call_args.args[:2], ("rv-sample-000011112222", "sample-project"))
+        # Without a terminal, it says how to start one instead.
+        with patch.object(rox, "gather_records", return_value=({"this machine": []}, {})), \
+                patch.object(rox, "up") as up, self.assertRaisesRegex(rox.Error, "Start one with rox up"):
+            rox.main(["agent", "--cwd", str(repo)])
+        up.assert_not_called()
+
+    def test_agent_local_updates_a_clean_guest_checkout_and_refuses_to_lose_its_work(self):
+        def git(cwd, *args):
+            return subprocess.run(["git", "-C", str(cwd), "-c", "user.name=t", "-c", "user.email=t@example.test",
+                                   *args], check=True, capture_output=True, text=True).stdout.strip()
+
+        remote = self.root / "remote.git"
+        git(self.root, "init", "--quiet", "--bare", "--initial-branch=main", str(remote))
+        launcher = self.root / "launcher"
+        git(self.root, "clone", "--quiet", str(remote), str(launcher))
+        git(launcher, "remote", "set-url", "origin", "https://git.example.test/repo.git")
+        (launcher / "a.txt").write_text("one\n")
+        git(launcher, "add", ".")
+        git(launcher, "commit", "--quiet", "-m", "base")
+        workspace = self.root / "guest"
+        git(self.root, "clone", "--quiet", str(launcher), str(workspace))
+        git(launcher, "commit", "--quiet", "--allow-empty", "-m", "newer")
+        (launcher / "a.txt").write_text("edited\n")
+        guest = SimpleNamespace(name="rv-app-000011112222", save=lambda: None)
+        project = SimpleNamespace(id="app", workspace=str(workspace), branch="main")
+        locally = lambda guest, argv, agent=None, tty=False: ["sh", "-c", shlex.join(argv)]
+        printed = io.StringIO()
+        with patch.object(rox, "remote_command", side_effect=locally), contextlib.redirect_stdout(printed), \
+                contextlib.redirect_stderr(io.StringIO()):
+            rox.update_local(guest, project, launcher)
+            self.assertEqual(git(workspace, "rev-parse", "HEAD"), git(launcher, "rev-parse", "HEAD"))
+            self.assertEqual((workspace / "a.txt").read_text(), "edited\n")
+            # The guest now has the launcher's uncommitted change, which is no work of its own.
+            rox.update_local(guest, project, launcher)
+            self.assertIn("already has this checkout's changes", printed.getvalue())
+            (workspace / "b.txt").write_text("the guest's\n")
+            with self.assertRaisesRegex(rox.Error, r"has working changes(.|\n)*\?\? b.txt"):
+                rox.update_local(guest, project, launcher)
+            git(workspace, "add", "-A")
+            git(workspace, "commit", "--quiet", "-m", "guest work")
+            with self.assertRaisesRegex(rox.Error, "has commits on main that .* lacks"):
+                rox.update_local(guest, project, launcher)
+            self.assertEqual((workspace / "b.txt").read_text(), "the guest's\n")
 
     def test_add_marks_a_failed_project_and_keeps_the_guest_ready(self):
         with self.fake_guests() as record, contextlib.redirect_stdout(io.StringIO()):
