@@ -6,9 +6,9 @@ export PATH="$HOME/.local/bin:/usr/local/bin:/opt/homebrew/bin:$PATH"
 stage=$1
 shift
 
-hook_agent_env() {
-    # Shells read the agents' credentials, which rox writes to ~/.rox/agents.env at boot.
-    local line='[ -f "$HOME/.rox/agents.env" ] && . "$HOME/.rox/agents.env"' file
+hook_env() {
+    # Shells read ~/.rox/NAME.env, which rox writes at boot.
+    local line="[ -f \"\$HOME/.rox/$1.env\" ] && . \"\$HOME/.rox/$1.env\"" file
     for file in "$HOME/.profile" "$HOME/.bashrc" "$HOME/.zshenv"; do
         grep -qxF "$line" "$file" 2>/dev/null || printf '%s\n' "$line" >>"$file"
     done
@@ -113,6 +113,11 @@ case "$stage" in
         # Rox forwards the launcher's Git keys to this path, when the guest has them.
         export SSH_AUTH_SOCK="$base/git-agent.sock"
         endpoint="unix://$1"
+        # Rex doesn't tell the guest's terminals which server they're in, so rex there would look
+        # for a server at the default socket. The server and every shell get this one.
+        mkdir -p "$HOME/.rox"
+        printf '[ -n "${REX_SERVER:-}" ] || export REX_SERVER=%q\n' "$endpoint" >"$HOME/.rox/rex.env"
+        hook_env rex
         rex_ready() {
             [[ -S $1 ]] && rex --autostart=false --timeout 1s -S "$endpoint" ls >/dev/null 2>&1
         }
@@ -124,6 +129,7 @@ case "$stage" in
         if [[ -f $HOME/.rox/agents.env ]]; then
             . "$HOME/.rox/agents.env"
         fi
+        export REX_SERVER="$endpoint"
         nohup rex server run --listen "$endpoint" --state-dir "$base/rex-state" >"$log" 2>&1 </dev/null &
         server_pid=$!
         deadline=$((SECONDS + 10))
@@ -143,7 +149,8 @@ case "$stage" in
         ;;
     agents)
         # Each argument is AGENT=VERSION, where VERSION may be latest.
-        hook_agent_env
+        # The agents' credentials.
+        hook_env agents
         for spec; do
             agent=${spec%%=*}
             version=${spec#*=}

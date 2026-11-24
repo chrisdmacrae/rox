@@ -2476,6 +2476,37 @@ class WorkspaceTests(unittest.TestCase):
         server = script[script.index("    server)"):script.index("    session)")]
         self.assertLess(server.index('. "$HOME/.rox/agents.env"'), server.index("nohup rex server run"))
 
+    def test_bootstrap_server_tells_shells_and_terminals_its_socket(self):
+        import socket
+        home = self.root / "guest home"
+        base = home / ".rox" / "rv-fixture-000011112222"
+        base.mkdir(parents=True)
+        # A short path, since Unix socket paths are limited to about 100 bytes.
+        path = Path(tempfile.mkdtemp(dir="/tmp")) / "r.sock"
+        self.addCleanup(shutil.rmtree, path.parent)
+        listener = socket.socket(socket.AF_UNIX)
+        listener.bind(str(path))
+        self.addCleanup(listener.close)
+        tools = self.root / "guest-tools"
+        tools.mkdir()
+        (tools / "rex").write_text("#!/bin/sh\nexit 0\n")
+        (tools / "rex").chmod(0o755)
+        env = {**os.environ, "HOME": str(home), "PATH": f"{tools}{os.pathsep}{os.environ['PATH']}"}
+        env.pop("REX_SERVER", None)
+        for _ in range(2):
+            subprocess.run(["bash", str(ROOT / "guest/bootstrap.sh"), "server", str(path)], env=env, check=True)
+        line = '[ -f "$HOME/.rox/rex.env" ] && . "$HOME/.rox/rex.env"'
+        for name in (".profile", ".bashrc", ".zshenv"):
+            self.assertEqual((home / name).read_text().splitlines().count(line), 1)
+        shell = subprocess.run(["sh", "-c", '. "$HOME/.profile"; printf %s "$REX_SERVER"'], env=env,
+                               capture_output=True, text=True, check=True).stdout
+        self.assertEqual(shell, f"unix://{path}")
+        # A terminal that Rex already pointed at a server keeps it.
+        shell = subprocess.run(["sh", "-c", '. "$HOME/.profile"; printf %s "$REX_SERVER"'],
+                               env={**env, "REX_SERVER": "unix:///other"}, capture_output=True, text=True,
+                               check=True).stdout
+        self.assertEqual(shell, "unix:///other")
+
     def test_up_installs_agents_before_the_rex_server_starts(self):
         token = self.secret("token", "sk-ant-oat01-x")
         config = self.agent_config({"claude": {"token_file": str(token)}, "codex": False})
