@@ -148,6 +148,21 @@ Install a background service that [keeps guests running](../../guides/keep-runni
 
 `rox service uninstall` stops and removes the service. `rox service status` shows whether it's running. `rox service run` runs the same loop in the foreground, with `--interval SECONDS` to check more or less often.
 
+## `rox template macos`
+
+Prepare a macOS [Tart template](../../guides/tart-vms/) and point the `macos` config at it. Rox clones `--base` into the template unless it already exists, creates the VM login key `identity` if it's missing, and boots the template. Through Tart's guest agent it authorizes the key and pins the template's SSH host key at `host_key`. Over SSH it replaces the base image's password, updates `/etc/kcpassword` and the login keychain so the template still signs in to its desktop on boot, and copies this Mac's `/Applications/Rex.app` into it with `rex` on SSH's `PATH`. It checks `rex`, `git` and `bash` as the SSH user, reboots the template to confirm the desktop session, shuts it down and writes `image`, `user`, `identity` and `host_key` under `macos`. The new password is saved, readable only by you, next to the config as `TEMPLATE-USER-password`.
+
+Run it again after upgrading Rex to copy the new version into the template. It reuses the saved password and doesn't pull the image again. The template must be shut down. The base image needs Tart's guest agent, SSH, and passwordless `sudo` for the user, as Cirrus Labs' images have.
+
+| Option | Description |
+| --- | --- |
+| `-S`, `--host HOST` | Prepare the template on this Rex remote host. |
+| `--config PATH` | A different rox config file, on the machine that runs the guests. |
+| `--name NAME` | Template name. Defaults to `macos.image`, then `rox-macos`. |
+| `--base IMAGE` | Tart image to clone from. Defaults to `ghcr.io/cirruslabs/macos-tahoe-base:latest`. |
+| `--base-password PASSWORD` | The base image's login password, which Rox replaces. Defaults to `admin`. |
+| `--boot-timeout SECONDS` | Seconds per readiness check. Defaults to 600. |
+
 ## `rox key add PATH` / `rox key remove PATH`
 
 Add or remove a Git SSH private key path in `git_keys`. Removing a path doesn't delete the key file.

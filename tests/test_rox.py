@@ -1,3 +1,4 @@
+import base64
 import contextlib
 import importlib.machinery
 import importlib.util
@@ -5,12 +6,14 @@ import io
 import json
 import os
 from pathlib import Path
+import secrets
 import shlex
 import shutil
 import subprocess
 import sys
 import tempfile
 import unittest
+import unittest.mock
 from unittest.mock import patch
 
 
@@ -2850,6 +2853,120 @@ class WorkspaceTests(unittest.TestCase):
         self.assertEqual((home / ".ssh" / "known_hosts").read_text(),
                          "other ssh-ed25519 BBBB\ngithub.com ssh-ed25519 AAAA\n")
 
+
+    def test_kcpassword_matches_macos_auto_login_encoding(self):
+        # "admin" is what Cirrus Labs' images ship, so this is the /etc/kcpassword they boot with.
+        self.assertEqual(rox.kcpassword("admin").hex(), "1ced3f4abcbcddeaa3b91f7d")
+        for password in ("admin", "x" * 12, "a" * 13, secrets.token_urlsafe(18)):
+            encoded = rox.kcpassword(password)
+            self.assertEqual(len(encoded) % 12, 0)
+            self.assertGreater(len(encoded), len(password))  # Always NUL-terminated.
+            key = rox.KCPASSWORD_KEY
+            decoded = bytes(byte ^ key[index % len(key)] for index, byte in enumerate(encoded))
+            self.assertEqual(decoded.rstrip(b"\0"), password.encode())
+
+    def template_fixture(self, images=(), state="stopped"):
+        """Fake Tart, SSH and the host's Rex app, and return the commands rox template ran."""
+        app = self.root / "Rex.app"
+        (app / rox.REX_APP_CLI).parent.mkdir(parents=True)
+        (app / rox.REX_APP_CLI).write_text("")
+        ssh = self.root / "home" / ".ssh"
+        ssh.mkdir(parents=True, exist_ok=True)
+        (ssh / "rox_vm").write_text("private\n")
+        (ssh / "rox_vm.pub").write_text("ssh-ed25519 AAAAlogin rox\n")
+        calls = []
+
+        def fake_run(argv, **kwargs):
+            calls.append((argv, kwargs.get("input")))
+            return subprocess.CompletedProcess(argv, 0, "", "")
+
+        def fake_output(argv, **kwargs):
+            calls.append((argv, kwargs.get("input")))
+            remote = argv[-1]
+            if argv[:2] == ["tart", "ip"]:
+                return "192.168.64.5"
+            if remote.endswith("ssh_host_ed25519_key.pub"):
+                return "ssh-ed25519 AAAAhost root@template"
+            if "uname" in remote:
+                return "Darwin"
+            if "/dev/console" in remote:
+                return "admin"
+            return "rex 0.1.0"
+
+        vm = unittest.mock.MagicMock()
+        vm.poll.return_value = None
+        patches = [
+            patch.object(rox.sys, "platform", "darwin"),
+            patch.object(rox.platform, "machine", return_value="arm64"),
+            patch.object(rox, "require"),
+            patch.object(rox, "REX_APP", app),
+            patch.object(rox, "tart_images", return_value=set(images)),
+            patch.object(rox, "guest_state", return_value=state),
+            patch.object(rox, "run", side_effect=fake_run),
+            patch.object(rox, "output", side_effect=fake_output),
+            patch.object(rox, "run_vm", return_value=vm),
+            patch.object(rox, "install_template_rex"),
+        ]
+        for item in patches:
+            item.start()
+            self.addCleanup(item.stop)
+        return calls
+
+    def test_template_clones_prepares_and_points_the_macos_config_at_it(self):
+        calls = self.template_fixture()
+        with contextlib.redirect_stdout(io.StringIO()):
+            rox.main(["template", "macos"])
+        commands = [argv for argv, _ in calls]
+        self.assertEqual(commands[0], ["tart", "clone", rox.DEFAULT_TEMPLATE_BASE, "rox-macos"])
+        # A fresh image only lets the login key in through Tart's guest agent.
+        self.assertIn(["tart", "exec", "rox-macos", "/bin/bash", "-c", rox.AUTHORIZE_SCRIPT, "rox",
+                       "ssh-ed25519 AAAAlogin rox"], commands)
+        config_dir = self.root / "config-home" / "rox"
+        self.assertEqual(json.loads((config_dir / "config.json").read_text())["macos"], {
+            "image": "rox-macos", "user": "admin", "identity": "~/.ssh/rox_vm",
+            "host_key": "~/.ssh/rox_macos_host.pub"})
+        self.assertEqual((self.root / "home" / ".ssh" / "rox_macos_host.pub").read_text(),
+                         "ssh-ed25519 AAAAhost root@template\n")
+        password_file = config_dir / "rox-macos-admin-password"
+        self.assertEqual(password_file.stat().st_mode & 0o777, 0o600)
+        password = password_file.read_text().strip()
+        # The password reaches the guest on stdin with its auto-login copy, never on a command line.
+        self.assertFalse(any(password in " ".join(argv) for argv in commands))
+        secret = next(given for argv, given in calls if given and "dscl" in argv[-1])
+        old, new, encoded = secret.splitlines()
+        self.assertEqual((old, new), ("admin", password))
+        self.assertEqual(base64.b64decode(encoded), rox.kcpassword(password))
+        # It reboots the template to check the desktop session, and leaves it shut down.
+        self.assertEqual(sum("shutdown" in argv[-1] for argv in commands), 2)
+        self.assertTrue(any("/dev/console" in argv[-1] for argv in commands))
+
+    def test_template_rerun_keeps_the_saved_password_and_refuses_a_running_template(self):
+        config_dir = self.root / "config-home" / "rox"
+        config_dir.mkdir(parents=True)
+        (config_dir / "rox-macos-admin-password").write_text("saved\n")
+        calls = self.template_fixture(images={"rox-macos"})
+        # A template rox prepared takes SSH, even when its desktop session, and so Tart's agent, is gone.
+        (self.root / "home" / ".ssh" / "rox_macos_host.pub").write_text("ssh-ed25519 AAAAhost root@template\n")
+        with contextlib.redirect_stdout(io.StringIO()):
+            rox.main(["template", "macos"])
+        tart = [argv[1] for argv, _ in calls if argv[0] == "tart"]
+        self.assertNotIn("clone", tart)
+        self.assertNotIn("exec", tart)
+        secret = next(given for argv, given in calls if given and "dscl" in argv[-1])
+        self.assertEqual(secret.splitlines()[1], "saved")
+        rox.guest_state.return_value = "running"
+        with self.assertRaisesRegex(rox.Error, "rox-macos is running"):
+            rox.main(["template", "macos"])
+
+    def test_template_on_a_remote_host_runs_there_and_waits_for_the_pull(self):
+        with patch.object(rox, "run_on_host") as remote:
+            rox.main(["template", "macos", "-S", "mini", "--name", "tahoe"])
+        host, _, argv = remote.call_args.args
+        self.assertEqual(host, "mini")
+        self.assertEqual(argv[:2], ["template", "macos"])
+        self.assertIn("--name=tahoe", argv)
+        self.assertIn(f"--base={rox.DEFAULT_TEMPLATE_BASE}", argv)
+        self.assertEqual(remote.call_args.kwargs["wait"], 4 * 3600)
 
 if __name__ == "__main__":
     unittest.main()

@@ -117,14 +117,16 @@ Only the selected keys are loaded into an SSH agent on the host, one per guest. 
 
 ## Tart VMs
 
-On an Apple Silicon Mac, install Tart and prepare one template per guest OS.
+On an Apple Silicon Mac, install Tart and prepare one template per guest OS. With the Rex app installed, `rox template macos` (or `rox template macos --host HOST`) builds the macOS one: it pulls `ghcr.io/cirruslabs/macos-tahoe-base:latest` into `rox-macos`, authorizes a VM login key, pins the host key, replaces the default password while keeping auto-login working, installs Rex, checks that it boots to SSH and its desktop, and fills in the `macos` config. Run it again after upgrading Rex.
+
+To prepare a template by hand instead, which Ubuntu still needs:
 
 ```sh
 tart clone ghcr.io/cirruslabs/ubuntu:24.04 rox-ubuntu
 tart clone ghcr.io/cirruslabs/macos-tahoe-base:latest rox-macos
 ```
 
-Boot each template once with `tart run TEMPLATE` and prepare it from its console.
+Boot each template once with `tart run TEMPLATE` and prepare it from its console. If you change a macOS template's password, also update `/etc/kcpassword`, which auto-login reads, or the template boots to the login window.
 
 1. Enable SSH. On macOS, use **System Settings → General → Sharing → Remote Login**. On Ubuntu, install `openssh-server`, then run `sudo systemctl enable --now ssh`. Use key-based login and change the default image password before using the template. SSH must allow local Unix-socket forwarding and, for private Git clones, SSH agent forwarding.
 2. Generate a VM login key on the host with `ssh-keygen -t ed25519 -f ~/.ssh/rox_vm`. Add the public key to the guest user's `~/.ssh/authorized_keys` and set permissions to `700` for `~/.ssh` and `600` for the file. Keep the private key on the host and set `identity` to its path. If it has a passphrase, load it into your regular host SSH agent before launch.
