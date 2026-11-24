@@ -28,6 +28,8 @@ REAL_SUGGEST_APP_HOST = rox.suggest_app_host
 REAL_LOCAL_APP = rox.local_app
 REAL_RESTORE_GIT_AGENT = rox.restore_git_agent
 REAL_SYNC_AGENT_SETUP = rox.sync_agent_setup
+# Guests get every agent CLI unless the config turns it off. Launch tests that aren't about agents turn them off.
+NO_AGENTS = {"claude": False, "codex": False}
 
 
 def base_image(version=None, image_id="sha256:base"):
@@ -256,7 +258,7 @@ class WorkspaceTests(unittest.TestCase):
             contextlib.redirect_stderr(io.StringIO()),
         ):
             with self.assertRaisesRegex(rox.Error, "launch fixture"):
-                rox.main(["up", "container", "--engine", "podman", "--cwd", str(cwd)])
+                rox.main(["up", "container", "--engine", "podman", "--no-agents", "--cwd", str(cwd)])
             rox.prepare_container_image("podman", "rox:linux")
             rox.prepare_container_image("podman", "registry.example.test/custom:latest")
 
@@ -1042,6 +1044,7 @@ class WorkspaceTests(unittest.TestCase):
         config = self.root / "config.json"
         config.write_text(json.dumps({
             "git_keys": [str(key)],
+            "agents": NO_AGENTS,
             backend: {"image": "fixture", "identity": str(identity), "host_key": str(host_key),
                       **({"engine": engine} if engine else {})},
         }))
@@ -1241,7 +1244,7 @@ class WorkspaceTests(unittest.TestCase):
         identity.touch()
         host_key.write_text("ssh-ed25519 AAAA fixture\n")
         vm = {"image": "rox-ubuntu", "identity": str(identity), "host_key": str(host_key)}
-        config.write_text(json.dumps(launcher or {"linux": vm, "macos": vm}))
+        config.write_text(json.dumps({"agents": NO_AGENTS, **(launcher or {"linux": vm, "macos": vm})}))
         branch = rox.Branch(self.root, "commit", "", project) if project is not None else None
         real_run, real_output = rox.run, rox.output
 
@@ -1731,7 +1734,7 @@ class WorkspaceTests(unittest.TestCase):
         outside.mkdir()
         printed = io.StringIO()
         with self.fake_guests() as record, contextlib.redirect_stdout(printed):
-            rox.main(["up", "container", "--cwd", str(outside), "--", "agent"])
+            rox.main(["up", "container", "--no-agents", "--cwd", str(outside), "--", "agent"])
         [guest] = self.guests()
         self.assertRegex(guest.name, r"^rv-host-[a-f0-9]{12}$")
         self.assertEqual((guest.phase, guest.projects, guest.session_id), ("ready", [], "session:1"))
@@ -2250,12 +2253,15 @@ class WorkspaceTests(unittest.TestCase):
 
     def test_agent_settings_are_validated(self):
         token = self.secret("token", "sk-ant-oat01-x")
-        self.assertEqual(rox.agent_settings({}, "c"), {})
         sync = rox.SYNC_DEFAULTS
+        everything = {"claude": {"version": "latest", "sync": sync}, "codex": {"version": "latest", "sync": sync}}
+        self.assertEqual(rox.agent_settings({}, "c"), everything)
+        self.assertEqual(rox.agent_settings({"agents": {}}, "c"), everything)
+        self.assertEqual(rox.agent_settings({"agents": NO_AGENTS}, "c"), {})
         self.assertEqual(rox.agent_settings({"agents": {"claude": {"token_file": str(token)}, "codex": {}}}, "c"),
                          {"claude": {"version": "latest", "sync": sync, "token_file": token},
                           "codex": {"version": "latest", "sync": sync}})
-        self.assertEqual(rox.agent_settings({"agents": {"codex": {"version": "0.171.0"}}}, "c"),
+        self.assertEqual(rox.agent_settings({"agents": {"claude": False, "codex": {"version": "0.171.0"}}}, "c"),
                          {"codex": {"version": "0.171.0", "sync": sync}})
         self.assertEqual(rox.agent_settings({"agents": {"codex": {"sync": {"skills": False, "mcp": ["docs"]}}}},
                                             "c")["codex"]["sync"],
@@ -2420,7 +2426,7 @@ class WorkspaceTests(unittest.TestCase):
 
     def test_up_installs_agents_before_the_rex_server_starts(self):
         token = self.secret("token", "sk-ant-oat01-x")
-        config = self.agent_config({"claude": {"token_file": str(token)}})
+        config = self.agent_config({"claude": {"token_file": str(token)}, "codex": False})
         stages = []
         pushed = []
 
@@ -2459,7 +2465,7 @@ class WorkspaceTests(unittest.TestCase):
         self.assertEqual([guest.agents for guest in agents], [{}, {"claude": "2.0.0"}])
 
     def test_update_agents_refreshes_running_guests(self):
-        config = self.agent_config({"codex": {}})
+        config = self.agent_config({"claude": False, "codex": {}})
         self.saved_guest("rv-fixture-000011112222", agents={"codex": "0.1.0"})
         self.saved_guest("rv-stopped-000011113333", stopped=True)
         installed = []
@@ -2476,7 +2482,7 @@ class WorkspaceTests(unittest.TestCase):
         self.assertEqual(rox.Guest.load("rv-fixture-000011112222").agents, {"codex": "0.2.0"})
         self.assertIn("has Codex 0.2.0 already", printed.getvalue())
         with self.assertRaisesRegex(rox.Error, "No agents are configured"):
-            rox.main(["update-agents", "rv-fixture-000011112222", "--config", str(self.root / "none.json")])
+            rox.main(["update-agents", "rv-fixture-000011112222", "--config", str(self.agent_config(NO_AGENTS))])
         with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
             rox.main(["update-agents"])
 
@@ -2599,7 +2605,8 @@ class WorkspaceTests(unittest.TestCase):
         self.assertEqual(saved["agents"]["codex"], {"api_key_file": str(config.with_name("openai-api-key"))})
         rox.agent_settings(saved, config)
         _, saved = configure("claude", "--off")
-        self.assertEqual(list(saved["agents"]), ["codex"])
+        self.assertIs(saved["agents"]["claude"], False)
+        self.assertEqual(list(rox.agent_settings(saved, config)), ["codex"])
         self.assertFalse(config.with_name("anthropic-api-key").exists())
         _, saved = configure("codex", "--sync", "skills,mcp", "--mcp", "docs")
         self.assertEqual(saved["agents"]["codex"], {
