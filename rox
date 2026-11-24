@@ -1562,16 +1562,21 @@ SYNC_WRITE_SCRIPT = 'cd "$HOME" && if [ "$#" -gt 0 ]; then rm -rf -- "$@"; fi &&
 
 
 def agent_settings(config, config_path):
-    """The agents the launcher installs in new guests, as {agent: {"version", credential paths}}."""
+    """The agents to install in new guests, as {agent: {"version", credential paths}}. All, unless turned off."""
     settings = config.get("agents")
     if settings is None:
-        return {}
+        settings = {}
     if not isinstance(settings, dict):
         raise Error(f"Expected an object for agents in {config_path}")
-    agents = {}
-    for agent, value in settings.items():
+    for agent in settings:
         if agent not in AGENT_CREDENTIALS:
             raise Error(f"Unknown agent {agent} in {config_path}. Use {' or '.join(AGENT_CREDENTIALS)}")
+    agents = {}
+    # Agents the config doesn't mention are installed without credentials. false turns one off.
+    for agent in AGENT_CREDENTIALS:
+        value = settings.get(agent, {})
+        if value is False:
+            continue
         if not isinstance(value, dict):
             raise Error(f"Expected an object for agents.{agent} in {config_path}")
         allowed = ["version", "sync", *AGENT_CREDENTIALS[agent]]
@@ -2181,7 +2186,7 @@ def configure_agents(args):
                 if owner == agent and update != "keep" and (update is None or setting not in update):
                     config_path.with_name(filename).unlink(missing_ok=True)
             if update is None:
-                current.pop(agent, None)
+                current[agent] = False
                 print(f"New guests won't get {AGENT_NAMES[agent]}", flush=True)
                 continue
             kept = previous.get("sync") if isinstance(previous.get("sync"), dict) else {}

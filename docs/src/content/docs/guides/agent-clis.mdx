@@ -6,6 +6,8 @@ description: Install Claude Code and Codex in every guest, signed in, with your 
 import { Aside, Steps } from '@astrojs/starlight/components';
 
 Rox can install Claude Code and Codex in every guest it starts, with their credentials ready. A worker started with `rex run -- claude ...` or `rex run -- codex ...` works right away, with no setup hook and no sign-in.
+Both agents are installed in every guest by default. Agents you have not set up are installed without credentials, and `rox config agents NAME --off` (or `"agents": {"codex": false}` in the config) leaves one out.
+
 
 ## Set it up
 
