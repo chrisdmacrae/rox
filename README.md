@@ -248,7 +248,7 @@ It checks every 15 seconds, logs to `~/.local/state/rox/service.log`, and leaves
 
 | Command | Effect |
 | --- | --- |
-| `rox ls` | List local workspace records, their provisioning state, IP address (Tart VMs and Apple containers), and each guest's projects. Add `--all` to include the guests on every Rex host you can reach, `--host HOST` for one host, or `--json`. |
+| `rox ls` | List local workspace records, their provisioning state, IP address (Tart VMs and Apple containers), and each guest's projects. In a checkout, it lists only the guests with that project; add `--all-projects` for every guest. Add `--all` to include the guests on every Rex host you can reach, `--host HOST` for one host, or `--json`. |
 | `rox add NAME` | Clone a project into a running guest and start a Rex session at its checkout. |
 | `rox shell NAME [PROJECT]` | Open an interactive shell at a project checkout. Without `PROJECT`, it opens the guest's only checkout, or the guest home when there are none or several. |
 | `rox agent [NAME] [PROJECT]` | Start Claude Code or Codex in a new Rex session at a checkout in a running guest. Without `NAME`, it picks the running guest with the current project, here or on a Rex host, matching by folder, repository name or remote URL, and offers to start one with `rox up` when there's none. `--local` first copies this checkout's changes into the guest's checkout, refusing when the guest has working changes. Pick one with `--agent` when the guest has both, pass the agent's arguments after `--`, and add `--open-shell` to show it in the Rex app. |

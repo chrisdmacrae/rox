@@ -22,7 +22,7 @@ rox up linux --cwd "$project_dir" --memory 16G --cpus 8
 rox up macos --host "$launcher" --cwd "$project_dir" --branch "$published_branch"
 ```
 
-Save the exact `Workspace`, `Checkout`, and `Session` values from each launch. For a remote launch, also save the launcher label and the Rex session ID printed on the `Provisioning` line. The host can be registered before cloning or setup succeeds. Verify the workspace is ready and the guest session answers before giving it the task. If a launch is interrupted, check its output and `rox ls` on the launcher before retrying. `rox ls --all` lists guests across every reachable Rex host, and `rox ls --host "$launcher"` lists one launcher's guests from here.
+Save the exact `Workspace`, `Checkout`, and `Session` values from each launch. For a remote launch, also save the launcher label and the Rex session ID printed on the `Provisioning` line. The host can be registered before cloning or setup succeeds. Verify the workspace is ready and the guest session answers before giving it the task. If a launch is interrupted, check its output and `rox ls` on the launcher before retrying. `rox ls --all` lists guests across every reachable Rex host, and `rox ls --host "$launcher"` lists one launcher's guests from here. Inside a checkout, `rox ls` lists only the guests with that project; add `--all-projects` to see guests without a project or for other projects.
 
 ## Delegate and monitor
 

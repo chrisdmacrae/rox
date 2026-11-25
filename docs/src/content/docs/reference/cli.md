@@ -55,10 +55,13 @@ List local workspace records with their backend, provisioning state, IP address,
 
 Each launcher keeps its own workspace records, so plain `rox ls` shows only the guests launched on this machine.
 
+Inside a Git checkout, `rox ls` lists only the guests with a checkout of that project, with a note on stderr saying so. A guest's checkout matches by a remote's URL, in its SSH or HTTPS form, or by the checkout's folder or repository name, as [`rox agent`](#rox-agent-name-project) finds guests. Outside a checkout, or with `--all-projects`, it lists every guest. The filter applies to `--all`, `--host` and `--json` too.
+
 | Option | Description |
 | --- | --- |
 | `-a`, `--all` | Also list the guests on every Rex host this machine can reach. Rox runs `rox ls` on each host in a short-lived Rex session and adds a `HOST` column. It skips rox guests in your host list, other names for this machine's own server, and hosts it can't reach or that don't have rox, with a note on stderr for each. |
 | `-S`, `--host HOST` | List the guests on this Rex remote host instead. |
+| `--all-projects` | In a checkout, list every guest, not only the ones with this project. |
 | `--json` | Print the workspaces as JSON, with `name`, `backend`, `engine`, `phase`, `ip`, `tailnet`, and `projects`, plus `host` with `--all` or `--host`. |
 
 ## `rox shell NAME [PROJECT]`

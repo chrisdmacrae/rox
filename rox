@@ -4343,7 +4343,7 @@ def choose_project_guest(cwd):
               for guest in local if any(entry.name == project for entry in guest.projects)]
     guests += remote_project_guests(project)
     if not guests:
-        raise Error(f"No workspaces for {project}. Run rox ls --all to see all workspaces.")
+        raise Error(f"No workspaces for {project}. Run rox ls --all --all-projects to see all workspaces.")
     host, name = guests[pick_guest(guests, f"{project} has {len(guests)} workspaces", "Remove which workspace?",
                                    "rox down NAME")][:2]
     return name, host
@@ -4422,7 +4422,8 @@ def server_id(server=None):
 
 
 LIST_COMMAND = ["sh", "-c", 'PATH="$HOME/.local/bin:/usr/local/bin:/opt/homebrew/bin:$PATH"; '
-                'rox ls --json 2>/dev/null || { echo "#rox-plain"; rox ls; }']
+                'rox ls --json --all-projects 2>/dev/null || rox ls --json 2>/dev/null || '
+                '{ echo "#rox-plain"; rox ls; }']
 
 
 def rex_output(server, label, argv, wait=30):
@@ -4459,10 +4460,29 @@ def remote_records(host):
     return records
 
 
-def list_guests(scope=None, as_json=False):
-    """List workspaces here, on one Rex host, or on every reachable Rex host."""
+def project_filter(cwd):
+    """A test for the guest records that have a checkout of the project at cwd, and that project's name.
+
+    Outside a checkout, (None, "") lets every record through.
+    """
+    checkout = current_checkout(cwd)
+    if not checkout:
+        return None, ""
+    root = Path(output(["git", "-C", str(cwd), "rev-parse", "--show-toplevel"]))
+    return (lambda record: matching_checkout(record, None, checkout) is not None), root.name
+
+
+def list_guests(scope=None, as_json=False, cwd=None):
+    """List workspaces here, on one Rex host, or on every reachable Rex host.
+
+    With cwd inside a checkout, only the workspaces with a checkout of that project.
+    """
+    keep, project = project_filter(cwd) if cwd else (None, "")
+    if project and not as_json:
+        print(f"Workspaces with {project}. Run rox ls --all-projects to list every workspace.",
+              file=sys.stderr, flush=True)
     if scope is None:
-        records = local_records()
+        records = [record for record in local_records() if not keep or keep(record)]
         if as_json:
             print(json.dumps(records, indent=2))
         else:
@@ -4473,6 +4493,8 @@ def list_guests(scope=None, as_json=False):
     unique, problems = gather_records(scope)
     if scope != "all" and problems:
         raise Error(f"Could not list workspaces on {scope}: {problems[scope]}")
+    if keep:
+        unique = {host: [record for record in records if keep(record)] for host, records in unique.items()}
     if as_json:
         print(json.dumps([{**record, "host": host} for host, records in unique.items() for record in records],
                          indent=2))
@@ -5226,6 +5248,9 @@ def main(argv):
     where.add_argument("-a", "--all", action="store_true",
                        help="also list workspaces on every Rex host this machine can reach")
     where.add_argument("-S", "--host", help="list workspaces on this Rex remote host instead")
+    listing.add_argument("--all-projects", action="store_true",
+                         help="in a checkout, list every workspace, not only the ones with this project")
+    listing.add_argument("--cwd", type=Path, default=Path.cwd(), help="directory within the project to list")
     listing.add_argument("--json", action="store_true", help="print the workspaces as JSON")
     shell_parser = commands.add_parser("shell", help="open an interactive guest shell")
     shell_parser.add_argument("name")
@@ -5368,7 +5393,7 @@ def main(argv):
                           "update-agents") and route_remote(args):
         return
     elif args.command == "ls":
-        list_guests("all" if args.all else args.host, args.json)
+        list_guests("all" if args.all else args.host, args.json, None if args.all_projects else args.cwd)
     elif args.command == "shell":
         shell(args.name, args.project)
     elif args.command == "forward":

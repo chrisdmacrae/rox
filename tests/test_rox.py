@@ -1890,7 +1890,7 @@ class WorkspaceTests(unittest.TestCase):
 
         listed = io.StringIO()
         with contextlib.redirect_stdout(listed):
-            rox.main(["ls"])
+            rox.main(["ls", "--all-projects"])
         self.assertIn("sample-project:published-feature, other:main, sample-project-2:published-feature",
                       listed.getvalue())
         self.assertEqual(self.down_without_name()[0], guest.name)
@@ -2144,6 +2144,45 @@ class WorkspaceTests(unittest.TestCase):
         with self.assertRaisesRegex(rox.Error, "'cli' is not a project.*web, api"):
             directory("cli")
 
+    def test_ls_in_a_checkout_lists_only_the_guests_with_that_project(self):
+        rox.private_directory(rox.state_root())
+        checkout = self.root / "my-app"
+        checkout.mkdir()
+        subprocess.run(["git", "init", "--quiet", str(checkout)], check=True)
+        subprocess.run(["git", "-C", str(checkout), "remote", "add", "origin", "git@github.com:acme/app.git"],
+                       check=True)
+        for name, project in (
+            # Matched by the remote URL in its other form, under another checkout name.
+            ("rv-url-000000000001", rox.Project("app", "app", "https://github.com/acme/app", "main")),
+            # Matched by the checkout's folder name, as older records carry no URL.
+            ("rv-name-000000000002", rox.Project("my-app", "my-app", "", "main")),
+            ("rv-other-000000000003", rox.Project("web", "web", "git@github.com:acme/web.git", "main")),
+            ("rv-empty-000000000004", None),
+        ):
+            guest = rox.Guest(name, "container", "image", "workspace", "container", phase="ready")
+            if project:
+                project.workspace = f"/home/workspace/{project.id}"
+                guest.projects = [project]
+            guest.directory.mkdir(mode=0o700)
+            guest.save()
+
+        def listed(*argv, cwd=checkout):
+            with contextlib.redirect_stdout(io.StringIO()) as printed, \
+                    contextlib.redirect_stderr(io.StringIO()) as errors:
+                rox.main(["ls", "--cwd", str(cwd), *argv])
+            return [line.split("\t")[0] for line in printed.getvalue().splitlines()], errors.getvalue()
+
+        names, errors = listed()
+        self.assertEqual(names, ["rv-name-000000000002", "rv-url-000000000001"])
+        self.assertIn("Workspaces with my-app. Run rox ls --all-projects", errors)
+        self.assertEqual(listed("--all-projects")[0], ["rv-empty-000000000004", "rv-name-000000000002",
+                                                       "rv-other-000000000003", "rv-url-000000000001"])
+        self.assertEqual(len(listed(cwd=self.root)[0]), 4)
+        with contextlib.redirect_stdout(io.StringIO()) as printed:
+            rox.main(["ls", "--cwd", str(checkout), "--json"])
+        self.assertEqual([entry["name"] for entry in json.loads(printed.getvalue())],
+                         ["rv-name-000000000002", "rv-url-000000000001"])
+
     def test_ls_lists_the_ip_of_guests_that_have_their_own_address(self):
         rox.private_directory(rox.state_root())
         for name, backend, engine, address in (
@@ -2157,7 +2196,7 @@ class WorkspaceTests(unittest.TestCase):
             guest.save()
         listed = io.StringIO()
         with contextlib.redirect_stdout(listed):
-            rox.main(["ls"])
+            rox.main(["ls", "--all-projects"])
         rows = {line.split("\t")[0]: line.split("\t")[3] for line in listed.getvalue().splitlines()}
         self.assertEqual(rows, {
             "rv-apple-000000000001": "192.168.64.7", "rv-docker-000000000002": "-",
