@@ -3361,6 +3361,108 @@ class WorkspaceTests(unittest.TestCase):
             self.assertEqual(rox.rex_channel(), "preview")
 
 
+class CloudTests(unittest.TestCase):
+    """The fly.io cloud backend, with the fly CLI faked."""
+
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.root = Path(directory.name).resolve()
+        state = patch.dict(os.environ, {"XDG_STATE_HOME": str(self.root / "state"),
+                                        "XDG_CONFIG_HOME": str(self.root / "config-home"),
+                                        "HOME": str(self.root / "home")})
+        state.start()
+        self.addCleanup(state.stop)
+        which = patch.object(rox.shutil, "which", return_value="/fixture/fly")
+        which.start()
+        self.addCleanup(which.stop)
+        rox.private_directory(rox.state_root())
+
+    def guest(self, **fields):
+        guest = rox.Guest("rv-fixture-000011112222", "cloud", "registry.fly.io/rox-app:rox-5", "workspace",
+                          provider="fly", app="rox-app", region="iad", disk=10, container_id="m1",
+                          volume="rox_000011112222", **fields)
+        guest.directory.mkdir(parents=True, mode=0o700)
+        guest.save()
+        return guest
+
+    def test_cloud_is_a_backend_that_a_branch_cannot_configure(self):
+        self.assertIn("cloud", rox.BACKENDS)
+        self.assertEqual(rox.checked_project_settings({"backend": "cloud"}, ".rox.json"), {"backend": "cloud"})
+        for setting in ({"image": "x"}, {"cpus": 64}, {"app": "other"}):
+            with self.assertRaises(rox.Error):
+                rox.checked_project_settings({"cloud": setting}, ".rox.json")
+
+    def test_cloud_settings_are_checked_and_given_defaults(self):
+        self.assertEqual(rox.cloud_settings({}, "config.json"), ("fly", "", "", "iad", 10))
+        self.assertEqual(
+            rox.cloud_settings({"app": "mine", "org": "acme", "region": "ams", "disk": 20}, "config.json"),
+            ("fly", "mine", "acme", "ams", 20))
+        for settings in ({"provider": "aws"}, {"app": "Bad_Name"}, {"region": 3}, {"disk": 0}, {"disk": True}):
+            with self.assertRaises(rox.Error):
+                rox.cloud_settings(settings, "config.json")
+
+    def test_default_app_name_does_not_expose_the_account(self):
+        name = rox.cloud_app_name("Person@Example.com")
+        self.assertRegex(name, r"^rox-[0-9a-f]{10}$")
+        self.assertEqual(name, rox.cloud_app_name("person@example.com"))
+        self.assertNotIn("person", name)
+
+    def test_the_fly_cli_is_required(self):
+        with patch.object(rox.shutil, "which", return_value=None), self.assertRaisesRegex(rox.Error, "Install the Fly.io CLI"):
+            rox.fly_cli()
+
+    def test_state_follows_the_machine(self):
+        guest = self.guest()
+        for fly_state, expected in (("started", "running"), ("stopped", "stopped"), ("suspended", "stopped"),
+                                    ("destroyed", "missing")):
+            with patch.object(rox, "fly", return_value=[{"id": "m1", "name": guest.name, "state": fly_state}]):
+                self.assertEqual(rox.guest_state(guest), expected)
+        with patch.object(rox, "fly", return_value=[]):
+            self.assertEqual(rox.guest_state(guest), "missing")
+
+    def test_stop_and_start_drive_the_machine(self):
+        guest = self.guest()
+        calls = []
+        with patch.object(rox, "fly", side_effect=lambda app, *args, **kwargs: calls.append((app, args))), \
+                patch.object(rox, "cloud_address", return_value=("127.0.0.1", 40000)), \
+                patch.object(rox, "check_guest_os"):
+            rox.stop_guest(guest)
+            rox.start_guest(guest, 5)
+        self.assertEqual(calls, [("rox-app", ("machine", "stop", "m1")), ("rox-app", ("machine", "start", "m1"))])
+        self.assertEqual((guest.address, guest.port), ("127.0.0.1", 40000))
+
+    def test_down_destroys_the_machine_then_its_volume(self):
+        guest = self.guest()
+        destroyed = []
+
+        def fake_fly(app, *args, **kwargs):
+            destroyed.append(args)
+            if args[0] == "machines":
+                return [{"id": "m1", "name": guest.name}, {"id": "m2", "name": "someone-else"}]
+            if args[:2] == ("volumes", "list"):
+                return [{"id": "vol_1", "name": guest.volume}, {"id": "vol_2", "name": "rox_other"}]
+            return ""
+
+        with patch.object(rox, "fly", side_effect=fake_fly), \
+                patch.object(rox, "stop_funnels"), patch.object(rox, "leave_tailnet"), \
+                patch.object(rox, "stop_git_agent"), patch.object(rox, "close_tunnel"), \
+                contextlib.redirect_stdout(io.StringIO()):
+            rox.down(guest.name)
+        self.assertIn(("machine", "destroy", "m1", "--force"), destroyed)
+        self.assertIn(("volumes", "destroy", "vol_1", "--yes"), destroyed)
+        self.assertFalse(any("m2" in call or "vol_2" in call for call in destroyed))
+        self.assertFalse(guest.directory.exists())
+
+    def test_the_image_is_built_once_per_toolkit_version(self):
+        with patch.object(rox, "run") as run:
+            image = rox.cloud_image("rox-app")
+            self.assertEqual(rox.cloud_image("rox-app"), image)
+        self.assertEqual(image, f"registry.fly.io/rox-app:rox-{rox.toolkit_version()}")
+        self.assertEqual(run.call_count, 1)
+        self.assertEqual(run.call_args.args[0][1:4], ["deploy", "--build-only", "--push"])
+
+
 class SelfUpdateTests(unittest.TestCase):
     def setUp(self):
         directory = tempfile.TemporaryDirectory()

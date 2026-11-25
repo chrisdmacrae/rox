@@ -33,6 +33,7 @@ export default defineConfig({
 						{ label: 'Project images', slug: 'guides/project-images' },
 						{ label: 'Private repositories', slug: 'guides/private-repositories' },
 						{ label: 'Tart VMs', slug: 'guides/tart-vms' },
+						{ label: 'Cloud guests on Fly.io', slug: 'guides/fly-cloud' },
 						{ label: 'Rex remote hosts', slug: 'guides/remote-hosts' },
 						{ label: 'Reaching guests from other devices', slug: 'guides/tailnet' },
 						{ label: 'Keeping guests running', slug: 'guides/keep-running' },

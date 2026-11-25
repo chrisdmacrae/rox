@@ -2,6 +2,8 @@
 set -eu
 
 : "${ROX_SSH_PUBLIC_KEY:?Start this image with rox up container}"
+# A cloud guest mounts a volume here, which starts out owned by root.
+chown workspace:workspace /home/workspace
 install -d -m 700 -o workspace -g workspace /home/workspace/.ssh
 umask 077
 printf '%s\n' "$ROX_SSH_PUBLIC_KEY" > /home/workspace/.ssh/authorized_keys
