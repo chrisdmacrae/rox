@@ -3518,6 +3518,126 @@ class CloudTests(unittest.TestCase):
         self.assertEqual(argv[argv.index("--dockerfile") + 1], str(rox.HERE / "Containerfile"))
 
 
+class RailwayTests(unittest.TestCase):
+    """The Railway sandbox backend, with the railway CLI faked."""
+
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.root = Path(directory.name).resolve()
+        state = patch.dict(os.environ, {"XDG_STATE_HOME": str(self.root / "state"),
+                                        "XDG_CONFIG_HOME": str(self.root / "config-home"),
+                                        "HOME": str(self.root / "home")})
+        state.start()
+        self.addCleanup(state.stop)
+        which = patch.object(rox.shutil, "which", return_value="/fixture/railway")
+        which.start()
+        self.addCleanup(which.stop)
+        rox.private_directory(rox.state_root())
+
+    def guest(self, **fields):
+        fields = {"container_id": "sbx_1", "railway_project": "rox", "railway_environment": "production", **fields}
+        guest = rox.Guest("rv-fixture-000011112222", "railway", "", "workspace", **fields)
+        guest.directory.mkdir(parents=True, mode=0o700)
+        guest.save()
+        return guest
+
+    def test_railway_is_a_backend_that_a_branch_cannot_configure(self):
+        self.assertIn("railway", rox.BACKENDS)
+        self.assertEqual(rox.checked_project_settings({"backend": "railway"}, ".rox.json"), {"backend": "railway"})
+        for setting in ({"image": "x"}, {"project": "other"}, {"idle_timeout": 0}):
+            with self.assertRaises(rox.Error):
+                rox.checked_project_settings({"railway": setting}, ".rox.json")
+
+    def test_railway_settings_need_a_project_and_are_given_defaults(self):
+        self.assertEqual(rox.railway_settings({"project": "rox"}, "config.json"), ("rox", "production", None))
+        self.assertEqual(rox.railway_settings({"project": "rox", "environment": "dev", "idle_timeout": 0},
+                                              "config.json"), ("rox", "dev", 0))
+        for settings in ({}, {"project": "-x"}, {"project": "rox", "idle_timeout": 121},
+                         {"project": "rox", "idle_timeout": True}):
+            with self.assertRaises(rox.Error):
+                rox.railway_settings(settings, "config.json")
+
+    def test_commands_name_the_project_and_put_json_before_the_command(self):
+        guest = self.guest()
+        with patch.object(rox, "output", return_value="[]") as output:
+            rox.railway(guest, "list", json_output=True)
+            rox.railway(guest, "exec", "--id", "sbx_1", "--", "true")
+        self.assertEqual(output.call_args_list[0].args[0],
+                         ["/fixture/railway", "sandbox", "-p", "rox", "-e", "production", "list", "--json"])
+        self.assertEqual(output.call_args_list[1].args[0][6:], ["exec", "--id", "sbx_1", "--", "true"])
+
+    def test_state_follows_the_sandbox(self):
+        guest = self.guest()
+        for status, expected in (("RUNNING", "running"), ("CREATING", "running"), ("FAILED", "missing"),
+                                 ("DESTROYED", "missing")):
+            with patch.object(rox, "railway", return_value=[{"id": "sbx_1", "status": status}]):
+                self.assertEqual(rox.guest_state(guest), expected)
+        with patch.object(rox, "railway", return_value=[{"id": "sbx_2", "status": "RUNNING"}]):
+            self.assertEqual(rox.guest_state(guest), "missing")
+
+    def test_sandboxes_cannot_be_stopped(self):
+        guest = self.guest()
+        with self.assertRaisesRegex(rox.Error, "can't be stopped"):
+            rox.stop_workspace(guest.name)
+        self.assertFalse(rox.Guest.load(guest.name).stopped)
+
+    def test_the_template_carries_the_entrypoint_and_is_named_by_its_steps(self):
+        with patch.object(rox, "rex_channel", return_value="preview"):
+            steps = rox.railway_template_steps()
+            with patch.object(rox, "run") as run, contextlib.redirect_stdout(io.StringIO()):
+                name = rox.railway_template(self.guest())
+        entrypoint = rox.base64.b64encode((rox.HERE / "guest" / "container-entrypoint.sh").read_bytes()).decode()
+        self.assertTrue(any(entrypoint in step for step in steps))
+        self.assertRegex(name, r"^rox-[0-9a-f]{12}$")
+        argv = run.call_args.args[0]
+        self.assertEqual(argv[6:11], ["template", "build", "--name", name, "--wait"])
+        self.assertEqual(argv.count("-c"), len(steps))
+
+    def test_launch_starts_sshd_and_pins_the_key_from_the_api(self):
+        guest = self.guest(container_id="", railway_idle_timeout=0)
+        guest.identity = str(guest.directory / "login")
+        Path(f"{guest.identity}.pub").write_text("ssh-ed25519 AAAA rox\n")
+        calls = []
+
+        def fake_railway(guest, *args, **kwargs):
+            calls.append(args)
+            if args[0] == "create":
+                return {"id": "sbx_9", "status": "RUNNING"}
+            if "cat /etc/ssh/ssh_host_ed25519_key.pub" in args:
+                return "ssh-ed25519 HOSTKEY"
+            return ""
+
+        with patch.object(rox, "run"), patch.object(rox, "railway_template", return_value="rox-abc"), \
+                patch.object(rox, "railway", side_effect=fake_railway), \
+                patch.object(rox, "pin_host") as pin, \
+                patch.object(rox, "railway_address", return_value=("127.0.0.1", 40000)):
+            self.assertEqual(rox.launch_railway_sandbox(guest, 5), ("127.0.0.1", 40000))
+        self.assertEqual(calls[0], ("create", "--template", "rox-abc", "--idle-timeout-minutes", "0"))
+        start = calls[1]
+        self.assertEqual(start[:5], ("exec", "--id", "sbx_9", "--detach", "--"))
+        self.assertIn("'ROX_SSH_PUBLIC_KEY=ssh-ed25519 AAAA rox'", start[5])
+        self.assertIn("ROX_SSH_PORT=2222", start[5])
+        pin.assert_called_once_with(guest, "ssh-ed25519 HOSTKEY")
+        self.assertEqual(rox.Guest.load(guest.name).container_id, "sbx_9")
+
+    def test_down_destroys_the_sandbox(self):
+        guest = self.guest()
+        calls = []
+
+        def fake_railway(guest, *args, **kwargs):
+            calls.append(args)
+            return [{"id": "sbx_1", "status": "RUNNING"}] if args[0] == "list" else ""
+
+        with patch.object(rox, "railway", side_effect=fake_railway), \
+                patch.object(rox, "stop_funnels"), patch.object(rox, "leave_tailnet"), \
+                patch.object(rox, "stop_git_agent"), patch.object(rox, "close_tunnel"), \
+                contextlib.redirect_stdout(io.StringIO()):
+            rox.down(guest.name)
+        self.assertIn(("destroy", "sbx_1"), calls)
+        self.assertFalse(guest.directory.exists())
+
+
 class SelfUpdateTests(unittest.TestCase):
     def setUp(self):
         directory = tempfile.TemporaryDirectory()

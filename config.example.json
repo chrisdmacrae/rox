@@ -11,6 +11,10 @@
     "cpus": 2,
     "memory": "4G"
   },
+  "railway": {
+    "project": "rox-guests",
+    "environment": "production"
+  },
   "linux": {
     "image": "rox-ubuntu",
     "user": "admin",

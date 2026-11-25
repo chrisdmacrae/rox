@@ -35,7 +35,9 @@ except ImportError:  # Python before 3.11 can't read Codex's config.toml, so rox
 
 
 HERE = Path(__file__).resolve().parent
-BACKENDS = ("container", "linux", "macos", "fly")
+BACKENDS = ("container", "linux", "macos", "fly", "railway")
+# Backends whose guests run on a cloud account that the launcher pays for.
+CLOUD_BACKENDS = ("fly", "railway")
 DEFAULT_CONTAINER_IMAGE = "rox:linux"
 # "container" is Apple's container CLI, which runs each container in its own lightweight VM.
 ENGINES = ("container", "docker", "podman")
@@ -44,14 +46,18 @@ NAME_PATTERN = r"rv-[a-z0-9-]{1,24}-[a-f0-9]{12}"
 PROJECT_CONFIG = ".rox.json"
 # Settings for this checkout only, kept out of Git. They override the branch's .rox.json.
 LOCAL_CONFIG = ".rox.local.json"
-PROJECT_KEYS = {backend: {"image", "cpus", "memory", "prebuild"} for backend in BACKENDS if backend != "fly"}
+PROJECT_KEYS = {backend: {"image", "cpus", "memory", "prebuild"} for backend in BACKENDS
+                if backend not in CLOUD_BACKENDS}
 # A branch can't choose what the launcher's cloud account runs or spends.
-PROJECT_KEYS["fly"] = set()
+PROJECT_KEYS.update({backend: set() for backend in CLOUD_BACKENDS})
 # These describe the launch machine, so only its own rox config may set them.
 LAUNCHER_KEYS = {"engine", "user", "identity", "host_key", "git_keys", "git_known_hosts", "tailscale", "agents",
                  "git_agent"}
 # The fly section's own settings, which name the launcher's Fly app and what it spends.
 FLY_KEYS = {"app", "org", "region", "disk", "image", "cpus", "memory"}
+# The railway section's own settings, which name the launcher's Railway project and environment.
+RAILWAY_KEYS = {"project", "environment", "idle_timeout"}
+CLOUD_KEYS = {"fly": FLY_KEYS, "railway": RAILWAY_KEYS}
 
 
 class Error(Exception):
@@ -166,6 +172,11 @@ class Guest:
     region: str = ""
     disk: int = 0
     volume: str = ""
+    # Railway guests: the project and environment the sandbox runs in. container_id holds the sandbox id.
+    railway_project: str = ""
+    railway_environment: str = ""
+    # Minutes Railway lets the sandbox sit idle before destroying it, or None for the plan's default.
+    railway_idle_timeout: object = None
 
     @property
     def base(self):
@@ -778,6 +789,8 @@ def guest_state(guest):
     """Return running, stopped or missing for the guest's container or VM."""
     if guest.backend == "fly":
         return cloud_state(guest)
+    if guest.backend == "railway":
+        return railway_state(guest)
     if guest.engine == "container":
         result = run(["container", "inspect", guest.name], capture=True, check=False, timeout=20)
         if result.returncode:
@@ -961,24 +974,38 @@ def port_open(port):
         return False
 
 
-def cloud_address(guest):
-    """Keep fly proxy forwarding a loopback port to the machine's SSH port, as the machine has no public address."""
+def forwarded_address(guest, argv_for, pid_path, log_name, description):
+    """Keep a CLI forwarding a loopback port to the guest's SSH port, as cloud guests have no public address.
+
+    argv_for takes the local port and returns the forwarder's command.
+    """
     private_directory(guest.runtime.parent)
     private_directory(guest.runtime)
-    if guest.port != 22 and pid_alive(cloud_proxy_pid(guest)) and port_open(guest.port):
+    if guest.port != 22 and pid_alive(pid_path) and port_open(guest.port):
         return "127.0.0.1", guest.port
-    close_cloud_proxy(guest)
+    kill_pid(pid_path)
     port = free_port()
-    proxy = detached([fly_cli(), "proxy", f"{port}:{CLOUD_SSH_PORT}", f"{guest.container_id}.vm.{guest.app}.internal",
-                      "-a", guest.app], guest, cloud_proxy_pid(guest), "fly-proxy.log")
+    proxy = detached(argv_for(port), guest, pid_path, log_name)
 
     def ready():
         if proxy.poll() is not None:
-            raise Error(f"fly proxy exited with status {proxy.returncode}. See {guest.directory / 'fly-proxy.log'}")
+            log = guest.directory / log_name
+            lines = [line for line in log.read_text(errors="replace").splitlines() if line.strip()] \
+                if log.is_file() else []
+            said = ("\n" + "\n".join(lines[-5:])) if lines else ""
+            raise Error(f"{description} exited with status {proxy.returncode}. See {log}{said}")
         return port_open(port)
 
-    wait_for(ready, 30, "fly proxy")
+    wait_for(ready, 30, description)
     return "127.0.0.1", port
+
+
+def cloud_address(guest):
+    """Keep fly proxy forwarding a loopback port to the machine's SSH port."""
+    return forwarded_address(
+        guest, lambda port: [fly_cli(), "proxy", f"{port}:{CLOUD_SSH_PORT}",
+                             f"{guest.container_id}.vm.{guest.app}.internal", "-a", guest.app],
+        cloud_proxy_pid(guest), "fly-proxy.log", "fly proxy")
 
 
 def launch_cloud_machine(guest, boot_timeout):
@@ -1026,6 +1053,155 @@ def destroy_cloud_machine(guest):
                 fly(guest.app, "volumes", "destroy", volume["id"], "--yes", timeout=120)
 
 
+# Railway guests are sandboxes, Firecracker microVMs that Railway runs in one of the launcher's projects, driven
+# through the railway CLI, which must be installed and logged in, with an SSH key on the Railway account.
+# Sandboxes run Railway's Ubuntu image, so a template adds what rox's Containerfile does, and the sandbox's own
+# sshd listens on RAILWAY_SSH_PORT, which railway sandbox forward brings to a loopback port. Sandboxes can't be
+# stopped, and Railway destroys one that sits idle past its idle timeout.
+RAILWAY_SSH_PORT = 2222
+RAILWAY_DEFAULT_ENVIRONMENT = "production"  # Every Railway project starts with it
+# CREATING counts as running, so rox waits on it rather than calling the sandbox gone.
+RAILWAY_STATES = {"RUNNING": "running", "CREATING": "running"}
+
+
+def railway_cli():
+    found = shutil.which("railway")
+    if not found:
+        raise Error("Install the Railway CLI (https://docs.railway.com/cli) and run railway login")
+    return found
+
+
+def railway(guest, *args, json_output=False, **kwargs):
+    """Run a railway sandbox command in the guest's project and environment."""
+    # --json goes right after the subcommand, as exec takes its command after --.
+    argv = [railway_cli(), "sandbox", "-p", guest.railway_project, "-e", guest.railway_environment,
+            args[0], *(["--json"] if json_output else []), *args[1:]]
+    text = output(argv, **kwargs)
+    if not json_output:
+        return text
+    try:
+        return json.loads(text or "null")
+    except ValueError:
+        raise Error(f"railway sandbox {args[0]} returned something other than JSON") from None
+
+
+def railway_settings(settings, config_path):
+    """Check the config's railway section. Return the project, environment and idle timeout in minutes."""
+    for key in ("project", "environment"):
+        value = settings.get(key, "")
+        if not isinstance(value, str) or value.startswith("-"):
+            raise Error(f"Expected a name or id for railway.{key} in {config_path}")
+    if not settings.get("project"):
+        raise Error(f"Set railway.project to the Railway project that runs guests, in {config_path}")
+    idle = settings.get("idle_timeout")
+    if idle is not None and (not isinstance(idle, int) or isinstance(idle, bool) or not 0 <= idle <= 120):
+        raise Error(f"Expected minutes from 0 to 120 for railway.idle_timeout in {config_path}")
+    return settings["project"], settings.get("environment") or RAILWAY_DEFAULT_ENVIRONMENT, idle
+
+
+def railway_template_steps():
+    """Shell steps that turn Railway's sandbox image into a rox guest, as the Containerfile does for rox:linux."""
+    entrypoint = base64.b64encode((HERE / "guest" / "container-entrypoint.sh").read_bytes()).decode()
+    root = 'S=$(test "$(id -u)" = 0 || echo sudo); '
+    return [
+        root + "$S apt-get update && $S env DEBIAN_FRONTEND=noninteractive apt-get install -y "
+               "--no-install-recommends bash ca-certificates curl git libpam0g openssh-client openssh-server sudo "
+               "xz-utils && $S rm -rf /var/lib/apt/lists/*",
+        root + "curl -fsSL https://pkgs.superlogical.com/rex/install.sh -o /tmp/rex-install.sh && "
+               f"$S sh /tmp/rex-install.sh --tarball --channel {rex_channel()} && rm /tmp/rex-install.sh && "
+               "if [ ! -x /usr/local/bin/rex ]; then $S install -m 0755 \"$($S sh -lc 'command -v rex')\" "
+               "/usr/local/bin/rex; fi && /usr/local/bin/rex version",
+        root + "id workspace >/dev/null 2>&1 || $S useradd --create-home --shell /bin/bash workspace; "
+               "$S passwd -d workspace",
+        root + f"printf %s {entrypoint} | base64 -d | $S tee /usr/local/bin/rox-container >/dev/null && "
+               "$S chmod 0755 /usr/local/bin/rox-container",
+        # Every sandbox from the template shares its disk, so each one makes its own host key at boot.
+        root + "$S rm -f /etc/ssh/ssh_host_*",
+    ]
+
+
+def railway_template(guest):
+    """Build the guest template, which Railway caches by its steps, and return its name."""
+    steps = railway_template_steps()
+    name = "rox-" + hashlib.sha256(json.dumps(steps).encode()).hexdigest()[:12]
+    print(f"Preparing the Railway sandbox template {name}", flush=True)
+    argv = [railway_cli(), "sandbox", "-p", guest.railway_project, "-e", guest.railway_environment,
+            "template", "build", "--name", name, "--wait"]
+    for step in steps:
+        argv += ["-c", step]
+    try:
+        run(argv, timeout=50 * 60)
+    except subprocess.CalledProcessError as error:
+        raise Error("Building the Railway sandbox template failed. See the build output above.") from error
+    return name
+
+
+def railway_sandbox(guest):
+    sandboxes = railway(guest, "list", json_output=True, timeout=60) or []
+    return next((sandbox for sandbox in sandboxes
+                 if isinstance(sandbox, dict) and sandbox.get("id") == guest.container_id), None)
+
+
+def railway_state(guest):
+    if not guest.container_id:
+        return "missing"
+    return RAILWAY_STATES.get((railway_sandbox(guest) or {}).get("status"), "missing")
+
+
+def railway_forward_pid(guest):
+    return guest.runtime / "railway-forward.pid"
+
+
+def close_railway_forward(guest):
+    kill_pid(railway_forward_pid(guest))
+
+
+def railway_address(guest):
+    """Keep railway sandbox forward bringing the sandbox's SSH port to a loopback port.
+
+    The forward's heartbeat also keeps the sandbox from idling out while rox is connected.
+    """
+    return forwarded_address(
+        guest, lambda port: [railway_cli(), "sandbox", "-p", guest.railway_project, "-e", guest.railway_environment,
+                             "forward", "--id", guest.container_id, "--strict", f"{port}:{RAILWAY_SSH_PORT}"],
+        railway_forward_pid(guest), "railway-forward.log", "railway sandbox forward")
+
+
+def launch_railway_sandbox(guest, boot_timeout):
+    """Create the sandbox from the rox template, start its sshd, pin its host key, and open the forward."""
+    run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", guest.identity], stdin=subprocess.DEVNULL)
+    public_key = Path(f"{guest.identity}.pub").read_text().strip()
+    template = railway_template(guest)
+    idle = [] if guest.railway_idle_timeout is None else ["--idle-timeout-minutes", str(guest.railway_idle_timeout)]
+    created = railway(guest, "create", "--template", template, *idle, json_output=True,
+                      timeout=boot_timeout + 360)
+    if not isinstance(created, dict) or not created.get("id"):
+        raise Error("railway sandbox create did not return a sandbox id")
+    guest.container_id = created["id"]
+    guest.save()
+    # Each sandbox is its own VM, so like Fly machines it gets sudo. The entrypoint ends in sshd, which the
+    # detached session keeps running.
+    environment = " ".join(shlex.quote(item) for item in (
+        f"ROX_SSH_PUBLIC_KEY={public_key}", "ROX_SUDO=1", f"ROX_SSH_PORT={RAILWAY_SSH_PORT}"))
+    railway(guest, "exec", "--id", guest.container_id, "--detach", "--",
+            f'S=$(test "$(id -u)" = 0 || echo sudo); exec $S env {environment} /usr/local/bin/rox-container',
+            timeout=120)
+    # railway sandbox exec goes through Railway's API, so the host key comes from the sandbox and not the network.
+    key = wait_for(lambda: railway(guest, "exec", "--id", guest.container_id, "--timeout", "20", "--",
+                                   "cat /etc/ssh/ssh_host_ed25519_key.pub", timeout=60),
+                   boot_timeout, "the sandbox's SSH host key")
+    pin_host(guest, key)
+    # The forward waits for its own port, and one that exits, such as for want of an SSH key on the Railway
+    # account, won't do better on a retry.
+    return railway_address(guest)
+
+
+def destroy_railway_sandbox(guest):
+    """Destroy the sandbox unless it's already gone."""
+    if guest.container_id and guest.railway_project and railway_state(guest) != "missing":
+        railway(guest, "destroy", guest.container_id, timeout=120)
+
+
 def reachable(guest):
     """Whether this machine reaches the guest's Rex server through its tunnel."""
     try:
@@ -1044,7 +1220,7 @@ def resume(guest, tailnet=None, boot_timeout=120, force=False):
     ensure_runtime(guest.engine)
     state = guest_state(guest)
     if state == "missing":
-        kind = "machine" if guest.backend == "fly" else "container" if guest.engine else "VM"
+        kind = {"fly": "machine", "railway": "sandbox"}.get(guest.backend) or ("container" if guest.engine else "VM")
         raise Error(f"The {kind} for {guest.name} no longer exists. Remove the workspace with rox down {guest.name}")
     if state == "stopped":
         print(f"Starting {guest.name}", flush=True)
@@ -2144,11 +2320,11 @@ def checked_project_settings(settings, where):
             if not isinstance(value, dict):
                 raise Error(f"Expected an object for {key} in {where}")
             for setting in value:
-                if setting in LAUNCHER_KEYS or (key == "fly" and setting in FLY_KEYS):
+                if setting in LAUNCHER_KEYS or setting in CLOUD_KEYS.get(key, ()):
                     raise Error(f"{key}.{setting} can only be set in the rox config on the launch machine, "
                                 f"not in {where}")
                 if setting not in PROJECT_KEYS[key]:
-                    allowed = ", ".join(sorted(PROJECT_KEYS[key])) or "no settings; set fly guests in the rox config"
+                    allowed = ", ".join(sorted(PROJECT_KEYS[key])) or f"no settings; set {key} guests in the rox config"
                     raise Error(f"Unknown setting {key}.{setting} in {where}. Use {allowed}")
         elif key in LAUNCHER_KEYS:
             raise Error(f"{key} can only be set in the rox config on the launch machine, not in {where}")
@@ -2176,6 +2352,8 @@ def prepare_project_image(backend, engine, base, project, url, branch, keys, kno
 def launch_guest(guest, boot_timeout):
     if guest.backend == "fly":
         return launch_cloud_machine(guest, boot_timeout)
+    if guest.backend == "railway":
+        return launch_railway_sandbox(guest, boot_timeout)
     if guest.backend == "container":
         run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", guest.identity],
             stdin=subprocess.DEVNULL)
@@ -2428,6 +2606,7 @@ def attach_guest(guest, session_id=""):
 def connect(guest, tailnet=None):
     """Find the running guest's SSH address, make sure its Rex server runs, and attach to it."""
     guest.address, guest.port = (cloud_address(guest) if guest.backend == "fly"
+                                 else railway_address(guest) if guest.backend == "railway"
                                  else container_address(guest) if guest.engine else vm_address(guest))
     guest.save()
     guest_stage(guest, "server", guest.guest_socket)
@@ -3762,7 +3941,7 @@ def up(args, command):
         project_config = fetched.settings if fetched else {}
     backend = args.backend or local.get("backend") or project_config.get("backend")
     if not backend:
-        raise Error(f"Choose a backend with rox up container, linux, macos or fly, or set \"backend\" in {PROJECT_CONFIG}")
+        raise Error(f"Choose a backend with rox up container, linux, macos, fly or railway, or set \"backend\" in {PROJECT_CONFIG}")
     if not args.backend:
         print(f"Using the {backend} backend from {LOCAL_CONFIG if local.get('backend') else PROJECT_CONFIG}",
               flush=True)
@@ -3794,7 +3973,15 @@ def up(args, command):
         where = "--memory" if args.memory is not None else f"{backend}.memory in {origin('memory')}"
         raise Error(f"Expected a size such as 4G or 512M for {where}")
     cloud = None
-    if backend == "fly":
+    sandbox = None
+    if backend == "railway":
+        sandbox = railway_settings(settings, config_path)
+        # Railway's CLI sets no sandbox size and runs only Railway's own image, which rox's template builds on.
+        for option, value in (("image", args.image or settings.get("image")), ("cpus", cpus), ("memory", memory)):
+            if value:
+                raise Error(f"The railway backend takes no {option}. Railway sizes sandboxes by plan")
+        image = ""
+    elif backend == "fly":
         cloud = cloud_settings(settings, config_path)
         # An empty image means Rox's own, which Fly builds and stores in the app's registry.
         image = args.image or settings.get("image") or ""
@@ -3807,7 +3994,7 @@ def up(args, command):
     identity = None
     host_key = None
     user = "workspace"
-    if not engine and not cloud:
+    if not engine and backend not in CLOUD_BACKENDS:
         user = settings.get("user", "admin")
         identity = configured_file(settings.get("identity"))
         host_key = configured_file(settings.get("host_key"))
@@ -3818,12 +4005,12 @@ def up(args, command):
         raise Error(f"Expected true or false for {backend}.prebuild in {origin('prebuild')}")
     # A project image holds a remote branch, and a --local launch runs .rox.sh on the copied checkout.
     prebuild = prebuild and bool(source) and not args.no_prebuild and not args.no_hook and not checkout
-    prebuild = prebuild and not cloud
+    prebuild = prebuild and backend not in CLOUD_BACKENDS
     if args.rebuild and not prebuild:
         raise Error("--rebuild needs a project image, which --no-project, --no-hook, --no-prebuild, --local, "
-                    "prebuild: false and the fly backend disable")
+                    "prebuild: false and the fly and railway backends disable")
 
-    required = ["rex", "ssh", engine or ("ssh-keygen" if cloud else "tart")]
+    required = ["rex", "ssh", engine or ("ssh-keygen" if backend in CLOUD_BACKENDS else "tart")]
     if engine:
         required.append("ssh-keygen")
     if engine == "container" and not shutil.which("container"):
@@ -3841,6 +4028,8 @@ def up(args, command):
         app = app or cloud_app_name(account)
         ensure_cloud_app(app, org)
         image = image or cloud_image(app)
+    if sandbox:
+        railway_cli()
     versions = agent_versions(agents) if agents else {}
     prebuilt = ""
     if prebuild:
@@ -3857,6 +4046,8 @@ def up(args, command):
                   cpus=cpus, memory=memory, git_keys=forwarded_keys)
     if cloud:
         guest.app, guest.region, guest.disk = app, region, disk
+    if sandbox:
+        guest.railway_project, guest.railway_environment, guest.railway_idle_timeout = sandbox
     guest.directory.mkdir(mode=0o700)
     guest.identity = str(identity or guest.directory / "login")
     with guest_lock(guest.directory):
@@ -4220,6 +4411,8 @@ def stop_workspace(name):
         guest = Guest.load(name)
         if guest.phase == "removing":
             raise Error(f"{name} is being removed")
+        if guest.backend == "railway":
+            raise Error(f"Railway sandboxes can't be stopped and started again. Remove {name} with rox down")
         guest.stopped = True
         guest.save()
         stop_funnels(guest)
@@ -4302,8 +4495,11 @@ def down(name):
         stop_git_agent(guest)
         close_tunnel(guest)
         close_cloud_proxy(guest)
+        close_railway_forward(guest)
         if guest.backend == "fly":
             destroy_cloud_machine(guest)
+        elif guest.backend == "railway":
+            destroy_railway_sandbox(guest)
         elif guest.engine == "container":
             result = run(["container", "delete", "--force", name], capture=True, check=False)
             if result.returncode and "not found" not in (result.stderr + result.stdout).lower():
@@ -4395,7 +4591,7 @@ def guest_ip(guest):
     Tart VMs and Apple's containers have their own address. Docker and Podman
     containers are reached through a loopback SSH port instead, so they have none.
     """
-    return guest.address if guest.address and guest.engine in ("", "container") and guest.backend != "fly" else "-"
+    return guest.address if guest.address and guest.engine in ("", "container") and guest.backend not in CLOUD_BACKENDS else "-"
 
 
 def local_records():

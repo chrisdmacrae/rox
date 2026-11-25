@@ -65,7 +65,7 @@ Each key is an agent, `claude` or `codex`, and each value is an object. An empty
 
 ## Backend settings
 
-Put these under `container`, `linux`, `macos`, or `fly`.
+Put these under `container`, `linux`, `macos`, or `fly`. The `railway` backend takes none of them.
 
 | Key | Backends | Default | Description |
 | --- | --- | --- | --- |
@@ -88,6 +88,16 @@ Settings for `rox up fly`, which runs guests on Fly.io. It needs the `fly` CLI, 
 | `org` | string | your personal org | The Fly organization that owns a new app. |
 | `region` | string | `iad` | The Fly region for new guests. |
 | `disk` | integer | `10` | GB of volume for each guest's home directory. |
+
+### `railway`
+
+Settings for `rox up railway`, which runs guests as Railway sandboxes. It needs the `railway` CLI, logged in, and an SSH key on your Railway account. See [Guests on Railway](../../guides/railway-sandboxes/). A branch's `.rox.json` can't set any of them.
+
+| Key | Type | Default | Description |
+| --- | --- | --- | --- |
+| `project` | string | — | The Railway project, by name or id, that runs your guests. Required. |
+| `environment` | string | `production` | The project's environment, by name or id. |
+| `idle_timeout` | integer | your plan's default | Minutes, from 0 to 120, that a sandbox may sit with nothing connected before Railway destroys it. `0` turns it off on Hobby and Pro plans. |
 
 ## Per-project settings: `.rox.json`
 

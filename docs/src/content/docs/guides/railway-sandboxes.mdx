@@ -1,0 +1,28 @@
+---
+title: Guests on Railway
+description: Run guests as Railway sandboxes.
+---
+
+The `railway` backend runs each guest as a [Railway sandbox](https://docs.railway.com/sandboxes), a microVM in one of your Railway projects. Rox drives the `railway` CLI on the machine that launches the guest.
+
+## Set up
+
+1. Install the [Railway CLI](https://docs.railway.com/cli), version 5.75 or later, and run `railway login`.
+2. Add an SSH public key to your Railway account with `railway ssh keys add`, `railway ssh keys github`, or at [railway.com/account/ssh-keys](https://railway.com/account/ssh-keys). `railway sandbox forward` logs in with it through your SSH agent or default keys.
+3. Add a `railway` section to your [config](../../reference/configuration/#railway) that names the project to run guests in.
+4. Run `rox up railway` in a project, or set `"backend": "railway"` in its `.rox.json`.
+
+## What rox creates
+
+- A sandbox template, built in the project's environment from steps that do what rox's Containerfile does: sshd, Rex and a `workspace` user, on top of Railway's Ubuntu image. Railway caches it by its steps, so it's rebuilt only when they change.
+- For each guest, a sandbox from that template. Rox starts the guest's sshd on port 2222 in a detached session, pins the host key it reads through `railway sandbox exec`, and reaches SSH through `railway sandbox forward` on a loopback port.
+
+The forward's heartbeat keeps the sandbox from idling out while rox is connected. When nothing is connected for longer than the idle timeout, Railway destroys the sandbox and everything on it. Set `railway.idle_timeout` to `0` to turn that off on Hobby and Pro plans.
+
+Sandboxes can't be stopped, so `rox stop` and `rox start` don't apply. `rox down` destroys the sandbox.
+
+<Aside type="caution">
+Railway guests cost money on your Railway account until they're destroyed. Run `rox down` when you finish.
+</Aside>
+
+Railway sizes sandboxes by plan, so the `railway` backend takes no `image`, `cpus` or `memory`. Project images aren't supported, so a Railway guest clones the project and runs `.rox.sh` at boot. A branch's `.rox.json` can select the `railway` backend, but can't change its project or environment.

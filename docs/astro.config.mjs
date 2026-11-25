@@ -34,6 +34,7 @@ export default defineConfig({
 						{ label: 'Private repositories', slug: 'guides/private-repositories' },
 						{ label: 'Tart VMs', slug: 'guides/tart-vms' },
 						{ label: 'Guests on Fly.io', slug: 'guides/fly-cloud' },
+						{ label: 'Guests on Railway', slug: 'guides/railway-sandboxes' },
 						{ label: 'Rex remote hosts', slug: 'guides/remote-hosts' },
 						{ label: 'Reaching guests from other devices', slug: 'guides/tailnet' },
 						{ label: 'Keeping guests running', slug: 'guides/keep-running' },
