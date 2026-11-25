@@ -80,10 +80,10 @@ Pass `--no-tailscale` to `rox up` to keep a single guest off the tailnet. A proj
 
 ## Sharing a guest's server on the internet
 
-`rox funnel` puts a server running in a guest on the public internet with [Tailscale Funnel](https://tailscale.com/kb/1223/funnel), for example to show someone a dev server or to receive webhooks:
+`rox funnel add` puts a server running in a guest on the public internet with [Tailscale Funnel](https://tailscale.com/kb/1223/funnel), for example to show someone a dev server or to receive webhooks:
 
 ```sh
-rox funnel rv-my-project-3f9a1c2b7d40 5173
+rox funnel add rv-my-project-3f9a1c2b7d40 5173
 # Funneling https://mini.tail1234.ts.net/ to port 5173 on rv-my-project-3f9a1c2b7d40
 ```
 
@@ -103,14 +103,14 @@ You need:
 Funnel listens publicly on ports 443, 8443 and 10000, with one hostname per launcher. To funnel several servers, give each its own port or path:
 
 ```sh
-rox funnel rv-my-project-3f9a1c2b7d40 3000 --https 8443
-rox funnel rv-my-project-3f9a1c2b7d40 8080 --path /api
+rox funnel add rv-my-project-3f9a1c2b7d40 3000 --https 8443
+rox funnel add rv-my-project-3f9a1c2b7d40 8080 --path /api
 ```
 
 Rox won't take an address that another guest, or something else on the launcher, already funnels.
 
-- **List** a guest's funnels with `rox funnel NAME`. `rox ls --json` lists them too.
-- **Stop** one with `rox funnel NAME PORT --off`, or all of a guest's funnels with `rox funnel NAME --off`.
+- **List** a guest's funnels with `rox funnel ls NAME`, or every guest's with `rox funnel ls`. `rox ls --json` lists them too.
+- **Stop** one with `rox funnel remove NAME PORT`, or all of a guest's funnels with `rox funnel remove NAME --all`.
 - **Restarts.** Funnels come back when the guest does, with `rox start`, `rox reconnect` or the [rox service](../keep-running/). The server in the guest doesn't come back on its own, so start it again after a restart.
 - **`rox stop` and `rox down`.** `rox stop` takes a guest's funnels off the internet until `rox start`. `rox down` removes them.
 - **Guests on other hosts.** `rox funnel` works on guests on other Rex hosts too. It runs on the guest's launcher, which needs Tailscale.

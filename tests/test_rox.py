@@ -821,7 +821,7 @@ class WorkspaceTests(unittest.TestCase):
         guest = self.saved_guest()
         commands = self.fake_tailscale()
         with contextlib.redirect_stdout(io.StringIO()) as printed:
-            rox.main(["funnel", guest.name, "5173", "--https", "10000", "--path", "app"])
+            rox.main(["funnel", "add", guest.name, "5173", "--https", "10000", "--path", "app"])
         self.assertEqual(commands[-1], ["tailscale", "funnel", "--bg", "--yes", "--https=10000", "--set-path=/app",
                                         "http://127.0.0.1:51460"])
         self.assertEqual(rox.Guest.load(guest.name).funnels, [
@@ -829,12 +829,16 @@ class WorkspaceTests(unittest.TestCase):
              "url": "https://box.tail.ts.net:10000/app"}])
         self.assertIn("Funneling https://box.tail.ts.net:10000/app to port 5173", printed.getvalue())
         self.assertIn("Anyone on the internet can open it", printed.getvalue())
+        self.assertIn(f"Stop it with rox funnel remove {guest.name} 5173", printed.getvalue())
         self.assertEqual(rox.local_records()[0]["funnels"], [{"url": "https://box.tail.ts.net:10000/app", "port": 5173}])
         with contextlib.redirect_stdout(io.StringIO()) as printed:
-            rox.main(["funnel", guest.name])
+            rox.main(["funnel", "ls", guest.name])
         self.assertIn("https://box.tail.ts.net:10000/app  ->  port 5173", printed.getvalue())
         with contextlib.redirect_stdout(io.StringIO()) as printed:
-            rox.main(["funnel", guest.name, "--off"])
+            rox.main(["funnel", "ls"])
+        self.assertIn(f"https://box.tail.ts.net:10000/app  ->  port 5173 on {guest.name}", printed.getvalue())
+        with contextlib.redirect_stdout(io.StringIO()) as printed:
+            rox.main(["funnel", "remove", guest.name, "--all"])
         self.assertEqual(commands[-1], ["tailscale", "funnel", "--yes", "--https=10000", "--set-path=/app", "off"])
         self.assertEqual(rox.Guest.load(guest.name).funnels, [])
 
@@ -844,12 +848,13 @@ class WorkspaceTests(unittest.TestCase):
         guest = self.saved_guest()
         self.fake_tailscale(self.FUNNEL_STATUS)
         with self.assertRaisesRegex(rox.Error, "rv-other-000011112222 already funnels port 443 at /"):
-            rox.main(["funnel", guest.name, "5173"])
+            rox.main(["funnel", "add", guest.name, "5173"])
         with self.assertRaisesRegex(rox.Error, "Tailscale already serves http://127.0.0.1:51460 on port 10000 at /"):
-            rox.main(["funnel", guest.name, "5173", "--https", "10000"])
-        for argv in (["0"], ["5173", "--https", "8080"]):
+            rox.main(["funnel", "add", guest.name, "5173", "--https", "10000"])
+        for argv in (["add", guest.name, "0"], ["add", guest.name, "5173", "--https", "8080"],
+                     ["remove", guest.name], ["remove", guest.name, "5173", "--all"], [guest.name, "5173"]):
             with self.subTest(argv=argv), contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
-                rox.main(["funnel", guest.name, *argv])
+                rox.main(["funnel", *argv])
 
     def test_resume_restores_funnels_tailscale_no_longer_serves(self):
         entry = {"port": 8000, "https": 10000, "path": "/", "local": 51460, "url": "https://box.tail.ts.net:10000/"}
@@ -880,9 +885,18 @@ class WorkspaceTests(unittest.TestCase):
     def test_funnel_runs_on_the_host_that_has_the_guest(self):
         with self.remote_listing(), patch.object(rox, "rex_output", return_value=(0, "")) as remote, \
                 contextlib.redirect_stdout(io.StringIO()):
-            rox.main(["funnel", "rv-remote-000011112222", "5173", "--https", "8443"])
-        self.assertEqual(remote.call_args.args[2], [*rox.REMOTE_ROX, "funnel", "rv-remote-000011112222", "5173",
-                                                    "--https=8443", "--path=/"])
+            rox.main(["funnel", "add", "rv-remote-000011112222", "5173", "--https", "8443"])
+        self.assertEqual(remote.call_args.args[2], [*rox.REMOTE_ROX, "funnel", "add", "rv-remote-000011112222",
+                                                    "5173", "--https=8443", "--path=/"])
+        with self.remote_listing(), patch.object(rox, "rex_output", return_value=(0, "")) as remote, \
+                contextlib.redirect_stdout(io.StringIO()):
+            rox.main(["funnel", "remove", "rv-remote-000011112222", "5173"])
+        self.assertEqual(remote.call_args.args[2], [*rox.REMOTE_ROX, "funnel", "remove", "rv-remote-000011112222",
+                                                    "5173"])
+        with patch.object(rox, "rex_output", return_value=(0, "")) as remote, contextlib.redirect_stdout(io.StringIO()):
+            rox.main(["funnel", "ls", "-S", "mini"])
+        self.assertEqual(remote.call_args.args[0], "mini")
+        self.assertEqual(remote.call_args.args[2], [*rox.REMOTE_ROX, "funnel", "ls"])
 
     def fake_app_servers(self, connected_after=0):
         """Fake the Rex app here and on a guest's server, which the app reaches after some checks."""

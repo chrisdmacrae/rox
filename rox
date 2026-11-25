@@ -1208,32 +1208,48 @@ def stop_funnels(guest, funnels=None):
         close_funnel_tunnel(guest, funnel)
 
 
-def show_funnels(guest):
-    if not guest.funnels:
-        print(f"{guest.name} has no funnels. Start one with rox funnel {guest.name} PORT")
-    for funnel in guest.funnels:
+def funnel_argv(args):
+    """The rox funnel command line for args, to run on the host that has the guest."""
+    name = [args.name] if args.name else []
+    if args.funnel_command == "add":
+        return ["funnel", "add", *name, str(args.port), f"--https={args.https}", f"--path={args.path}"]
+    if args.funnel_command == "remove":
+        return ["funnel", "remove", *name, *([str(args.port)] if args.port else ["--all"])]
+    return ["funnel", "ls", *name]
+
+
+def list_funnels(name=None):
+    """Print a guest's funnels, or every funnel of this machine's guests."""
+    guests = [Guest.load(name)] if name else local_guests()
+    funnels = [(guest, funnel) for guest in guests for funnel in guest.funnels]
+    if not funnels:
+        print(f"{name + ' has no' if name else 'No guest here has'} funnels. "
+              f"Start one with rox funnel add {name or 'NAME'} PORT")
+    for guest, funnel in funnels:
         print(f"{funnel['url']}  ->  port {funnel['port']} on {guest.name}")
 
 
-def funnel(name, port=None, https=443, path="/", off=False):
-    """Funnel a port in the guest to the internet through this machine's Tailscale, or turn funnels off."""
+def remove_funnels(name, port=None):
+    """Take the guest's funnels of port, or all of them without one, off the internet for good."""
     guest = Guest.load(name)
     with guest_lock(guest.directory, wait=True):
         guest = Guest.load(name)
-        if off:
-            chosen = [f for f in guest.funnels if port is None or f["port"] == port]
-            if not chosen:
-                print(f"{name} has no funnel{f' for port {port}' if port else 's'}")
-                return
-            stop_funnels(guest, chosen)
-            guest.funnels = [f for f in guest.funnels if f not in chosen]
-            guest.save()
-            for f in chosen:
-                print(f"Stopped funneling {f['url']} to port {f['port']} on {name}")
+        chosen = [f for f in guest.funnels if port is None or f["port"] == port]
+        if not chosen:
+            print(f"{name} has no funnel{f' for port {port}' if port else 's'}")
             return
-        if port is None:
-            show_funnels(guest)
-            return
+        stop_funnels(guest, chosen)
+        guest.funnels = [f for f in guest.funnels if f not in chosen]
+        guest.save()
+    for f in chosen:
+        print(f"Stopped funneling {f['url']} to port {f['port']} on {name}")
+
+
+def add_funnel(name, port, https=443, path="/"):
+    """Funnel a port in the guest to the internet through this machine's Tailscale."""
+    guest = Guest.load(name)
+    with guest_lock(guest.directory, wait=True):
+        guest = Guest.load(name)
         if guest.stopped:
             raise Error(f"{name} is stopped. Start it with rox start {name}")
         if guest.phase != "ready":
@@ -1271,7 +1287,7 @@ def funnel(name, port=None, https=443, path="/", off=False):
         guest.save()
     print(f"Funneling {url} to port {port} on {name}")
     print("Anyone on the internet can open it. Stop it with "
-          f"rox funnel {name} {port} --off")
+          f"rox funnel remove {name} {port}")
 
 
 def local_guests():
@@ -4707,6 +4723,9 @@ def route_remote(args):
     """
     name = getattr(args, "name", None)
     host = getattr(args, "host", None)
+    if args.command == "funnel" and not name and host is not None:
+        run_on_host(host, "rox funnel ls", funnel_argv(args))  # Every funnel on that host.
+        return True
     if not name or (host is None and is_local(name)):
         return False
     if args.command in ("down", "add") and host is not None:
@@ -4720,9 +4739,7 @@ def route_remote(args):
     elif args.command == "forward":
         remote_forward(host, record, args.ports)
     elif args.command == "funnel":
-        run_on_host(host, f"rox funnel {name}", [
-            "funnel", name, *([str(args.port)] if args.port else []), f"--https={args.https}",
-            f"--path={args.path}", *(["--off"] if args.off else [])])
+        run_on_host(host, f"rox funnel {args.funnel_command} {name}", funnel_argv(args))
     elif args.command in ("down", "add"):
         args.host = host
         return False
@@ -5282,15 +5299,21 @@ def main(argv):
     start_parser.add_argument("name")
     stop_parser = commands.add_parser("stop", help="stop a guest and keep it stopped until rox start")
     stop_parser.add_argument("name")
-    funnel_parser = commands.add_parser("funnel", help="expose a port in a guest to the internet with Tailscale Funnel")
-    funnel_parser.add_argument("name")
-    funnel_parser.add_argument("port", nargs="?", type=port_number,
-                               help="port the server listens on in the guest; omit to list the guest's funnels")
-    funnel_parser.add_argument("--https", type=int, choices=FUNNEL_PORTS, default=443,
-                               help="public HTTPS port (default 443)")
-    funnel_parser.add_argument("--path", default="/", help="public path to serve it at (default /)")
-    funnel_parser.add_argument("--off", action="store_true",
-                               help="stop funneling PORT, or every funnel of the guest without PORT")
+    funnel_parser = commands.add_parser("funnel", help="expose ports in guests to the internet with Tailscale Funnel")
+    funnel_commands = funnel_parser.add_subparsers(dest="funnel_command", required=True)
+    funnel_add = funnel_commands.add_parser("add", help="put a port in a guest on the internet")
+    funnel_add.add_argument("name")
+    funnel_add.add_argument("port", type=port_number, help="port the server listens on in the guest")
+    funnel_add.add_argument("--https", type=int, choices=FUNNEL_PORTS, default=443,
+                            help="public HTTPS port (default 443)")
+    funnel_add.add_argument("--path", default="/", help="public path to serve it at (default /)")
+    funnel_remove = funnel_commands.add_parser("remove", help="take a guest's funnels off the internet")
+    funnel_remove.add_argument("name")
+    which = funnel_remove.add_mutually_exclusive_group(required=True)
+    which.add_argument("port", nargs="?", type=port_number, help="port in the guest to stop funneling")
+    which.add_argument("--all", action="store_true", help="remove every funnel of the guest")
+    funnel_ls = funnel_commands.add_parser("ls", help="list funnels")
+    funnel_ls.add_argument("name", nargs="?", help="guest whose funnels to list; omit for every guest here")
     agents_parser = commands.add_parser("update-agents",
                                         help="update a running guest's agent CLIs and refresh their credentials")
     agents_parser.add_argument("name", nargs="?", help="guest to update; omit with --all")
@@ -5302,7 +5325,7 @@ def main(argv):
     app_parser = commands.add_parser("add-remote-host",
                                      help="add a guest to the Rex app on this machine, which keeps its own host list")
     app_parser.add_argument("name")
-    for named in (forward_parser, funnel_parser, reconnect_parser, start_parser, stop_parser, app_parser,
+    for named in (forward_parser, funnel_add, funnel_remove, funnel_ls, reconnect_parser, start_parser, stop_parser, app_parser,
                   open_parser, agents_parser):
         named.add_argument("-S", "--host", help=HOST_HELP)
     stop = commands.add_parser("down", help="delete a guest and its workspace")
@@ -5403,7 +5426,12 @@ def main(argv):
     elif args.command == "start":
         reconnect(args.name, force=False)
     elif args.command == "funnel":
-        funnel(args.name, args.port, args.https, args.path, args.off)
+        if args.funnel_command == "add":
+            add_funnel(args.name, args.port, args.https, args.path)
+        elif args.funnel_command == "remove":
+            remove_funnels(args.name, args.port)
+        else:
+            list_funnels(args.name)
     elif args.command == "open":
         open_guest(args.name, args.project, args.host)
     elif args.command == "add-remote-host":
