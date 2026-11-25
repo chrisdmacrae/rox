@@ -3379,26 +3379,26 @@ class CloudTests(unittest.TestCase):
         rox.private_directory(rox.state_root())
 
     def guest(self, **fields):
-        guest = rox.Guest("rv-fixture-000011112222", "cloud", "registry.fly.io/rox-app:rox-5", "workspace",
-                          provider="fly", app="rox-app", region="iad", disk=10, container_id="m1",
+        guest = rox.Guest("rv-fixture-000011112222", "fly", "registry.fly.io/rox-app:rox-5", "workspace",
+                          app="rox-app", region="iad", disk=10, container_id="m1",
                           volume="rox_000011112222", **fields)
         guest.directory.mkdir(parents=True, mode=0o700)
         guest.save()
         return guest
 
-    def test_cloud_is_a_backend_that_a_branch_cannot_configure(self):
-        self.assertIn("cloud", rox.BACKENDS)
-        self.assertEqual(rox.checked_project_settings({"backend": "cloud"}, ".rox.json"), {"backend": "cloud"})
+    def test_fly_is_a_backend_that_a_branch_cannot_configure(self):
+        self.assertIn("fly", rox.BACKENDS)
+        self.assertEqual(rox.checked_project_settings({"backend": "fly"}, ".rox.json"), {"backend": "fly"})
         for setting in ({"image": "x"}, {"cpus": 64}, {"app": "other"}):
             with self.assertRaises(rox.Error):
-                rox.checked_project_settings({"cloud": setting}, ".rox.json")
+                rox.checked_project_settings({"fly": setting}, ".rox.json")
 
     def test_cloud_settings_are_checked_and_given_defaults(self):
-        self.assertEqual(rox.cloud_settings({}, "config.json"), ("fly", "", "", "iad", 10))
+        self.assertEqual(rox.cloud_settings({}, "config.json"), ("", "personal", "iad", 10))
         self.assertEqual(
             rox.cloud_settings({"app": "mine", "org": "acme", "region": "ams", "disk": 20}, "config.json"),
-            ("fly", "mine", "acme", "ams", 20))
-        for settings in ({"provider": "aws"}, {"app": "Bad_Name"}, {"region": 3}, {"disk": 0}, {"disk": True}):
+            ("mine", "acme", "ams", 20))
+        for settings in ({"app": "Bad_Name"}, {"region": 3}, {"disk": 0}, {"disk": True}):
             with self.assertRaises(rox.Error):
                 rox.cloud_settings(settings, "config.json")
 
@@ -3460,7 +3460,9 @@ class CloudTests(unittest.TestCase):
             self.assertEqual(rox.cloud_image("rox-app"), image)
         self.assertEqual(image, f"registry.fly.io/rox-app:rox-{rox.toolkit_version()}")
         self.assertEqual(run.call_count, 1)
-        self.assertEqual(run.call_args.args[0][1:4], ["deploy", "--build-only", "--push"])
+        argv = run.call_args.args[0]
+        self.assertEqual(argv[1:5], ["deploy", str(rox.HERE), "--build-only", "--push"])
+        self.assertEqual(argv[argv.index("--dockerfile") + 1], str(rox.HERE / "Containerfile"))
 
 
 class SelfUpdateTests(unittest.TestCase):

@@ -2,7 +2,14 @@
 set -eu
 
 : "${ROX_SSH_PUBLIC_KEY:?Start this image with rox up container}"
-# A cloud guest mounts a volume here, which starts out owned by root.
+# A cloud guest mounts a volume here, which starts out owned by root and empty. Seed a fresh one with the
+# image's starting dotfiles, whose .profile puts ~/.local/bin, where the agent CLIs install, on PATH.
+if [ ! -e /home/workspace/.profile ]; then
+    for file in /etc/skel/.[!.]*; do
+        target=/home/workspace/${file##*/}
+        [ -e "$target" ] || { cp -a "$file" "$target" && chown -R workspace:workspace "$target"; }
+    done
+fi
 chown workspace:workspace /home/workspace
 install -d -m 700 -o workspace -g workspace /home/workspace/.ssh
 umask 077
@@ -36,12 +43,15 @@ else
     rm -f /etc/sudoers.d/workspace
 fi
 unset ROX_SUDO
+# Fly.io machines run their own SSH server on port 22 of the private address, so rox moves this one there.
+ssh_port="${ROX_SSH_PORT:-22}"
+unset ROX_SSH_PORT
 
 mkdir -p /run/sshd
 if [ ! -f /etc/ssh/ssh_host_ed25519_key ]; then
     ssh-keygen -q -t ed25519 -N '' -f /etc/ssh/ssh_host_ed25519_key
 fi
-exec /usr/sbin/sshd -D -e -f /dev/null \
+exec /usr/sbin/sshd -D -e -f /dev/null -p "$ssh_port" \
     -h /etc/ssh/ssh_host_ed25519_key \
     -o AuthenticationMethods=publickey -o PermitRootLogin=no \
     -o PasswordAuthentication=no -o KbdInteractiveAuthentication=no \
