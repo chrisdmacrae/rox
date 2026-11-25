@@ -49,7 +49,9 @@ PROJECT_KEYS = {backend: {"image", "cpus", "memory", "prebuild"} for backend in 
 PROJECT_KEYS["fly"] = set()
 # These describe the launch machine, so only its own rox config may set them.
 LAUNCHER_KEYS = {"engine", "user", "identity", "host_key", "git_keys", "git_known_hosts", "tailscale", "agents",
-                 "git_agent", "app", "org", "region", "disk"}
+                 "git_agent"}
+# The fly section's own settings, which name the launcher's Fly app and what it spends.
+FLY_KEYS = {"app", "org", "region", "disk", "image", "cpus", "memory"}
 
 
 class Error(Exception):
@@ -2126,7 +2128,7 @@ def checked_project_settings(settings, where):
             if not isinstance(value, dict):
                 raise Error(f"Expected an object for {key} in {where}")
             for setting in value:
-                if setting in LAUNCHER_KEYS:
+                if setting in LAUNCHER_KEYS or (key == "fly" and setting in FLY_KEYS):
                     raise Error(f"{key}.{setting} can only be set in the rox config on the launch machine, "
                                 f"not in {where}")
                 if setting not in PROJECT_KEYS[key]:
