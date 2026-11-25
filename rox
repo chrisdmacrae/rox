@@ -35,7 +35,8 @@ except ImportError:  # Python before 3.11 can't read Codex's config.toml, so rox
 
 
 HERE = Path(__file__).resolve().parent
-BACKENDS = ("container", "linux", "macos")
+BACKENDS = ("container", "linux", "macos", "cloud")
+PROVIDERS = ("fly",)
 DEFAULT_CONTAINER_IMAGE = "rox:linux"
 # "container" is Apple's container CLI, which runs each container in its own lightweight VM.
 ENGINES = ("container", "docker", "podman")
@@ -44,10 +45,12 @@ NAME_PATTERN = r"rv-[a-z0-9-]{1,24}-[a-f0-9]{12}"
 PROJECT_CONFIG = ".rox.json"
 # Settings for this checkout only, kept out of Git. They override the branch's .rox.json.
 LOCAL_CONFIG = ".rox.local.json"
-PROJECT_KEYS = {backend: {"image", "cpus", "memory", "prebuild"} for backend in BACKENDS}
+PROJECT_KEYS = {backend: {"image", "cpus", "memory", "prebuild"} for backend in BACKENDS if backend != "cloud"}
+# A branch can't choose what the launcher's cloud account runs or spends.
+PROJECT_KEYS["cloud"] = set()
 # These describe the launch machine, so only its own rox config may set them.
 LAUNCHER_KEYS = {"engine", "user", "identity", "host_key", "git_keys", "git_known_hosts", "tailscale", "agents",
-                 "git_agent"}
+                 "git_agent", "provider", "app", "org", "region", "disk"}
 
 
 class Error(Exception):
@@ -156,6 +159,13 @@ class Guest:
     agents: dict = field(default_factory=dict)
     # Launcher SSH keys that a per-guest agent keeps forwarded into the guest, so Git works after the clone.
     git_keys: list = field(default_factory=list)
+    # Cloud guests: the provider, its app, region and volume (which keeps the home directory), and the volume's GB.
+    # container_id holds the machine id.
+    provider: str = ""
+    app: str = ""
+    region: str = ""
+    disk: int = 0
+    volume: str = ""
 
     @property
     def base(self):
@@ -766,6 +776,8 @@ def ensure_runtime(engine):
 
 def guest_state(guest):
     """Return running, stopped or missing for the guest's container or VM."""
+    if guest.backend == "cloud":
+        return cloud_state(guest)
     if guest.engine == "container":
         result = run(["container", "inspect", guest.name], capture=True, check=False, timeout=20)
         if result.returncode:
@@ -796,6 +808,13 @@ def guest_state(guest):
 
 def start_guest(guest, boot_timeout):
     """Start a stopped guest and wait until it takes SSH logins at its new address."""
+    if guest.backend == "cloud":
+        fly(guest.app, "machine", "start", guest.container_id, timeout=boot_timeout + 30)
+        guest.address, guest.port = wait_for(lambda: cloud_address(guest), boot_timeout,
+                                             f"{guest.name} to get an address")
+        guest.save()
+        check_guest_os(guest, boot_timeout)
+        return
     if guest.engine == "container":
         output(["container", "start", guest.name], timeout=120)
     elif guest.engine:
@@ -810,12 +829,200 @@ def start_guest(guest, boot_timeout):
 
 
 def stop_guest(guest):
+    if guest.backend == "cloud":
+        close_cloud_proxy(guest)
+        fly(guest.app, "machine", "stop", guest.container_id, timeout=120)
+        return
     if guest.engine == "container":
         output(["container", "stop", guest.name], timeout=120)
     elif guest.engine:
         output([guest.engine, "stop", guest.container_id], timeout=120)
     else:
         output(["tart", "stop", guest.name], timeout=120)
+
+
+# Cloud guests are Firecracker microVMs that Fly.io runs, driven through the fly CLI, which the launcher must
+# have installed and logged in. Each guest is one machine in a shared app, with a volume for /home/workspace,
+# because a machine's root filesystem is rebuilt from its image whenever it starts.
+CLOUD_DEFAULT_CPUS = 2
+CLOUD_DEFAULT_MEMORY = "4G"
+CLOUD_DEFAULT_DISK = 10
+CLOUD_DEFAULT_REGION = "iad"
+CLOUD_STATES = {"started": "running", "starting": "running", "created": "running", "replacing": "running",
+                "stopped": "stopped", "stopping": "stopped", "suspended": "stopped", "suspending": "stopped"}
+
+
+def fly_cli():
+    found = shutil.which("fly") or shutil.which("flyctl")
+    if not found:
+        raise Error("Install the Fly.io CLI (https://fly.io/docs/flyctl/install/) and run fly auth login")
+    return found
+
+
+def fly(app, *args, json_output=False, **kwargs):
+    """Run a fly command, for an app unless it's None. Return its output, parsed when json_output is set."""
+    argv = [fly_cli(), *args, *(["--json"] if json_output else []), *(["-a", app] if app else [])]
+    text = output(argv, **kwargs)
+    if not json_output:
+        return text
+    try:
+        return json.loads(text or "null")
+    except ValueError:
+        raise Error(f"fly {args[0]} returned something other than JSON") from None
+
+
+def fly_account():
+    """The email the fly CLI is logged in as."""
+    try:
+        return output([fly_cli(), "auth", "whoami"], timeout=30)
+    except Error as error:
+        raise Error(f"The fly CLI isn't logged in. Run fly auth login. ({error})") from None
+
+
+def cloud_settings(settings, config_path):
+    """Check the config's cloud section. Return the provider, app, org, region and volume size."""
+    provider = settings.get("provider", "fly")
+    if provider not in PROVIDERS:
+        raise Error(f"Expected cloud.provider in {config_path} to be one of {', '.join(PROVIDERS)}")
+    for key in ("app", "org", "region"):
+        value = settings.get(key, "")
+        if not isinstance(value, str) or (value and not re.fullmatch(r"[a-z0-9][a-z0-9-]*", value)):
+            raise Error(f"Expected a lowercase name for cloud.{key} in {config_path}")
+    disk = settings.get("disk", CLOUD_DEFAULT_DISK)
+    if not isinstance(disk, int) or isinstance(disk, bool) or disk < 1:
+        raise Error(f"Expected a whole number of GB for cloud.disk in {config_path}")
+    return (provider, settings.get("app", ""), settings.get("org", ""),
+            settings.get("region") or CLOUD_DEFAULT_REGION, disk)
+
+
+def cloud_app_name(account):
+    """The default shared app. It's named from a hash, so the account's email stays out of it."""
+    return "rox-" + hashlib.sha256(account.lower().encode()).hexdigest()[:10]
+
+
+def ensure_cloud_app(app, org):
+    apps = fly(None, "apps", "list", json_output=True, timeout=60) or []
+    if any(entry.get("Name") == app for entry in apps if isinstance(entry, dict)):
+        return
+    print(f"Creating the Fly app {app}", flush=True)
+    fly(None, "apps", "create", app, *(["--org", org] if org else []), timeout=60)
+
+
+def cloud_image(app):
+    """Rox's Containerfile as an image in the app's Fly registry, built on Fly's remote builder when it changed."""
+    label = f"rox-{toolkit_version()}"
+    image = f"registry.fly.io/{app}:{label}"
+    marker = state_root() / f"fly-image-{app}"
+    if marker.is_file() and marker.read_text().strip() == label:
+        return image
+    print(f"Building {image} on Fly.io", flush=True)
+    with tempfile.TemporaryDirectory() as scratch:
+        config = Path(scratch) / "fly.toml"
+        config.write_text(f'app = {json.dumps(app)}\n\n[build]\n  dockerfile = "Containerfile"\n')
+        try:
+            run([fly_cli(), "deploy", "--build-only", "--push", "--image-label", label,
+                 "--config", str(config), "-a", app], cwd=HERE)
+        except subprocess.CalledProcessError as error:
+            raise Error("Building the guest image on Fly.io failed. See the build output above.") from error
+    marker.write_text(label + "\n")
+    return image
+
+
+def cloud_machine(guest):
+    machines = fly(guest.app, "machines", "list", json_output=True, timeout=60) or []
+    for machine in machines:
+        if machine.get("id") == guest.container_id or machine.get("name") == guest.name:
+            return machine
+    return None
+
+
+def cloud_state(guest):
+    if not guest.container_id:
+        return "missing"
+    machine = cloud_machine(guest)
+    if not machine or machine.get("state") == "destroyed":
+        return "missing"
+    return CLOUD_STATES.get(machine.get("state"), "stopped")
+
+
+def cloud_proxy_pid(guest):
+    return guest.runtime / "fly-proxy.pid"
+
+
+def close_cloud_proxy(guest):
+    kill_pid(cloud_proxy_pid(guest))
+
+
+def port_open(port):
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=1):
+            return True
+    except OSError:
+        return False
+
+
+def cloud_address(guest):
+    """Keep fly proxy forwarding a loopback port to the machine's SSH port, as the machine has no public address."""
+    private_directory(guest.runtime.parent)
+    private_directory(guest.runtime)
+    if guest.port != 22 and pid_alive(cloud_proxy_pid(guest)) and port_open(guest.port):
+        return "127.0.0.1", guest.port
+    close_cloud_proxy(guest)
+    port = free_port()
+    proxy = detached([fly_cli(), "proxy", f"{port}:22", f"{guest.container_id}.vm.{guest.app}.internal",
+                      "-a", guest.app], guest, cloud_proxy_pid(guest), "fly-proxy.log")
+
+    def ready():
+        if proxy.poll() is not None:
+            raise Error(f"fly proxy exited with status {proxy.returncode}. See {guest.directory / 'fly-proxy.log'}")
+        return port_open(port)
+
+    wait_for(ready, 30, "fly proxy")
+    return "127.0.0.1", port
+
+
+def launch_cloud_machine(guest, boot_timeout):
+    """Create the guest's volume and machine, pin its host key, and open the SSH proxy."""
+    run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", guest.identity], stdin=subprocess.DEVNULL)
+    public_key = Path(f"{guest.identity}.pub").read_text().strip()
+    guest.volume = "rox_" + guest.name.rsplit("-", 1)[1]
+    fly(guest.app, "volumes", "create", guest.volume, "--region", guest.region, "--size", str(guest.disk),
+        "--yes", timeout=120)
+    guest.save()
+    # --restart no keeps a machine that exits from starting again behind rox stop's back. Each machine is its
+    # own VM, so like Apple's containers it gets sudo and can run Docker.
+    memory = memory_megabytes(guest.memory or CLOUD_DEFAULT_MEMORY)
+    fly(guest.app, "machine", "run", guest.image, "--name", guest.name, "--region", guest.region,
+        "--vm-cpus", str(guest.cpus or CLOUD_DEFAULT_CPUS), "--vm-memory", str(memory),
+        "--volume", f"{guest.volume}:/home/workspace", "--restart", "no",
+        "--env", f"ROX_SSH_PUBLIC_KEY={public_key}", "--env", "ROX_SUDO=1",
+        "--metadata", f"rox_workspace={guest.name}", timeout=boot_timeout + 120)
+    machine = wait_for(lambda: cloud_machine(guest), 60, "the Fly machine to appear")
+    guest.container_id = machine["id"]
+    guest.save()
+    wait_for(lambda: (cloud_machine(guest) or {}).get("state") == "started", boot_timeout,
+             "the Fly machine to start")
+    # fly machine exec goes through Fly's API, so the host key comes from the machine and not from the network.
+    key = wait_for(lambda: fly(guest.app, "machine", "exec", guest.container_id,
+                               "cat /etc/ssh/ssh_host_ed25519_key.pub", timeout=30),
+                   boot_timeout, "the machine's SSH host key")
+    pin_host(guest, key)
+    return wait_for(lambda: cloud_address(guest), boot_timeout, "the SSH proxy")
+
+
+def destroy_cloud_machine(guest):
+    """Delete the machine, then its volume. Whatever is already gone is skipped."""
+    if not guest.app:
+        return
+    machines = fly(guest.app, "machines", "list", json_output=True, timeout=60) or []
+    for machine in machines:
+        if machine.get("name") == guest.name or machine.get("id") == guest.container_id:
+            fly(guest.app, "machine", "destroy", machine["id"], "--force", timeout=120)
+    if guest.volume:
+        volumes = fly(guest.app, "volumes", "list", json_output=True, timeout=60) or []
+        for volume in volumes:
+            if volume.get("name") == guest.volume:
+                fly(guest.app, "volumes", "destroy", volume["id"], "--yes", timeout=120)
 
 
 def reachable(guest):
@@ -836,7 +1043,7 @@ def resume(guest, tailnet=None, boot_timeout=120, force=False):
     ensure_runtime(guest.engine)
     state = guest_state(guest)
     if state == "missing":
-        kind = "container" if guest.engine else "VM"
+        kind = "machine" if guest.backend == "cloud" else "container" if guest.engine else "VM"
         raise Error(f"The {kind} for {guest.name} no longer exists. Remove the workspace with rox down {guest.name}")
     if state == "stopped":
         print(f"Starting {guest.name}", flush=True)
@@ -1924,7 +2131,7 @@ def checked_project_settings(settings, where):
                     raise Error(f"{key}.{setting} can only be set in the rox config on the launch machine, "
                                 f"not in {where}")
                 if setting not in PROJECT_KEYS[key]:
-                    allowed = ", ".join(sorted(PROJECT_KEYS[key]))
+                    allowed = ", ".join(sorted(PROJECT_KEYS[key])) or "no settings; set cloud guests in the rox config"
                     raise Error(f"Unknown setting {key}.{setting} in {where}. Use {allowed}")
         elif key in LAUNCHER_KEYS:
             raise Error(f"{key} can only be set in the rox config on the launch machine, not in {where}")
@@ -1950,6 +2157,8 @@ def prepare_project_image(backend, engine, base, project, url, branch, keys, kno
 
 
 def launch_guest(guest, boot_timeout):
+    if guest.backend == "cloud":
+        return launch_cloud_machine(guest, boot_timeout)
     if guest.backend == "container":
         run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", guest.identity],
             stdin=subprocess.DEVNULL)
@@ -2068,8 +2277,8 @@ def kill_pid(path):
     path.unlink(missing_ok=True)
 
 
-def detached(argv, guest, pid_path):
-    with (guest.directory / "git-agent.log").open("a") as log:
+def detached(argv, guest, pid_path, log_name="git-agent.log"):
+    with (guest.directory / log_name).open("a") as log:
         process = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=log, stderr=log, start_new_session=True)
     pid_path.write_text(f"{process.pid}\n")
     return process
@@ -2201,7 +2410,8 @@ def attach_guest(guest, session_id=""):
 
 def connect(guest, tailnet=None):
     """Find the running guest's SSH address, make sure its Rex server runs, and attach to it."""
-    guest.address, guest.port = container_address(guest) if guest.engine else vm_address(guest)
+    guest.address, guest.port = (cloud_address(guest) if guest.backend == "cloud"
+                                 else container_address(guest) if guest.engine else vm_address(guest))
     guest.save()
     guest_stage(guest, "server", guest.guest_socket)
     attach_guest(guest)
@@ -3535,7 +3745,7 @@ def up(args, command):
         project_config = fetched.settings if fetched else {}
     backend = args.backend or local.get("backend") or project_config.get("backend")
     if not backend:
-        raise Error(f"Choose a backend with rox up container, linux or macos, or set \"backend\" in {PROJECT_CONFIG}")
+        raise Error(f"Choose a backend with rox up container, linux, macos or cloud, or set \"backend\" in {PROJECT_CONFIG}")
     if not args.backend:
         print(f"Using the {backend} backend from {LOCAL_CONFIG if local.get('backend') else PROJECT_CONFIG}",
               flush=True)
@@ -3566,13 +3776,21 @@ def up(args, command):
     if not isinstance(memory, str) or (memory and not re.fullmatch(r"[0-9]+[KMGT]", memory, re.IGNORECASE)):
         where = "--memory" if args.memory is not None else f"{backend}.memory in {origin('memory')}"
         raise Error(f"Expected a size such as 4G or 512M for {where}")
-    image = args.image or settings.get("image") or (DEFAULT_CONTAINER_IMAGE if engine else "")
-    if not isinstance(image, str) or not image or image.startswith("-"):
-        raise Error(f"Choose a {backend} image with --image or in {origin('image')}")
+    cloud = None
+    if backend == "cloud":
+        cloud = cloud_settings(settings, config_path)
+        # An empty image means Rox's own, which Fly builds and stores in the app's registry.
+        image = args.image or settings.get("image") or ""
+        if not isinstance(image, str) or image.startswith("-"):
+            raise Error(f"Expected an image name for --image or cloud.image in {origin('image')}")
+    else:
+        image = args.image or settings.get("image") or (DEFAULT_CONTAINER_IMAGE if engine else "")
+        if not isinstance(image, str) or not image or image.startswith("-"):
+            raise Error(f"Choose a {backend} image with --image or in {origin('image')}")
     identity = None
     host_key = None
     user = "workspace"
-    if not engine:
+    if not engine and not cloud:
         user = settings.get("user", "admin")
         identity = configured_file(settings.get("identity"))
         host_key = configured_file(settings.get("host_key"))
@@ -3583,11 +3801,12 @@ def up(args, command):
         raise Error(f"Expected true or false for {backend}.prebuild in {origin('prebuild')}")
     # A project image holds a remote branch, and a --local launch runs .rox.sh on the copied checkout.
     prebuild = prebuild and bool(source) and not args.no_prebuild and not args.no_hook and not checkout
+    prebuild = prebuild and not cloud
     if args.rebuild and not prebuild:
-        raise Error("--rebuild needs a project image, which --no-project, --no-hook, --no-prebuild, --local "
-                    "or prebuild: false disable")
+        raise Error("--rebuild needs a project image, which --no-project, --no-hook, --no-prebuild, --local, "
+                    "prebuild: false and the cloud backend disable")
 
-    required = ["rex", "ssh", engine or "tart"]
+    required = ["rex", "ssh", engine or ("ssh-keygen" if cloud else "tart")]
     if engine:
         required.append("ssh-keygen")
     if engine == "container" and not shutil.which("container"):
@@ -3599,6 +3818,12 @@ def up(args, command):
     private_directory(state_root())
     if engine:
         prepare_container_image(engine, image)
+    if cloud:
+        provider, app, org, region, disk = cloud
+        account = fly_account()
+        app = app or cloud_app_name(account)
+        ensure_cloud_app(app, org)
+        image = image or cloud_image(app)
     versions = agent_versions(agents) if agents else {}
     prebuilt = ""
     if prebuild:
@@ -3613,6 +3838,8 @@ def up(args, command):
     name = f"rv-{slugify(source[0] if source else 'host', 24) or 'project'}-{secrets.token_hex(6)}"
     guest = Guest(name, backend, launch_image, user, engine, prebuilt=bool(prebuilt),
                   cpus=cpus, memory=memory, git_keys=forwarded_keys)
+    if cloud:
+        guest.provider, guest.app, guest.region, guest.disk = provider, app, region, disk
     guest.directory.mkdir(mode=0o700)
     guest.identity = str(identity or guest.directory / "login")
     with guest_lock(guest.directory):
@@ -4057,7 +4284,10 @@ def down(name):
         leave_tailnet(guest)
         stop_git_agent(guest)
         close_tunnel(guest)
-        if guest.engine == "container":
+        close_cloud_proxy(guest)
+        if guest.backend == "cloud":
+            destroy_cloud_machine(guest)
+        elif guest.engine == "container":
             result = run(["container", "delete", "--force", name], capture=True, check=False)
             if result.returncode and "not found" not in (result.stderr + result.stdout).lower():
                 raise Error(result.stderr.strip() or f"Could not delete container {name}")
@@ -4148,7 +4378,7 @@ def guest_ip(guest):
     Tart VMs and Apple's containers have their own address. Docker and Podman
     containers are reached through a loopback SSH port instead, so they have none.
     """
-    return guest.address if guest.address and guest.engine in ("", "container") else "-"
+    return guest.address if guest.address and guest.engine in ("", "container") and guest.backend != "cloud" else "-"
 
 
 def local_records():

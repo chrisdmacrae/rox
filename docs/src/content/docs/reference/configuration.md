@@ -65,7 +65,7 @@ Each key is an agent, `claude` or `codex`, and each value is an object. An empty
 
 ## Backend settings
 
-Put these under `container`, `linux`, or `macos`.
+Put these under `container`, `linux`, `macos`, or `cloud`.
 
 | Key | Backends | Default | Description |
 | --- | --- | --- | --- |
@@ -77,6 +77,18 @@ Put these under `container`, `linux`, or `macos`.
 | `identity` | `linux`, `macos` | — | Private key on the host for logging in to the VM. Required. |
 | `host_key` | `linux`, `macos` | — | The template's SSH host public key, used for pinning. Required. |
 | `prebuild` | all | `true` | Build and reuse a [project image](../../guides/project-images/) when the branch has a `.rox.sh`. |
+
+### `cloud`
+
+Settings for `rox up cloud`, which runs guests on Fly.io. It needs the `fly` CLI, logged in. See [Cloud guests on Fly.io](../../guides/fly-cloud/). It also takes `cpus`, `memory` and `image` as in the backend settings above; `cpus` defaults to 2 and `memory` to `4G`, and a missing `image` is built from rox's Containerfile. A branch's `.rox.json` can't set any of them.
+
+| Key | Type | Default | Description |
+| --- | --- | --- | --- |
+| `provider` | string | `fly` | The cloud provider. Only `fly` is supported. |
+| `app` | string | `rox-` and a hash of your account | The Fly app that holds your guests. Rox creates it if it's missing. |
+| `org` | string | your personal org | The Fly organization that owns a new app. |
+| `region` | string | `iad` | The Fly region for new guests. |
+| `disk` | integer | `10` | GB of volume for each guest's home directory. |
 
 ## Per-project settings: `.rox.json`
 

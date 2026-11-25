@@ -1,0 +1,29 @@
+---
+title: Cloud guests on Fly.io
+description: Run guests as Firecracker microVMs on Fly.io.
+---
+
+The `cloud` backend runs each guest as a [Fly.io Machine](https://fly.io/docs/machines/), a Firecracker microVM. Rox drives the `fly` CLI on the machine that launches the guest, so you need no other cloud setup.
+
+## Set up
+
+1. Install [flyctl](https://fly.io/docs/flyctl/install/).
+2. Run `fly auth login`.
+3. Optionally add a `cloud` section to your [config](../../reference/configuration/#cloud).
+4. Run `rox up cloud` in a project, or set `"backend": "cloud"` in its `.rox.json`.
+
+## What rox creates
+
+- One shared Fly app for all your guests. It's `cloud.app`, or `rox-` and a hash of your account that rox creates the first time.
+- The guest image, which Fly's remote builder builds from rox's Containerfile and pushes to the app's registry. Rox rebuilds it only when the Containerfile changes.
+- For each guest, a volume mounted at `/home/workspace` and a machine. The volume keeps your checkouts across `rox stop` and `rox start`, because a machine's root filesystem is rebuilt from its image whenever it starts.
+
+The machine has no public address. Rox reaches its SSH port through `fly proxy` on a loopback port, and pins the host key it reads through `fly machine exec`.
+
+`rox stop` stops the machine, which stops its compute charges. The volume still costs storage. `rox down` destroys the machine and its volume.
+
+<Aside type="caution">
+Cloud guests cost money on your Fly account. A guest left running keeps billing, so run `rox down` when you finish.
+</Aside>
+
+Project images aren't supported yet, so a cloud guest clones the project and runs `.rox.sh` at boot. A branch's `.rox.json` can select the `cloud` backend, but can't change its image, size or app.
