@@ -20,6 +20,7 @@ import secrets
 import shlex
 import shutil
 import socket
+import stat
 import subprocess
 import sys
 import tarfile
@@ -4467,6 +4468,68 @@ def forward(name, ports):
     os.execvp(argv[0], argv)
 
 
+# Write stdin to $1 with mode $2, making its folders, through a temporary file so a reader never sees half of it.
+COPY_SCRIPT = r"""set -eu
+mkdir -p "$(dirname "$1")"
+temporary="$1.rox-cp.$$"
+trap 'rm -f "$temporary"' EXIT
+(umask 077 && cat > "$temporary")
+chmod "$2" "$temporary"
+mv -f "$temporary" "$1"
+trap - EXIT
+"""
+
+
+def copy_spec(value):
+    """Parse SOURCE[:DEST] into (source, dest). DEST defaults to SOURCE, or its name when SOURCE is absolute."""
+    source, colon, dest = value.partition(":")
+    if not source or (colon and not dest):
+        raise argparse.ArgumentTypeError("expected SOURCE:DEST, such as .env:.env")
+    if not colon:
+        dest = Path(source).name if Path(source).is_absolute() else source
+    return source, dest
+
+
+def copy_directory(guest, key=None):
+    """The folder relative destinations start from: the project's checkout, or the guest home without one."""
+    if key:
+        project = guest.find_project(key)
+    else:
+        ready = [project for project in guest.projects if project.phase == "ready"]
+        if len(ready) > 1:
+            choices = ", ".join(project.id for project in ready)
+            raise Error(f"{guest.name} has several projects ({choices}). Choose one with --project")
+        if not ready:
+            return str(guest.home)
+        project = ready[0]
+    if project.phase != "ready" or not project.workspace:
+        raise Error(f"{project.id} on {guest.name} is {project.phase}, so it has no checkout to copy into")
+    return project.workspace
+
+
+def copy_files(name, copies, key=None, cwd=None):
+    """rox cp: copy files from this machine into a guest, relative ones into its project's checkout."""
+    if re.fullmatch(NAME_PATTERN, name) and not is_local(name):
+        raise Error(f"rox cp copies into guests on this machine, and {name} isn't one. Run it on the guest's host")
+    cwd = cwd or Path.cwd()
+    files = []
+    for source, dest in copies:
+        path = (cwd / source).expanduser()
+        if not path.is_file():
+            raise Error(f"{source} is not a file" if path.exists() else f"No file {source}")
+        files.append((path, dest))
+    require(["ssh"])
+    guest = ready_guest(name)
+    directory = PurePosixPath(copy_directory(guest, key))
+    for path, dest in files:
+        target = PurePosixPath(dest)
+        target = target if target.is_absolute() else directory / target
+        mode = f"{stat.S_IMODE(path.stat().st_mode):o}"
+        with path.open("rb") as stream:
+            run(remote_command(guest, ["bash", "-c", COPY_SCRIPT, "rox", str(target), mode]), stdin=stream)
+        print(f"Copied {path} to {target} on {name}", flush=True)
+
+
 def close_relay(guest):
     if guest.relay_socket.is_socket():
         with socket.socket(socket.AF_UNIX) as control:
@@ -5488,6 +5551,14 @@ def main(argv):
     forward_parser.add_argument("name")
     forward_parser.add_argument("ports", nargs="+", type=forward_spec, metavar="PORT|LOCAL:GUEST",
                                 help="guest port to reach at the same localhost port, or LOCAL:GUEST")
+    copy_parser = commands.add_parser("cp", help="copy files from this machine into a guest")
+    copy_parser.add_argument("name")
+    copy_parser.add_argument("copies", nargs="+", type=copy_spec, metavar="SOURCE[:DEST]",
+                             help="file here, from the current directory, and where it goes in the guest: "
+                                  "relative to the project's checkout, or absolute. DEST defaults to SOURCE")
+    copy_parser.add_argument("--project", help="project whose checkout relative destinations go in; "
+                                               "omit for the only one")
+    copy_parser.add_argument("--cwd", type=Path, default=Path.cwd(), help="directory SOURCE paths start from")
     reconnect_parser = commands.add_parser("reconnect", help="restore access to a workspace, starting it if it stopped")
     reconnect_parser.add_argument("name")
     reconnect_parser.add_argument("--no-app-host", action="store_true", help=APP_HOST_HELP)
@@ -5617,6 +5688,8 @@ def main(argv):
         shell(args.name, args.project)
     elif args.command == "forward":
         forward(args.name, args.ports)
+    elif args.command == "cp":
+        copy_files(args.name, args.copies, args.project, args.cwd)
     elif args.command == "reconnect":
         reconnect(args.name)
     elif args.command == "start":

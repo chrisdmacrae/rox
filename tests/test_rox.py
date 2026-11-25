@@ -3638,6 +3638,72 @@ class RailwayTests(unittest.TestCase):
         self.assertFalse(guest.directory.exists())
 
 
+class CopyTests(unittest.TestCase):
+    """rox cp, with the guest's SSH faked."""
+
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.root = Path(directory.name).resolve()
+        state = patch.dict(os.environ, {"XDG_STATE_HOME": str(self.root / "state")})
+        state.start()
+        self.addCleanup(state.stop)
+        rox.private_directory(rox.state_root())
+        self.cwd = self.root / "checkout"
+        self.cwd.mkdir()
+        (self.cwd / ".env").write_text("SECRET=1\n")
+        (self.cwd / ".env").chmod(0o600)
+
+    def guest(self, *projects):
+        guest = rox.Guest("rv-fixture-000011112222", "container", "rox:linux", "workspace",
+                          guest_socket="/home/workspace/.rox/rv-fixture-000011112222/rex.sock")
+        for name in projects:
+            project = guest.add_project(name, f"git@example.com:{name}.git", "main")
+            project.workspace, project.phase = f"/home/workspace/{name}", "ready"
+        guest.directory.mkdir(parents=True, mode=0o700)
+        guest.save()
+        return guest
+
+    def copy(self, guest, copies, key=None):
+        sent = []
+
+        def fake_run(argv, stdin=None, **kwargs):
+            sent.append((shlex.split(argv[-1])[-2:], stdin.read()))
+
+        with patch.object(rox, "ready_guest", return_value=guest), patch.object(rox, "run", side_effect=fake_run), \
+                patch.object(rox, "require"), contextlib.redirect_stdout(io.StringIO()):
+            rox.copy_files(guest.name, [rox.copy_spec(value) for value in copies], key, self.cwd)
+        return sent
+
+    def test_specs_default_the_destination(self):
+        self.assertEqual(rox.copy_spec(".env:config/.env"), (".env", "config/.env"))
+        self.assertEqual(rox.copy_spec(".env"), (".env", ".env"))
+        self.assertEqual(rox.copy_spec("/tmp/key.pem"), ("/tmp/key.pem", "key.pem"))
+        for value in ("", ":x", ".env:"):
+            with self.assertRaises(rox.argparse.ArgumentTypeError):
+                rox.copy_spec(value)
+
+    def test_relative_destinations_go_in_the_checkout_and_absolute_ones_stay(self):
+        sent = self.copy(self.guest("app"), [".env:.env", ".env:/etc/app.env"])
+        self.assertEqual(sent, [(["/home/workspace/app/.env", "600"], b"SECRET=1\n"),
+                                (["/etc/app.env", "600"], b"SECRET=1\n")])
+
+    def test_several_projects_need_one_chosen(self):
+        guest = self.guest("app", "api")
+        with self.assertRaisesRegex(rox.Error, "several projects"):
+            self.copy(guest, [".env"])
+        self.assertEqual(self.copy(guest, [".env"], key="api")[0][0], ["/home/workspace/api/.env", "600"])
+
+    def test_without_a_project_it_copies_into_the_home(self):
+        self.assertEqual(self.copy(self.guest(), [".env"])[0][0], ["/home/workspace/.env", "600"])
+
+    def test_a_missing_source_fails_before_connecting(self):
+        guest = self.guest("app")
+        with patch.object(rox, "ready_guest") as ready, self.assertRaisesRegex(rox.Error, "No file nope"):
+            rox.copy_files(guest.name, [("nope", "nope")], cwd=self.cwd)
+        ready.assert_not_called()
+
+
 class SelfUpdateTests(unittest.TestCase):
     def setUp(self):
         directory = tempfile.TemporaryDirectory()

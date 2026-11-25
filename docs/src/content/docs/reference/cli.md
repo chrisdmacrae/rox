@@ -104,6 +104,17 @@ Give each port as `PORT` to use the same number on both sides, or `LOCAL:GUEST` 
 
 Containers started from a `rox:linux` image built before `rox forward` existed refuse the tunnel. Rox rebuilds `rox:linux` on the next `rox up container`, so start a new guest to use it.
 
+## `rox cp NAME SOURCE[:DEST]...`
+
+Copy files from this machine into a guest. `SOURCE` is a file, relative to the current directory. A relative `DEST` goes in the project's checkout, and an absolute one is used as it is. Without `:DEST`, the file keeps its relative path, or just its name when `SOURCE` is absolute. For example, `rox cp rv-app-1a2b3c4d5e6f .env:.env` puts this checkout's gitignored `.env` in the guest's checkout, which `--local` leaves behind.
+
+Rox makes any missing folders and keeps the file's permissions. It replaces an existing file in one step, so nothing in the guest reads a half-written file. When the guest has no checkout, relative paths go in the guest home. When it has several, choose one with `--project`. The guest must be on this machine, ready and not stopped. If it stopped or lost its tunnel, Rox [starts it again](../../guides/keep-running/) first.
+
+| Option | Description |
+| --- | --- |
+| `--project PROJECT` | The project whose checkout relative destinations go in. Defaults to the only one. |
+| `--cwd PATH` | The directory `SOURCE` paths start from. Defaults to the current directory. |
+
 ## `rox funnel`
 
 Put servers in guests on the public internet with Tailscale Funnel. The launcher's Tailscale serves each one at the launcher's tailnet name, through an SSH tunnel to the guest's `localhost`, so the server can listen on `localhost`. The launcher needs Tailscale installed and Funnel allowed by your tailnet policy. Funnels come back when the guest restarts, go offline at `rox stop` until `rox start`, and are removed by `rox down`. See [Sharing a guest's server on the internet](../../guides/tailnet/#sharing-a-guests-server-on-the-internet).
