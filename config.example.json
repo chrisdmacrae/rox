@@ -6,8 +6,7 @@
     "image": "rox:linux",
     "memory": "4G"
   },
-  "cloud": {
-    "provider": "fly",
+  "fly": {
     "region": "iad",
     "cpus": 2,
     "memory": "4G"
