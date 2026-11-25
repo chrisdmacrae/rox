@@ -1158,8 +1158,8 @@ class WorkspaceTests(unittest.TestCase):
             [project] = state.projects
             self.assertEqual((project.id, project.name, project.branch),
                              ("sample-project", "sample project", "published-feature"))
-            self.assertEqual(project.workspace, f"/home/guest/.rox/image/project" if prebuilt
-                             else f"/home/guest/.rox/{name}/projects/sample-project")
+            # A project image prepared its checkout where the guest keeps it, in the guest home.
+            self.assertEqual(project.workspace, "/home/guest/sample-project")
             self.assertEqual(project.phase, "failed" if fail_stage else "ready")
             if not fail_stage:
                 self.assertEqual(project.session_id, "session:fixture")
@@ -1461,10 +1461,10 @@ class WorkspaceTests(unittest.TestCase):
         env = {**os.environ, "HOME": str(home), "REX_SERVER": "unix:///leak",
                "PATH": f"{tools}{os.pathsep}{os.environ['PATH']}"}
         bootstrap = ["bash", str(ROOT / "guest/bootstrap.sh")]
-        workspace = subprocess.run([*bootstrap, "bake-prepare"], env=env, check=True,
-                                   capture_output=True, text=True).stdout.strip()
-        self.assertEqual(workspace, str(home / ".rox/image/project"))
-        subprocess.run([*bootstrap, "clone", workspace, str(origin), "main", "no"], env=env, check=True,
+        workspace, pins = subprocess.run([*bootstrap, "bake-prepare", "sample-project"], env=env, check=True,
+                                         capture_output=True, text=True).stdout.splitlines()
+        self.assertEqual((workspace, pins), (str(home / "sample-project"), str(home / ".rox/image/git_known_hosts")))
+        subprocess.run([*bootstrap, "clone", workspace, str(origin), "main", "no", pins], env=env, check=True,
                        capture_output=True)
         subprocess.run([*bootstrap, "bake", workspace, "linux", "rox-fixture-linux"], env=env, check=True,
                        capture_output=True)
@@ -1477,7 +1477,7 @@ class WorkspaceTests(unittest.TestCase):
                                capture_output=True, text=True).stdout.splitlines()
         self.assertEqual(paths, [str(home / ".rox/rv-fixture-000011112222"),
                                  str(home / ".rox/rv-fixture-000011112222/r.sock")])
-        subprocess.run([*bootstrap, "clone", workspace, str(origin), "main", "no"], env=env, check=True,
+        subprocess.run([*bootstrap, "clone", workspace, str(origin), "main", "no", pins], env=env, check=True,
                        capture_output=True)
         self.assertEqual((Path(workspace) / "README").read_text(), "two\n")
         self.assertTrue((Path(workspace) / "baked").exists())
@@ -1535,7 +1535,7 @@ class WorkspaceTests(unittest.TestCase):
                 context = Path(argv[-1])
                 containerfile = (context / "Containerfile").read_text()
                 self.assertIn("FROM rox:linux", containerfile)
-                self.assertIn('"bake", "/home/workspace/.rox/image/project", "container", "rox:fixture"', containerfile)
+                self.assertIn('"bake", "/home/workspace/sample-project", "container", "rox:fixture"', containerfile)
                 self.assertTrue((context / "project/.rox.sh").is_file())
                 labels = dict(arg.removeprefix("--label=").split("=", 1) for arg in argv if arg.startswith("--label="))
                 builds.append(labels)
@@ -1544,7 +1544,7 @@ class WorkspaceTests(unittest.TestCase):
 
         def build(rebuild=False):
             rox.build_container_image("podman", "rox:linux", "rox:fixture", mirror, "git@x.test:r.git",
-                                      "main", hook, rebuild)
+                                      "main", hook, rebuild, "sample project")
 
         with patch.object(rox, "run", side_effect=command), contextlib.redirect_stdout(io.StringIO()):
             build()
@@ -1884,17 +1884,17 @@ class WorkspaceTests(unittest.TestCase):
         guest = rox.Guest.load(guest.name)
         base = f"/home/guest/.rox/{guest.name}"
         self.assertEqual([(p.id, p.name, p.branch, p.workspace, p.session_id, p.phase) for p in guest.projects], [
-            ("sample-project", "sample project", "published-feature", f"{base}/projects/sample-project",
+            ("sample-project", "sample project", "published-feature", f"/home/guest/sample-project",
              "session:2", "ready"),
-            ("other", "other", "main", f"{base}/projects/other", "session:3", "ready"),
-            ("sample-project-2", "sample project", "published-feature", f"{base}/projects/sample-project-2",
+            ("other", "other", "main", f"/home/guest/other", "session:3", "ready"),
+            ("sample-project-2", "sample project", "published-feature", f"/home/guest/sample-project-2",
              "session:4", "ready"),
         ])
         clones = [stage for stage in record["stages"] if stage[0] == "clone"]
         self.assertEqual([clone[1:4] for clone in clones], [
-            (f"{base}/projects/sample-project", "git@git.example.test:fork/repo.git", "published-feature"),
-            (f"{base}/projects/other", "https://git.example.test/other.git", "main"),
-            (f"{base}/projects/sample-project-2", "git@git.example.test:fork/repo.git", "published-feature"),
+            (f"/home/guest/sample-project", "git@git.example.test:fork/repo.git", "published-feature"),
+            (f"/home/guest/other", "https://git.example.test/other.git", "main"),
+            (f"/home/guest/sample-project-2", "git@git.example.test:fork/repo.git", "published-feature"),
         ])
         setups = [stage[-1] for stage in record["stages"] if stage[0] == "setup"]
         self.assertEqual(setups, ["true", "false", "false"])
@@ -1930,7 +1930,7 @@ class WorkspaceTests(unittest.TestCase):
                 rox.main(["agent", guest.name, "missing"])
             with patch.object(rox, "local_app", return_value="Rex"), patch.object(rox, "open_in_app") as opened:
                 rox.main(["agent", guest.name, "--open-shell"])
-        workspace = f"/home/guest/.rox/{guest.name}/projects/sample-project"
+        workspace = "/home/guest/sample-project"
         sessions = [stage for stage in record["stages"] if stage[0] == "session"]
         self.assertEqual([stage[stage.index("new") + 1:] for stage in sessions], [
             ("codex sample-project", "-c", workspace, "--json", "--keep-open", "--", "codex", "fix the tests"),
@@ -1982,7 +1982,7 @@ class WorkspaceTests(unittest.TestCase):
                     rox.main(["agent", "--cwd", str(outside)])
                 with self.assertRaisesRegex(rox.Error, "No running guests with a checkout of missing"):
                     rox.main(["agent", "missing", "--cwd", str(outside)])
-        workspace = f"/home/guest/.rox/{with_project.name}/projects/sample-project"
+        workspace = "/home/guest/sample-project"
         sessions = [stage for stage in record["stages"] if stage[0] == "session"]
         self.assertEqual([stage[stage.index("-c") + 1] for stage in sessions], [workspace, workspace])
 
@@ -3083,7 +3083,7 @@ class WorkspaceTests(unittest.TestCase):
         env = {"HOME": str(home), "PATH": os.environ["PATH"]}
         for _ in range(2):
             subprocess.run(["bash", str(ROOT / "guest/bootstrap.sh"), "clone", str(workspace),
-                            "git@127.0.0.1:none.git", "main", "no"], env=env, capture_output=True)
+                            "git@127.0.0.1:none.git", "main", "no", str(pins)], env=env, capture_output=True)
         self.assertEqual((home / ".ssh" / "known_hosts").read_text(),
                          "other ssh-ed25519 BBBB\ngithub.com ssh-ed25519 AAAA\n")
 
@@ -3173,7 +3173,7 @@ class WorkspaceTests(unittest.TestCase):
         record["prepare"].assert_not_called()
         clones = [stage for stage in record["stages"] if stage[0] == "clone"]
         self.assertEqual([clone[-1] for clone in clones], ["local", "local"])
-        base = f"/home/guest/.rox/{guest.name}/projects"
+        base = "/home/guest"
         self.assertEqual([call.args[1:] for call in send.call_args_list], [
             (f"{base}/sample-project", repo.parent, "published-feature"),
             (f"{base}/sample-project-2", repo.parent, "published-feature"),

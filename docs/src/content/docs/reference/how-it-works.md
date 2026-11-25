@@ -15,7 +15,7 @@ description: What rox does during a launch, how Rex connects, and where state li
 8. **Forward Git keys.** Rox keeps an SSH agent with the guest's Git keys on the launcher and forwards it into the guest, so Git works there for the guest's whole life. See [Private repositories](../../guides/private-repositories/).
 9. **Create the session.** Rox creates a Rex session rooted at the checkout, running your `--` command if you gave one.
 
-`rox add` repeats steps 6 to 9 on a guest that's already running. It reconnects to the guest's Rex server first and clones into a new directory under `~/.rox/NAME/projects/`, so each project in a guest has its own checkout and session.
+`rox add` repeats steps 6 to 9 on a guest that's already running. It reconnects to the guest's Rex server first and clones into a new directory in the guest's home directory, so each project in a guest has its own checkout and session.
 
 ## Connecting to Rex
 

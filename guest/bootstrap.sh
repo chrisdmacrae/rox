@@ -34,21 +34,22 @@ case "$stage" in
         command -v git >/dev/null || { echo 'Install Git in the guest.' >&2; exit 1; }
         base="$HOME/.rox/$1"
         mkdir -p -m 700 "$base"
-        # Projects are checked out under $base/projects, or at the project image's prepared
-        # checkout in $HOME/.rox/image/project. The launcher picks which.
+        # Projects are checked out in $HOME, by project id. The launcher picks the path.
         printf '%s\n' "$base" "$base/r.sock"
         ;;
     bake-prepare)
         command -v git >/dev/null || { echo 'Install Git in the guest.' >&2; exit 1; }
-        rm -rf "$HOME/.rox/image"
+        # $1 is the project's id. Its checkout goes where a guest from the image keeps it, and the Git
+        # server pins go beside rox's other state.
+        rm -rf "$HOME/.rox/image" "${HOME:?}/$1"
         mkdir -p -m 700 "$HOME/.rox/image"
-        printf '%s\n' "$HOME/.rox/image/project"
+        printf '%s\n' "$HOME/$1" "$HOME/.rox/image/git_known_hosts"
         ;;
     clone)
         workspace=$1
         url=$2
         branch=$3
-        known_hosts="${workspace%/*}/git_known_hosts"
+        known_hosts=$5
         if [[ $4 == yes ]]; then
             if [[ ! -S ${SSH_AUTH_SOCK:-} ]]; then
                 echo 'The guest SSH server did not forward the Git agent.' >&2
@@ -72,7 +73,7 @@ case "$stage" in
                 grep -qxF -- "$line" "$HOME/.ssh/known_hosts" || printf '%s\n' "$line" >>"$HOME/.ssh/known_hosts"
             done <"$known_hosts"
         fi
-        if [[ ${5:-} == local ]]; then
+        if [[ ${6:-} == local ]]; then
             # The launcher sends its own commits and files next, so the branch needn't be on the remote yet.
             git -c credential.helper= clone --quiet --no-checkout -- "$url" "$workspace" </dev/null
             exit 0

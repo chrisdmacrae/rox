@@ -407,7 +407,8 @@ def send_local(guest, workspace, root, branch):
     if known:
         checked = git("cat-file", "--batch-check=%(objectname) %(objecttype)", input="\n".join(known) + "\n")
         have = [line.split()[0] for line in checked.splitlines() if line.endswith(" commit")]
-    payload = str(PurePosixPath(workspace).parent / f".{PurePosixPath(workspace).name}.local")
+    # Inside .git, so the checkout's files and the guest home stay as they are. The local stage removes it.
+    payload = str(PurePosixPath(workspace) / ".git" / "rox-local")
     with tempfile.TemporaryDirectory(prefix="rox-local-") as scratch:
         scratch = Path(scratch)
         uploads = {}
@@ -1517,11 +1518,22 @@ def prepare_container_image(engine, image):
             raise Error(f"Building {image} with {engine} failed. See the build output above.") from error
 
 
-IMAGE_PROJECT = "/home/workspace/.rox/image/project"
+def project_id(name):
+    """The id, and checkout folder name, of a guest's first project called name."""
+    return slugify(name, 40) or "project"
+
+
+def image_checkout_path(home, name):
+    """Where a project image keeps its prepared checkout: in the guest home, where the guest's checkout goes,
+    since .rox.sh may leave absolute paths behind."""
+    return str(PurePosixPath(home) / project_id(name))
+
+
+CONTAINER_HOME = "/home/workspace"
 PROJECT_CONTAINERFILE = """\
 FROM {base}
 USER root
-RUN install -d -m 700 -o workspace -g workspace /home/workspace/.rox /home/workspace/.rox/image
+RUN install -d -m 700 -o workspace -g workspace /home/workspace/.rox
 COPY bootstrap.sh /usr/local/share/rox/bootstrap.sh
 COPY --chown=workspace:workspace project {project}
 USER workspace
@@ -1631,7 +1643,7 @@ def find_labels(data):
     return {}
 
 
-def build_container_image(engine, base, target, mirror, url, branch, hook, rebuild):
+def build_container_image(engine, base, target, mirror, url, branch, hook, rebuild, project):
     with file_lock(state_root() / f"image-{target.replace(':', '-')}.lock"):
         base_info = image_info(engine, base)
         if base_info is None:
@@ -1639,7 +1651,8 @@ def build_container_image(engine, base, target, mirror, url, branch, hook, rebui
             base_info = image_info(engine, base)
         if base_info is None:
             raise Error(f"Base image {base} is not available to {engine}")
-        wanted = {"io.rox.hook": hook, "io.rox.base": base_info[0], "io.rox.repo": url}
+        checkout = image_checkout_path(CONTAINER_HOME, project)
+        wanted = {"io.rox.hook": hook, "io.rox.base": base_info[0], "io.rox.repo": url, "io.rox.checkout": checkout}
         current = image_info(engine, target)
         if not rebuild and current and all(current[1].get(k) == v for k, v in wanted.items()):
             print(f"Using project image {target} (built from {current[1].get('io.rox.commit', '?')[:12]})",
@@ -1651,9 +1664,9 @@ def build_container_image(engine, base, target, mirror, url, branch, hook, rebui
             context = Path(context)
             commit = export_checkout(mirror, url, branch, context / "project")
             shutil.copy(HERE / "guest" / "bootstrap.sh", context / "bootstrap.sh")
-            bake = ["bash", "/usr/local/share/rox/bootstrap.sh", "bake", IMAGE_PROJECT, "container", target]
+            bake = ["bash", "/usr/local/share/rox/bootstrap.sh", "bake", checkout, "container", target]
             (context / "Containerfile").write_text(
-                PROJECT_CONTAINERFILE.format(base=base, project=IMAGE_PROJECT, bake=json.dumps(bake)))
+                PROJECT_CONTAINERFILE.format(base=base, project=checkout, bake=json.dumps(bake)))
             labels = {**wanted, "io.rox.commit": commit, "io.rox.branch": branch}
             try:
                 run([engine, "build", "--file", str(context / "Containerfile"), "--tag", target,
@@ -1676,7 +1689,7 @@ def build_vm_image(backend, base, target, project, url, branch, hook, commit, se
     images.mkdir(mode=0o700, exist_ok=True)
     record = images / f"{target}.json"
     with file_lock(images / f"{target}.lock"):
-        wanted = {"hook": hook, "base": base, "repo": url}
+        wanted = {"hook": hook, "base": base, "repo": url, "checkout": project_id(project)}
         try:
             current = json.loads(record.read_text())
         except FileNotFoundError:
@@ -1687,7 +1700,7 @@ def build_vm_image(backend, base, target, project, url, branch, hook, commit, se
             return
         reason = "--rebuild" if rebuild else ("first build" if not exists else ".rox.sh or base image changed")
         print(f"Building project image {target} from {base} ({reason})", flush=True)
-        bake_vm(backend, base, target, branch, url, settings)
+        bake_vm(backend, base, target, branch, url, {**settings, "project": project})
         if exists:
             run(["tart", "delete", target])
         run(["tart", "rename", settings["name"], target])
@@ -1705,15 +1718,15 @@ def bake_vm(backend, base, target, branch, url, settings):
         pin_host(guest, settings["host_key"].read_text())
         guest.address, guest.port = launch_guest(guest, settings["boot_timeout"])
         check_guest_os(guest, settings["boot_timeout"])
-        workspace = guest_stage(guest, "bake-prepare", capture=True)
-        if not workspace.startswith("/") or "\n" in workspace:
+        paths = guest_stage(guest, "bake-prepare", project_id(settings["project"]), capture=True).splitlines()
+        if len(paths) != 2 or any(not path.startswith("/") for path in paths):
             raise Error("Guest image preparation did not return a valid checkout path")
+        workspace, pins = paths
         if settings["known_hosts"]:
-            pins = str(PurePosixPath(workspace).parent / "git_known_hosts")
             run(remote_command(guest, ["bash", "-c", 'umask 077; cat > "$1"', "rox", pins]),
                 input=settings["known_hosts"])
         with git_agent(guest, settings["keys"]) as agent:
-            guest_stage(guest, "clone", workspace, url, branch, "yes" if agent else "no", agent=agent)
+            guest_stage(guest, "clone", workspace, url, branch, "yes" if agent else "no", pins, agent=agent)
         guest_stage(guest, "bake", workspace, backend, target)
         if settings.get("agents"):
             # Guests check these versions again at boot, so a newer release costs only an update.
@@ -2342,7 +2355,7 @@ def prepare_project_image(backend, engine, base, project, url, branch, keys, kno
     mirror, commit, hook = fetched.mirror, fetched.commit, fetched.hook
     target = project_image_name(backend, project, base)
     if engine:
-        build_container_image(engine, base, target, mirror, url, branch, hook, rebuild)
+        build_container_image(engine, base, target, mirror, url, branch, hook, rebuild, project)
     else:
         name = f"rv-build-{secrets.token_hex(6)}"
         build_vm_image(backend, base, target, project, url, branch, hook, commit,
@@ -3878,18 +3891,17 @@ def provision_project(guest, source, command, keys, known_hosts, no_hook, image_
     """Clone a project into a ready guest, run its hook and start a Rex session at the checkout."""
     name, url, branch = source
     project = guest.add_project(name, url, branch)
-    # A project image keeps its prepared checkout at a fixed path beside the per-guest state.
-    project.workspace = str(guest.base.parent / "image" / "project" if image_checkout
-                            else guest.base / "projects" / project.id)
+    # Checkouts go in the guest home. A project image prepared the first project's there already.
+    project.workspace = str(guest.home / project.id)
     guest.save()
+    pins = str(guest.base / "git_known_hosts")
     print(f"Adding {name} ({branch}) to {guest.name} as {project.id}", flush=True)
     try:
         if known_hosts:
-            target = str(PurePosixPath(project.workspace).parent / "git_known_hosts")
-            upload = ["bash", "-c", 'umask 077; mkdir -p "${1%/*}" && cat > "$1"', "rox", target]
+            upload = ["bash", "-c", 'umask 077; mkdir -p "${1%/*}" && cat > "$1"', "rox", pins]
             run(remote_command(guest, upload), input=known_hosts)
         with git_agent(guest, keys) as agent:
-            guest_stage(guest, "clone", project.workspace, url, branch, "yes" if agent else "no",
+            guest_stage(guest, "clone", project.workspace, url, branch, "yes" if agent else "no", pins,
                         *(["local"] if local else []), agent=agent)
         if local:
             send_local(guest, project.workspace, local, branch)

@@ -41,7 +41,7 @@ rox up container [options] [-- COMMAND [ARG ...]]
 
 ## `rox add NAME`
 
-Clone a project into the running guest `NAME`, run its `.rox.sh`, and create a Rex session rooted at the checkout. Arguments after `--` run in that session's first terminal. The checkout goes to `~/.rox/NAME/projects/ID` in the guest, where `ID` is the project name with a number added if the guest already has it.
+Clone a project into the running guest `NAME`, run its `.rox.sh`, and create a Rex session rooted at the checkout. Arguments after `--` run in that session's first terminal. The checkout goes to `~/ID` in the guest's home directory, where `ID` is the project name with a number added if the guest already has it.
 
 ```sh
 rox add NAME [options] [-- COMMAND [ARG ...]]

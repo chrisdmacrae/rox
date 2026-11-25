@@ -67,7 +67,7 @@ rox add rv-host-3f9a1c2b7d40
 rox add rv-host-3f9a1c2b7d40 --repo git@github.com:organization/api.git --branch main -- my-agent
 ```
 
-Each project gets its own checkout under `~/.rox/NAME/projects/ID` in the guest. `ID` is the project name, with a number added when the guest already has a checkout by that name, so adding the same project twice gives two separate checkouts. A project added with `rox add` always runs `.rox.sh` at boot, because the guest's image is already fixed. If cloning or the hook fails, that project is marked failed and the guest stays usable.
+Each project gets its own checkout at `~/ID` in the guest's home directory. `ID` is the project name, with a number added when the guest already has a checkout by that name, so adding the same project twice gives two separate checkouts. A project added with `rox add` always runs `.rox.sh` at boot, because the guest's image is already fixed. If cloning or the hook fails, that project is marked failed and the guest stays usable.
 
 ## Launch on a Rex remote host
 
@@ -179,7 +179,7 @@ When the branch has a `.rox.sh`, Rox runs it once while building a project image
 
 Tart names cannot contain `:`, so VM images use a dash and include the backend. To decide whether the image is current, Rox fetches the branch into a cached mirror under `${XDG_CACHE_HOME:-$HOME/.cache}/rox/repos` on the launch machine. It uses the same keys and pinned host keys as the guest. Rox rebuilds the image when `.rox.sh` changes, when the base image changes, or when the repository URL differs. A new commit that leaves `.rox.sh` unchanged reuses the image.
 
-While the image builds, `ROX_PHASE` is `build`, `ROX_NAME` is the image name, the checkout is at `~/.rox/image/project`, and neither `REX_SERVER` nor a Git agent is available. At boot without an image, `ROX_PHASE` is `boot` and `REX_SERVER` points to the guest's running server. Because the image does not keep running processes, a hook that starts Rex terminals for long-running services should launch with `--no-prebuild`.
+While the image builds, `ROX_PHASE` is `build`, `ROX_NAME` is the image name, the checkout is at `~/ID`, where it stays in guests started from the image, and neither `REX_SERVER` nor a Git agent is available. At boot without an image, `ROX_PHASE` is `boot` and `REX_SERVER` points to the guest's running server. Because the image does not keep running processes, a hook that starts Rex terminals for long-running services should launch with `--no-prebuild`.
 
 | Option | Effect |
 | --- | --- |
